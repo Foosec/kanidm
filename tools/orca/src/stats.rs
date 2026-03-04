@@ -96,7 +96,11 @@ impl DataCollector for BasicStatistics {
                     // We have been told to stop immediately.
                     return Ok(());
                 }
-                None => thread::sleep(Duration::from_millis(100)),
+                None => {
+                    #[allow(clippy::disallowed_methods)]
+                    // Allowed as this is a backoff in a synchronous code loop
+                    thread::sleep(Duration::from_millis(100))
+                }
             }
         };
 
@@ -115,7 +119,11 @@ impl DataCollector for BasicStatistics {
                     // We have been told to stop immediately.
                     return Ok(());
                 }
-                None => thread::sleep(Duration::from_millis(100)),
+                None => {
+                    #[allow(clippy::disallowed_methods)]
+                    // Allowed as this is a backoff in a synchronous code loop
+                    thread::sleep(Duration::from_millis(100))
+                }
             }
         };
 
@@ -271,9 +279,9 @@ type Percentile95 = f64;
 
 impl StatsContainer {
     fn new(
-        readop_times: &Vec<f64>,
-        writeop_times: &Vec<f64>,
-        replication_delays: &Vec<f64>,
+        readop_times: &[f64],
+        writeop_times: &[f64],
+        replication_delays: &[f64],
         node_count: usize,
         person_count: usize,
         group_count: usize,
@@ -315,7 +323,7 @@ impl StatsContainer {
     }
 
     fn compute_stats_from_timings_vec(
-        op_times: &Vec<f64>,
+        op_times: &[f64],
     ) -> (EventCount, Mean, Variance, Sd, Percentile95) {
         let op_times_len = op_times.len();
         if op_times_len >= 2 {

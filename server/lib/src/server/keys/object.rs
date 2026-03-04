@@ -1,6 +1,6 @@
 use crate::prelude::*;
 use compact_jwt::{compact::JweCompact, jwe::Jwe};
-use compact_jwt::{Jwk, Jws, JwsCompact};
+use compact_jwt::{Jwk, JwkKeySet, Jws, JwsCompact};
 use smolset::SmolSet;
 use std::collections::BTreeSet;
 use uuid::Uuid;
@@ -29,6 +29,33 @@ pub trait KeyObjectT {
         current_time: Duration,
     ) -> Result<JwsCompact, OperationError>;
 
+    fn jws_es256_jwks(&self) -> Option<JwkKeySet>;
+
+    fn jws_rs256_import(
+        &mut self,
+        import_keys: &SmolSet<[Vec<u8>; 1]>,
+        valid_from: Duration,
+        cid: &Cid,
+    ) -> Result<(), OperationError>;
+
+    fn jws_rs256_assert(&mut self, valid_from: Duration, cid: &Cid) -> Result<(), OperationError>;
+
+    fn jws_rs256_sign(
+        &self,
+        jws: &Jws,
+        current_time: Duration,
+    ) -> Result<JwsCompact, OperationError>;
+
+    fn jws_rs256_jwks(&self) -> Option<JwkKeySet>;
+
+    fn jws_hs256_assert(&mut self, valid_from: Duration, cid: &Cid) -> Result<(), OperationError>;
+
+    fn jws_hs256_sign(
+        &self,
+        jws: &Jws,
+        current_time: Duration,
+    ) -> Result<JwsCompact, OperationError>;
+
     fn jws_verify(&self, jwsc: &JwsCompact) -> Result<Jws, OperationError>;
 
     fn jws_public_jwk(&self, kid: &str) -> Result<Option<Jwk>, OperationError>;
@@ -43,6 +70,15 @@ pub trait KeyObjectT {
     ) -> Result<JweCompact, OperationError>;
 
     fn jwe_decrypt(&self, jwec: &JweCompact) -> Result<Jwe, OperationError>;
+
+    fn hkdf_s256_assert(&mut self, valid_from: Duration, cid: &Cid) -> Result<(), OperationError>;
+
+    fn hkdf_s256_expand(
+        &self,
+        info: &[u8],
+        output_key: &mut [u8],
+        current_time: Duration,
+    ) -> Result<(), OperationError>;
 
     fn as_valuesets(&self) -> Result<Vec<(Attribute, ValueSet)>, OperationError>;
 

@@ -1,31 +1,33 @@
-use std::env;
-
 use compact_jwt::{traits::JwsVerifiable, JwsCompact, JwsEs256Verifier, JwsVerifier, JwtError};
 use dialoguer::theme::ColorfulTheme;
 use dialoguer::{Confirm, Select};
 use kanidm_client::{KanidmClient, KanidmClientBuilder};
 use kanidm_proto::constants::{DEFAULT_CLIENT_CONFIG_PATH, DEFAULT_CLIENT_CONFIG_PATH_HOME};
-use kanidm_proto::internal::UserAuthToken;
+use kanidm_proto::internal::{PrivilegesActive, UserAuthToken};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
-use crate::session::read_tokens;
-use crate::{CommonOpt, LoginOpt, ReauthOpt};
+use crate::session::{process_auth_state, read_tokens};
+use crate::{KanidmClientParser, LoginOpt};
 
-#[derive(Clone)]
-pub enum OpType {
+#[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
+pub enum ToClientError {
+    NeedLogin(String),
+    NeedReauth(String, KanidmClient),
+    ReadOnly,
+    Other,
+}
+
+/// Show what kind of operation the CLI is about to attempt to perform. This is an internal
+/// detail of the CLI.
+#[derive(Debug, Copy, Clone)]
+pub(crate) enum OpType {
     Read,
     Write,
 }
 
-#[derive(Debug)]
-pub enum ToClientError {
-    NeedLogin(String),
-    NeedReauth(String, KanidmClient),
-    Other,
-}
-
-impl CommonOpt {
+impl KanidmClientParser {
     pub fn to_unauth_client(&self) -> KanidmClient {
         let config_path: String = shellexpand::tilde(DEFAULT_CLIENT_CONFIG_PATH_HOME).into_owned();
 
@@ -164,7 +166,7 @@ impl CommonOpt {
                         token_refs.pop()
                     } else {
                         // otherwise let's try the fallback
-                        let filter_username = format!("{}@", filter_username);
+                        let filter_username = format!("{filter_username}@");
                         // Filter for tokens that match the pattern
                         let mut token_refs: Vec<_> = token_instance
                             .tokens()
@@ -250,6 +252,8 @@ impl CommonOpt {
             })
         }) {
             Ok(uat) => {
+                #[allow(clippy::disallowed_methods)]
+                // Allowed as this is a local time check
                 let now_utc = time::OffsetDateTime::now_utc();
                 if let Some(exp) = uat.expiry {
                     if now_utc >= exp {
@@ -268,12 +272,20 @@ impl CommonOpt {
                 match optype {
                     OpType::Read => {}
                     OpType::Write => {
-                        if !uat.purpose_readwrite_active(now_utc + time::Duration::new(20, 0)) {
-                            error!(
-                                "Privileges have expired for {} - you need to re-authenticate again.",
-                                uat.spn
-                            );
-                            return Err(ToClientError::NeedReauth(spn, client));
+                        match uat.purpose_privilege_state(now_utc + time::Duration::seconds(20)) {
+                            // Good to go.
+                            PrivilegesActive::True => {}
+                            PrivilegesActive::ReauthRequired => {
+                                error!(
+                                    "Privileges have expired for {} - you need to re-authenticate again.",
+                                    uat.spn
+                                );
+                                return Err(ToClientError::NeedReauth(spn, client));
+                            }
+                            PrivilegesActive::False => {
+                                error!("The current session for {} is read-only.", uat.spn);
+                                return Err(ToClientError::ReadOnly);
+                            }
                         }
                     }
                 }
@@ -288,10 +300,9 @@ impl CommonOpt {
         Ok(client)
     }
 
-    pub async fn to_client(&self, optype: OpType) -> KanidmClient {
-        let mut copt_mut = self.clone();
+    pub(crate) async fn to_client(&self, optype: OpType) -> KanidmClient {
         loop {
-            match self.try_to_client(optype.clone()).await {
+            match self.try_to_client(optype).await {
                 Ok(c) => break c,
                 Err(ToClientError::NeedLogin(username)) => {
                     if !Confirm::new()
@@ -303,18 +314,19 @@ impl CommonOpt {
                         std::process::exit(1);
                     }
 
-                    copt_mut.username = Some(username);
-                    let copt = copt_mut.clone();
-                    let login_opt = LoginOpt {
-                        copt,
-                        password: env::var("KANIDM_PASSWORD").ok(),
+                    let copt = Self {
+                        username: Some(username),
+                        ..self.to_owned()
                     };
 
-                    login_opt.exec().await;
+                    let login_opt = LoginOpt {};
+
                     // Okay, try again ...
+                    login_opt.exec(copt).await;
                     continue;
                 }
-                Err(ToClientError::NeedReauth(username, client)) => {
+
+                Err(ToClientError::NeedReauth(username, _client)) => {
                     if !Confirm::new()
                         .with_prompt("Would you like to re-authenticate?")
                         .default(true)
@@ -323,19 +335,33 @@ impl CommonOpt {
                     {
                         std::process::exit(1);
                     }
-                    copt_mut.username = Some(username);
-                    let copt = copt_mut.clone();
-                    let reauth_opt = ReauthOpt { copt };
-                    reauth_opt.inner(client).await;
+
+                    let copt = Self {
+                        username: Some(username),
+                        ..self.to_owned()
+                    };
+                    Box::pin(copt.reauth()).await;
 
                     // Okay, re-auth should have passed, lets loop
                     continue;
                 }
-                Err(ToClientError::Other) => {
+                Err(ToClientError::ReadOnly) | Err(ToClientError::Other) => {
                     std::process::exit(1);
                 }
             }
         }
+    }
+
+    pub(crate) async fn reauth(&self) {
+        // IMPORTANT: Must be READ ONLY else we loop on reauth!!!
+        let client = self.to_client(OpType::Read).await;
+
+        let allowed = client.reauth_begin().await.unwrap_or_else(|e| {
+            error!("Error during reauthentication begin phase: {:?}", e);
+            std::process::exit(1);
+        });
+
+        process_auth_state(allowed, client, &self.password, &self.instance).await;
     }
 }
 
@@ -382,7 +408,10 @@ pub fn prompt_for_username_get_values(
         Some(value) => {
             let (f_uname, f_token) = value;
             debug!("Using cached token for name {}", f_uname);
-            debug!("Cached token: {}", f_token);
+            debug!(
+                "First ten chars of cached token: {}",
+                &f_token.to_string()[..10]
+            );
             Ok((f_uname.to_string(), f_token.clone()))
         }
         None => {
@@ -430,13 +459,17 @@ pub fn prompt_for_username_get_token() -> Result<String, String> {
 pub(crate) fn try_expire_at_from_string(input: &str) -> Result<Option<String>, ()> {
     match input {
         "any" | "never" | "clear" => Ok(None),
-        "now" => match OffsetDateTime::now_utc().format(&Rfc3339) {
-            Ok(s) => Ok(Some(s)),
-            Err(e) => {
-                error!(err = ?e, "Unable to format current time to rfc3339");
-                Err(())
+        "now" => {
+            #[allow(clippy::disallowed_methods)]
+            // Allowed as this is a local time from the callers machine.
+            match OffsetDateTime::now_utc().format(&Rfc3339) {
+                Ok(s) => Ok(Some(s)),
+                Err(e) => {
+                    error!(err = ?e, "Unable to format current time to rfc3339");
+                    Err(())
+                }
             }
-        },
+        }
         "epoch" => match OffsetDateTime::UNIX_EPOCH.format(&Rfc3339) {
             Ok(val) => Ok(Some(val)),
             Err(err) => {

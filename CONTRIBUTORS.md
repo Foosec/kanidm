@@ -47,6 +47,8 @@
 - Fabian Kammel (datosh)
 - Andris Raugulis (arthepsy)
 - Jason (argonaut0)
+- Pieter Kokx (kokx)
+- Aitor Mecinas (TheSylex)
 
 ## Acknowledgements
 

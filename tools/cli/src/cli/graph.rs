@@ -1,23 +1,27 @@
-use crate::common::OpType;
-use crate::{handle_client_error, GraphCommonOpt, GraphType, ObjectType, OutputMode};
+use crate::OpType;
+use crate::{
+    handle_client_error, GraphCommonOpt, GraphType, KanidmClientParser, ObjectType, OutputMode,
+};
+use kanidm_proto::constants::{
+    ATTR_CLASS, ATTR_MEMBER, ATTR_SPN, ATTR_UUID, ENTRYCLASS_ACCOUNT, ENTRYCLASS_GROUP,
+    ENTRYCLASS_PERSON, ENTRYCLASS_SERVICE_ACCOUNT,
+};
 use kanidm_proto::internal::Filter::{Eq, Or};
 
 impl GraphCommonOpt {
-    pub fn debug(&self) -> bool {
-        self.copt.debug
-    }
-
-    pub async fn exec(&self) {
+    pub async fn exec(&self, opt: KanidmClientParser) {
         let gopt: &GraphCommonOpt = self;
-        let copt = &gopt.copt;
-        let client = copt.to_client(OpType::Read).await;
+        let client = opt.to_client(OpType::Read).await;
         let graph_type = &gopt.graph_type;
         let filters = &gopt.filter;
 
         let filter = Or(vec![
-            Eq("class".to_string(), "person".to_string()),
-            Eq("class".to_string(), "service_account".to_string()),
-            Eq("class".to_string(), "group".to_string()),
+            Eq(ATTR_CLASS.to_string(), ENTRYCLASS_PERSON.to_string()),
+            Eq(
+                ATTR_CLASS.to_string(),
+                ENTRYCLASS_SERVICE_ACCOUNT.to_string(),
+            ),
+            Eq(ATTR_CLASS.to_string(), ENTRYCLASS_GROUP.to_string()),
         ]);
 
         let result = client.search(filter).await;
@@ -25,12 +29,12 @@ impl GraphCommonOpt {
         let entries = match result {
             Ok(entries) => entries,
             Err(e) => {
-                handle_client_error(e, copt.output_mode);
+                handle_client_error(e, opt.output_mode);
                 return;
             }
         };
 
-        match copt.output_mode {
+        match opt.output_mode {
             OutputMode::Json => {
                 let r_attrs: Vec<_> = entries.iter().map(|entry| &entry.attrs).collect();
                 println!(
@@ -43,20 +47,20 @@ impl GraphCommonOpt {
                 let typed_entries = entries
                     .iter()
                     .filter_map(|entry| {
-                        let classes = entry.attrs.get("class")?;
-                        let uuid = entry.attrs.get("uuid")?.first()?;
+                        let classes = entry.attrs.get(ATTR_CLASS)?;
+                        let uuid = entry.attrs.get(ATTR_UUID)?.first()?;
 
                         // Logic to decide the type of each entry
-                        let obj_type = if classes.contains(&"group".to_string()) {
+                        let obj_type = if classes.contains(&ENTRYCLASS_GROUP.to_string()) {
                             if uuid.starts_with("00000000-0000-0000-0000-") {
                                 ObjectType::BuiltinGroup
                             } else {
                                 ObjectType::Group
                             }
-                        } else if classes.contains(&"account".to_string()) {
-                            if classes.contains(&"person".to_string()) {
+                        } else if classes.contains(&ENTRYCLASS_ACCOUNT.to_string()) {
+                            if classes.contains(&ENTRYCLASS_PERSON.to_string()) {
                                 ObjectType::Person
-                            } else if classes.contains(&"service-account".to_string()) {
+                            } else if classes.contains(&ENTRYCLASS_SERVICE_ACCOUNT.to_string()) {
                                 ObjectType::ServiceAccount
                             } else {
                                 return None;
@@ -70,7 +74,7 @@ impl GraphCommonOpt {
                             return None;
                         }
 
-                        let spn = entry.attrs.get("spn")?.first()?;
+                        let spn = entry.attrs.get(ATTR_SPN)?.first()?;
                         Some((spn.clone(), uuid.clone(), obj_type))
                     })
                     .collect::<Vec<(String, String, ObjectType)>>();
@@ -79,13 +83,13 @@ impl GraphCommonOpt {
                 let members_of = entries
                     .into_iter()
                     .filter_map(|entry| {
-                        let spn = entry.attrs.get("spn")?.first()?.clone();
-                        let uuid = entry.attrs.get("uuid")?.first()?.clone();
+                        let spn = entry.attrs.get(ATTR_SPN)?.first()?.clone();
+                        let uuid = entry.attrs.get(ATTR_UUID)?.first()?.clone();
                         let keep = typed_entries
                             .iter()
                             .any(|(_, filtered_uuid, _)| &uuid == filtered_uuid);
                         if keep {
-                            Some((spn, entry.attrs.get("member")?.clone()))
+                            Some((spn, entry.attrs.get(ATTR_MEMBER)?.clone()))
                         } else {
                             None
                         }

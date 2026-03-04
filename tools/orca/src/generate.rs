@@ -4,9 +4,10 @@ use crate::model::ActorRole;
 use crate::profile::Profile;
 use crate::state::{Credential, Flag, Group, GroupName, Person, PreflightState, State};
 use hashbrown::HashMap;
-use rand::distributions::{Alphanumeric, DistString, Uniform};
-use rand::seq::{index, SliceRandom};
-use rand::{Rng, SeedableRng};
+use rand::distr::{Alphanumeric, SampleString, Uniform};
+use rand::seq::{index, IndexedRandom};
+
+use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
 use std::collections::BTreeSet;
@@ -21,7 +22,7 @@ const PEOPLE_PREFIX: &str = "person";
 
 fn random_name(prefix: &str, rng: &mut ChaCha8Rng) -> String {
     let suffix = Alphanumeric.sample_string(rng, 8).to_lowercase();
-    format!("{}_{}", prefix, suffix)
+    format!("{prefix}_{suffix}")
 }
 
 fn random_password(rng: &mut ChaCha8Rng) -> String {
@@ -111,7 +112,7 @@ pub async fn populate(_client: &KanidmOrcaClient, profile: Profile) -> Result<St
             .choose(&mut seeded_rng)
             .expect("name set corrupted");
 
-        let display_name = format!("{} {}", given_name, surname);
+        let display_name = format!("{given_name} {surname}");
 
         let username = display_name
             .chars()
@@ -171,7 +172,8 @@ pub async fn populate(_client: &KanidmOrcaClient, profile: Profile) -> Result<St
                 let baseline = persons.len() / 3;
                 let inverse = persons.len() - baseline;
                 // Randomly add extra from the inverse
-                let extra = Uniform::new(0, inverse);
+                let extra =
+                    Uniform::new(0, inverse).map_err(|err| Error::RandomNumber(err.to_string()))?;
                 baseline + seeded_rng.sample(extra)
             }
         };

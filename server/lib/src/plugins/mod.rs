@@ -3,12 +3,11 @@
 //! helps to ensure that data is always in specific known states within the
 //! `QueryServer`
 
-use std::collections::BTreeSet;
-use std::sync::Arc;
-
 use crate::entry::{Entry, EntryCommitted, EntryInvalid, EntryNew, EntrySealed};
-use crate::event::{CreateEvent, DeleteEvent, ModifyEvent};
+use crate::event::{CreateEvent, DeleteEvent, ModifyEvent, ReviveRecycledEvent};
 use crate::prelude::*;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 mod attrunique;
 mod base;
@@ -18,11 +17,11 @@ mod domain;
 pub(crate) mod dyngroup;
 mod eckeygen;
 pub(crate) mod gidnumber;
-mod jwskeygen;
+pub(crate) mod hmac_name_unique;
 mod keyobject;
 mod memberof;
 mod namehistory;
-mod protected;
+mod oauth2;
 mod refint;
 mod session;
 mod spn;
@@ -36,7 +35,7 @@ trait Plugin {
         _cand: &mut Vec<EntryInvalidNew>,
         _ce: &CreateEvent,
     ) -> Result<(), OperationError> {
-        admin_error!(
+        error!(
             "plugin {} has an unimplemented pre_create_transform!",
             Self::id()
         );
@@ -44,13 +43,14 @@ trait Plugin {
         Err(OperationError::InvalidState)
     }
 
+    #[allow(dead_code)]
     fn pre_create(
         _qs: &mut QueryServerWriteTransaction,
         // List of what we will commit that is valid?
         _cand: &[EntrySealedNew],
         _ce: &CreateEvent,
     ) -> Result<(), OperationError> {
-        admin_error!("plugin {} has an unimplemented pre_create!", Self::id());
+        error!("plugin {} has an unimplemented pre_create!", Self::id());
         debug_assert!(false);
         Err(OperationError::InvalidState)
     }
@@ -61,7 +61,17 @@ trait Plugin {
         _cand: &[EntrySealedCommitted],
         _ce: &CreateEvent,
     ) -> Result<(), OperationError> {
-        admin_error!("plugin {} has an unimplemented post_create!", Self::id());
+        error!("plugin {} has an unimplemented post_create!", Self::id());
+        debug_assert!(false);
+        Err(OperationError::InvalidState)
+    }
+
+    fn teardown_memorials(
+        _qs: &mut QueryServerWriteTransaction,
+        _memorial_pairs: &mut [(&EntrySealedCommitted, &mut EntryInvalidCommitted)],
+        _re: &ReviveRecycledEvent,
+    ) -> Result<(), OperationError> {
+        error!("plugin {} has an unimplemented pre_modify!", Self::id());
         debug_assert!(false);
         Err(OperationError::InvalidState)
     }
@@ -72,7 +82,7 @@ trait Plugin {
         _cand: &mut Vec<EntryInvalidCommitted>,
         _me: &ModifyEvent,
     ) -> Result<(), OperationError> {
-        admin_error!("plugin {} has an unimplemented pre_modify!", Self::id());
+        error!("plugin {} has an unimplemented pre_modify!", Self::id());
         debug_assert!(false);
         Err(OperationError::InvalidState)
     }
@@ -84,7 +94,7 @@ trait Plugin {
         _cand: &[EntrySealedCommitted],
         _ce: &ModifyEvent,
     ) -> Result<(), OperationError> {
-        admin_error!("plugin {} has an unimplemented post_modify!", Self::id());
+        error!("plugin {} has an unimplemented post_modify!", Self::id());
         debug_assert!(false);
         Err(OperationError::InvalidState)
     }
@@ -95,7 +105,7 @@ trait Plugin {
         _cand: &mut Vec<EntryInvalidCommitted>,
         _me: &BatchModifyEvent,
     ) -> Result<(), OperationError> {
-        admin_error!(
+        error!(
             "plugin {} has an unimplemented pre_batch_modify!",
             Self::id()
         );
@@ -110,8 +120,22 @@ trait Plugin {
         _cand: &[EntrySealedCommitted],
         _me: &BatchModifyEvent,
     ) -> Result<(), OperationError> {
-        admin_error!(
+        error!(
             "plugin {} has an unimplemented post_batch_modify!",
+            Self::id()
+        );
+        debug_assert!(false);
+        Err(OperationError::InvalidState)
+    }
+
+    fn build_memorials(
+        _qs: &mut QueryServerWriteTransaction,
+        _cand: &[Arc<EntrySealedCommitted>],
+        _memorials: &mut BTreeMap<Uuid, EntryInitNew>,
+        _de: &DeleteEvent,
+    ) -> Result<(), OperationError> {
+        error!(
+            "plugin {} has an unimplemented run_build_memorials!",
             Self::id()
         );
         debug_assert!(false);
@@ -123,7 +147,7 @@ trait Plugin {
         _cand: &mut Vec<EntryInvalidCommitted>,
         _de: &DeleteEvent,
     ) -> Result<(), OperationError> {
-        admin_error!("plugin {} has an unimplemented pre_delete!", Self::id());
+        error!("plugin {} has an unimplemented pre_delete!", Self::id());
         debug_assert!(false);
         Err(OperationError::InvalidState)
     }
@@ -134,7 +158,7 @@ trait Plugin {
         _cand: &[EntrySealedCommitted],
         _ce: &DeleteEvent,
     ) -> Result<(), OperationError> {
-        admin_error!("plugin {} has an unimplemented post_delete!", Self::id());
+        error!("plugin {} has an unimplemented post_delete!", Self::id());
         debug_assert!(false);
         Err(OperationError::InvalidState)
     }
@@ -143,7 +167,7 @@ trait Plugin {
         _qs: &mut QueryServerWriteTransaction,
         _cand: &[EntryRefreshNew],
     ) -> Result<(), OperationError> {
-        admin_error!(
+        error!(
             "plugin {} has an unimplemented pre_repl_refresh!",
             Self::id()
         );
@@ -155,7 +179,7 @@ trait Plugin {
         _qs: &mut QueryServerWriteTransaction,
         _cand: &[EntrySealedCommitted],
     ) -> Result<(), OperationError> {
-        admin_error!(
+        error!(
             "plugin {} has an unimplemented post_repl_refresh!",
             Self::id()
         );
@@ -167,7 +191,7 @@ trait Plugin {
     //     _qs: &mut QueryServerWriteTransaction,
     //     _cand: &mut [(EntryIncrementalCommitted, Arc<EntrySealedCommitted>)],
     // ) -> Result<(), OperationError> {
-    //     admin_error!(
+    //     error!(
     //         "plugin {} has an unimplemented pre_repl_incremental!",
     //         Self::id()
     //     );
@@ -180,7 +204,7 @@ trait Plugin {
         _cand: &[(EntrySealedCommitted, Arc<EntrySealedCommitted>)],
         _conflict_uuids: &mut BTreeSet<Uuid>,
     ) -> Result<(), OperationError> {
-        admin_error!(
+        error!(
             "plugin {} has an unimplemented post_repl_incremental_conflict!",
             Self::id()
         );
@@ -194,7 +218,7 @@ trait Plugin {
         _cand: &[EntrySealedCommitted],
         _conflict_uuids: &BTreeSet<Uuid>,
     ) -> Result<(), OperationError> {
-        admin_error!(
+        error!(
             "plugin {} has an unimplemented post_repl_incremental!",
             Self::id()
         );
@@ -203,7 +227,7 @@ trait Plugin {
     }
 
     fn verify(_qs: &mut QueryServerReadTransaction) -> Vec<Result<(), ConsistencyError>> {
-        admin_error!("plugin {} has an unimplemented verify!", Self::id());
+        error!("plugin {} has an unimplemented verify!", Self::id());
         vec![Err(ConsistencyError::Unknown)]
     }
 }
@@ -230,26 +254,29 @@ impl Plugins {
     ) -> Result<(), OperationError> {
         base::Base::pre_create_transform(qs, cand, ce)?;
         valuedeny::ValueDeny::pre_create_transform(qs, cand, ce)?;
-        cred_import::CredImport::pre_create_transform(qs, cand, ce)?;
+
+        oauth2::OAuth2::pre_create_transform(qs, cand, ce)?;
+        eckeygen::EcdhKeyGen::pre_create_transform(qs, cand, ce)?;
         keyobject::KeyObjectManagement::pre_create_transform(qs, cand, ce)?;
-        jwskeygen::JwsKeygen::pre_create_transform(qs, cand, ce)?;
+        cred_import::CredImport::pre_create_transform(qs, cand, ce)?;
+
         gidnumber::GidNumber::pre_create_transform(qs, cand, ce)?;
         domain::Domain::pre_create_transform(qs, cand, ce)?;
         spn::Spn::pre_create_transform(qs, cand, ce)?;
         default_values::DefaultValues::pre_create_transform(qs, cand, ce)?;
         namehistory::NameHistory::pre_create_transform(qs, cand, ce)?;
-        eckeygen::EcdhKeyGen::pre_create_transform(qs, cand, ce)?;
+        hmac_name_unique::HmacNameUnique::pre_create_transform(qs, cand, ce)?;
         // Should always be last
         attrunique::AttrUnique::pre_create_transform(qs, cand, ce)
     }
 
-    #[instrument(level = "debug", name = "plugins::run_pre_create", skip_all)]
+    #[instrument(level = "trace", name = "plugins::run_pre_create", skip_all)]
     pub fn run_pre_create(
-        qs: &mut QueryServerWriteTransaction,
-        cand: &[Entry<EntrySealed, EntryNew>],
-        ce: &CreateEvent,
+        _qs: &mut QueryServerWriteTransaction,
+        _cand: &[Entry<EntrySealed, EntryNew>],
+        _ce: &CreateEvent,
     ) -> Result<(), OperationError> {
-        protected::Protected::pre_create(qs, cand, ce)
+        Ok(())
     }
 
     #[instrument(level = "debug", name = "plugins::run_post_create", skip_all)]
@@ -262,6 +289,15 @@ impl Plugins {
         memberof::MemberOf::post_create(qs, cand, ce)
     }
 
+    #[instrument(level = "debug", name = "plugins::run_teardown_memorials", skip_all)]
+    pub fn run_teardown_memorials(
+        qs: &mut QueryServerWriteTransaction,
+        memorial_pairs: &mut [(&EntrySealedCommitted, &mut EntryInvalidCommitted)],
+        re: &ReviveRecycledEvent,
+    ) -> Result<(), OperationError> {
+        hmac_name_unique::HmacNameUnique::teardown_memorials(qs, memorial_pairs, re)
+    }
+
     #[instrument(level = "debug", name = "plugins::run_pre_modify", skip_all)]
     pub fn run_pre_modify(
         qs: &mut QueryServerWriteTransaction,
@@ -269,19 +305,21 @@ impl Plugins {
         cand: &mut Vec<Entry<EntryInvalid, EntryCommitted>>,
         me: &ModifyEvent,
     ) -> Result<(), OperationError> {
-        protected::Protected::pre_modify(qs, pre_cand, cand, me)?;
         base::Base::pre_modify(qs, pre_cand, cand, me)?;
         valuedeny::ValueDeny::pre_modify(qs, pre_cand, cand, me)?;
-        cred_import::CredImport::pre_modify(qs, pre_cand, cand, me)?;
-        jwskeygen::JwsKeygen::pre_modify(qs, pre_cand, cand, me)?;
+
+        oauth2::OAuth2::pre_modify(qs, pre_cand, cand, me)?;
+        eckeygen::EcdhKeyGen::pre_modify(qs, pre_cand, cand, me)?;
         keyobject::KeyObjectManagement::pre_modify(qs, pre_cand, cand, me)?;
+        cred_import::CredImport::pre_modify(qs, pre_cand, cand, me)?;
+
         gidnumber::GidNumber::pre_modify(qs, pre_cand, cand, me)?;
         domain::Domain::pre_modify(qs, pre_cand, cand, me)?;
         spn::Spn::pre_modify(qs, pre_cand, cand, me)?;
         session::SessionConsistency::pre_modify(qs, pre_cand, cand, me)?;
         default_values::DefaultValues::pre_modify(qs, pre_cand, cand, me)?;
         namehistory::NameHistory::pre_modify(qs, pre_cand, cand, me)?;
-        eckeygen::EcdhKeyGen::pre_modify(qs, pre_cand, cand, me)?;
+        hmac_name_unique::HmacNameUnique::pre_modify(qs, pre_cand, cand, me)?;
         // attr unique should always be last
         attrunique::AttrUnique::pre_modify(qs, pre_cand, cand, me)
     }
@@ -305,19 +343,21 @@ impl Plugins {
         cand: &mut Vec<Entry<EntryInvalid, EntryCommitted>>,
         me: &BatchModifyEvent,
     ) -> Result<(), OperationError> {
-        protected::Protected::pre_batch_modify(qs, pre_cand, cand, me)?;
         base::Base::pre_batch_modify(qs, pre_cand, cand, me)?;
         valuedeny::ValueDeny::pre_batch_modify(qs, pre_cand, cand, me)?;
-        cred_import::CredImport::pre_batch_modify(qs, pre_cand, cand, me)?;
-        jwskeygen::JwsKeygen::pre_batch_modify(qs, pre_cand, cand, me)?;
+
+        oauth2::OAuth2::pre_batch_modify(qs, pre_cand, cand, me)?;
+        eckeygen::EcdhKeyGen::pre_batch_modify(qs, pre_cand, cand, me)?;
         keyobject::KeyObjectManagement::pre_batch_modify(qs, pre_cand, cand, me)?;
+        cred_import::CredImport::pre_batch_modify(qs, pre_cand, cand, me)?;
+
         gidnumber::GidNumber::pre_batch_modify(qs, pre_cand, cand, me)?;
         domain::Domain::pre_batch_modify(qs, pre_cand, cand, me)?;
         spn::Spn::pre_batch_modify(qs, pre_cand, cand, me)?;
         session::SessionConsistency::pre_batch_modify(qs, pre_cand, cand, me)?;
         default_values::DefaultValues::pre_batch_modify(qs, pre_cand, cand, me)?;
         namehistory::NameHistory::pre_batch_modify(qs, pre_cand, cand, me)?;
-        eckeygen::EcdhKeyGen::pre_batch_modify(qs, pre_cand, cand, me)?;
+        hmac_name_unique::HmacNameUnique::pre_batch_modify(qs, pre_cand, cand, me)?;
         // attr unique should always be last
         attrunique::AttrUnique::pre_batch_modify(qs, pre_cand, cand, me)
     }
@@ -334,13 +374,22 @@ impl Plugins {
         memberof::MemberOf::post_batch_modify(qs, pre_cand, cand, me)
     }
 
+    #[instrument(level = "debug", name = "plugins::run_build_memorials", skip_all)]
+    pub fn run_build_memorials(
+        qs: &mut QueryServerWriteTransaction,
+        cand: &[Arc<EntrySealedCommitted>],
+        memorials: &mut BTreeMap<Uuid, EntryInitNew>,
+        de: &DeleteEvent,
+    ) -> Result<(), OperationError> {
+        hmac_name_unique::HmacNameUnique::build_memorials(qs, cand, memorials, de)
+    }
+
     #[instrument(level = "debug", name = "plugins::run_pre_delete", skip_all)]
     pub fn run_pre_delete(
         qs: &mut QueryServerWriteTransaction,
         cand: &mut Vec<Entry<EntryInvalid, EntryCommitted>>,
         de: &DeleteEvent,
     ) -> Result<(), OperationError> {
-        protected::Protected::pre_delete(qs, cand, de)?;
         memberof::MemberOf::pre_delete(qs, cand, de)
     }
 
@@ -394,7 +443,9 @@ impl Plugins {
         conflict_uuids: &mut BTreeSet<Uuid>,
     ) -> Result<(), OperationError> {
         // Attr unique MUST BE FIRST.
-        attrunique::AttrUnique::post_repl_incremental_conflict(qs, cand, conflict_uuids)
+        attrunique::AttrUnique::post_repl_incremental_conflict(qs, cand, conflict_uuids)?;
+        // refint probably needs to be last to ensure all refers are correctly cleaned.
+        refint::ReferentialIntegrity::post_repl_incremental_conflict(qs, cand, conflict_uuids)
     }
 
     #[instrument(level = "debug", name = "plugins::run_post_repl_incremental", skip_all)]

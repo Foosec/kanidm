@@ -9,10 +9,14 @@ use super::ServerState;
 use crate::https::extractors::VerifiedClientInformation;
 use axum::extract::{rejection::JsonRejection, DefaultBodyLimit, Path, Query, State};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Extension, Json, Router};
+use kanidm_proto::scim_v1::ScimEntry;
 use kanidm_proto::scim_v1::{
-    server::ScimEntryKanidm, ScimEntryGetQuery, ScimSyncRequest, ScimSyncState,
+    client::{ScimEntryPostGeneric, ScimEntryPutGeneric},
+    server::{ScimEntryKanidm, ScimListResponse},
+    ScimApplicationPassword, ScimApplicationPasswordCreate, ScimEntryGetQuery, ScimSyncRequest,
+    ScimSyncState,
 };
 use kanidm_proto::v1::Entry as ProtoEntry;
 use kanidmd_lib::prelude::*;
@@ -23,11 +27,11 @@ const DEFAULT_SCIM_SYNC_BYTES: usize = 1024 * 1024 * 32;
     get,
     path = "/v1/sync_account",
     responses(
-        (status = 200,content_type="application/json", body=Vec<ProtoEntry>),
+        (status = 200,content_type=APPLICATION_JSON, body=Vec<ProtoEntry>),
         ApiResponseWithout200,
     ),
     security(("token_jwt" = [])),
-    tag = "v1/sync_account",
+    tag = "sync_account",
     operation_id = "sync_account_get"
 )]
 /// Get all? the sync accounts.
@@ -48,7 +52,7 @@ pub async fn sync_account_get(
         DefaultApiResponse,
     ),
     security(("token_jwt" = [])),
-    tag = "v1/sync_account",
+    tag = "sync_account",
     operation_id = "sync_account_post"
 )]
 pub async fn sync_account_post(
@@ -65,11 +69,11 @@ pub async fn sync_account_post(
     get,
     path = "/v1/sync_account/{id}",
     responses(
-        (status = 200,content_type="application/json", body=Option<ProtoEntry>),
+        (status = 200,content_type=APPLICATION_JSON, body=Option<ProtoEntry>),
         ApiResponseWithout200,
     ),
     security(("token_jwt" = [])),
-    tag = "v1/sync_account",
+    tag = "sync_account",
 )]
 /// Get the details of a sync account
 pub async fn sync_account_id_get(
@@ -90,7 +94,7 @@ pub async fn sync_account_id_get(
         DefaultApiResponse,
     ),
     security(("token_jwt" = [])),
-    tag = "v1/sync_account",
+    tag = "sync_account",
     operation_id = "sync_account_id_patch"
 )]
 /// Modify a sync account in-place
@@ -119,7 +123,7 @@ pub async fn sync_account_id_patch(
         DefaultApiResponse,
     ),
     security(("token_jwt" = [])),
-    tag = "v1/sync_account",
+    tag = "sync_account",
     operation_id = "sync_account_id_finalise_get"
 )]
 pub async fn sync_account_id_finalise_get(
@@ -143,7 +147,7 @@ pub async fn sync_account_id_finalise_get(
         DefaultApiResponse,
     ),
     security(("token_jwt" = [])),
-    tag = "v1/sync_account",
+    tag = "sync_account",
     operation_id = "sync_account_id_terminate_get"
 )]
 pub async fn sync_account_id_terminate_get(
@@ -164,11 +168,11 @@ pub async fn sync_account_id_terminate_get(
     post,
     path = "/v1/sync_account/{id}/_sync_token",
     responses(
-        (status = 200, body=String, content_type="application/json"),
+        (status = 200, body=String, content_type=APPLICATION_JSON),
         ApiResponseWithout200,
     ),
     security(("token_jwt" = [])),
-    tag = "v1/sync_account",
+    tag = "sync_account",
     operation_id = "sync_account_token_post"
 )]
 pub async fn sync_account_token_post(
@@ -193,7 +197,7 @@ pub async fn sync_account_token_post(
         DefaultApiResponse,
     ),
     security(("token_jwt" = [])),
-    tag = "v1/sync_account",
+    tag = "sync_account",
     operation_id = "sync_account_token_delete"
 )]
 pub async fn sync_account_token_delete(
@@ -214,11 +218,11 @@ pub async fn sync_account_token_delete(
     get,
     path = "/v1/sync_account/{id}/_attr/{attr}",
     responses(
-        (status = 200, body=Option<Vec<String>>, content_type="application/json"),
+        (status = 200, body=Option<Vec<String>>, content_type=APPLICATION_JSON),
         ApiResponseWithout200,
     ),
     security(("token_jwt" = [])),
-    tag = "v1/sync_account",
+    tag = "sync_account",
     operation_id = "sync_account_id_attr_get"
 )]
 pub async fn sync_account_id_attr_get(
@@ -239,7 +243,7 @@ pub async fn sync_account_id_attr_get(
         DefaultApiResponse,
     ),
     security(("token_jwt" = [])),
-    tag = "v1/sync_account",
+    tag = "sync_account",
     operation_id = "sync_account_id_attr_put"
 )]
 pub async fn sync_account_id_attr_put(
@@ -298,7 +302,7 @@ async fn scim_sync_post(
     get,
     path = "/scim/v1/Sync",
     responses(
-        (status = 200, content_type="application/json", body=ScimSyncState), // TODO: response content
+        (status = 200, content_type=APPLICATION_JSON, body=ScimSyncState), // TODO: response content
         ApiResponseWithout200,
     ),
     security(("token_jwt" = [])),
@@ -321,9 +325,114 @@ async fn scim_sync_get(
 
 #[utoipa::path(
     get,
+    path = "/scim/v1/Entry",
+    responses(
+        (status = 200, content_type=APPLICATION_JSON, body=ScimListResponse),
+        ApiResponseWithout200,
+    ),
+    security(("token_jwt" = [])),
+    tag = "scim",
+    operation_id = "scim_entry_get"
+)]
+async fn scim_entry_get(
+    State(state): State<ServerState>,
+    Extension(kopid): Extension<KOpId>,
+    VerifiedClientInformation(client_auth_info): VerifiedClientInformation,
+    Query(scim_entry_get_query): Query<ScimEntryGetQuery>,
+) -> Result<Json<ScimListResponse>, WebError> {
+    state
+        .qe_r_ref
+        .scim_entry_search(
+            client_auth_info,
+            kopid.eventid,
+            EntryClass::Object.into(),
+            scim_entry_get_query,
+        )
+        .await
+        .map(Json::from)
+        .map_err(WebError::from)
+}
+
+#[utoipa::path(
+    post,
+    path = "/scim/v1/Entry",
+    responses(
+        (status = 200, content_type=APPLICATION_JSON, body=ScimEntry),
+        ApiResponseWithout200,
+    ),
+    security(("token_jwt" = [])),
+    tag = "scim",
+    operation_id = "scim_entry_post"
+)]
+async fn scim_entry_post(
+    State(state): State<ServerState>,
+    Extension(kopid): Extension<KOpId>,
+    VerifiedClientInformation(client_auth_info): VerifiedClientInformation,
+    Json(post_generic): Json<ScimEntryPostGeneric>,
+) -> Result<Json<ScimEntryKanidm>, WebError> {
+    state
+        .qe_w_ref
+        .scim_entry_create(client_auth_info, kopid.eventid, &[], post_generic)
+        .await
+        .map(Json::from)
+        .map_err(WebError::from)
+}
+
+#[utoipa::path(
+    put,
+    path = "/scim/v1/Entry",
+    responses(
+        (status = 200, content_type=APPLICATION_JSON, body=ScimEntry),
+        ApiResponseWithout200,
+    ),
+    security(("token_jwt" = [])),
+    tag = "scim",
+    operation_id = "scim_entry_put"
+)]
+async fn scim_entry_put(
+    State(state): State<ServerState>,
+    Extension(kopid): Extension<KOpId>,
+    VerifiedClientInformation(client_auth_info): VerifiedClientInformation,
+    Json(put_generic): Json<ScimEntryPutGeneric>,
+) -> Result<Json<ScimEntryKanidm>, WebError> {
+    state
+        .qe_w_ref
+        .handle_scim_entry_put(client_auth_info, kopid.eventid, put_generic)
+        .await
+        .map(Json::from)
+        .map_err(WebError::from)
+}
+
+#[utoipa::path(
+    delete,
     path = "/scim/v1/Entry/{id}",
     responses(
-        (status = 200, content_type="application/json", body=ScimEntry),
+        (status = 200, content_type=APPLICATION_JSON, body=ScimEntry),
+        ApiResponseWithout200,
+    ),
+    security(("token_jwt" = [])),
+    tag = "scim",
+    operation_id = "scim_entry_id_delete"
+)]
+async fn scim_entry_id_delete(
+    State(state): State<ServerState>,
+    Path(id): Path<String>,
+    Extension(kopid): Extension<KOpId>,
+    VerifiedClientInformation(client_auth_info): VerifiedClientInformation,
+) -> Result<Json<()>, WebError> {
+    state
+        .qe_w_ref
+        .scim_entry_id_delete(client_auth_info, kopid.eventid, id, EntryClass::Object)
+        .await
+        .map(Json::from)
+        .map_err(WebError::from)
+}
+
+#[utoipa::path(
+    get,
+    path = "/scim/v1/Entry/{id}",
+    responses(
+        (status = 200, content_type=APPLICATION_JSON, body=ScimEntry),
         ApiResponseWithout200,
     ),
     security(("token_jwt" = [])),
@@ -355,7 +464,7 @@ async fn scim_entry_id_get(
     get,
     path = "/scim/v1/Person/{id}",
     responses(
-        (status = 200, content_type="application/json", body=ScimEntry),
+        (status = 200, content_type=APPLICATION_JSON, body=ScimEntry),
         ApiResponseWithout200,
     ),
     security(("token_jwt" = [])),
@@ -383,6 +492,376 @@ async fn scim_person_id_get(
         .map_err(WebError::from)
 }
 
+#[utoipa::path(
+    post,
+    path = "/scim/v1/Person/{id}/Application/_create_password",
+    request_body = ScimApplicationPasswordCreate,
+    responses(
+        (status = 200, content_type=APPLICATION_JSON, body=ScimApplicationPassword),
+        ApiResponseWithout200,
+    ),
+    security(("token_jwt" = [])),
+    tag = "scim",
+    operation_id = "scim_person_id_application_create_password"
+)]
+async fn scim_person_id_application_create_password(
+    State(state): State<ServerState>,
+    Path(id): Path<String>,
+    Extension(kopid): Extension<KOpId>,
+    VerifiedClientInformation(client_auth_info): VerifiedClientInformation,
+    Json(request): Json<ScimApplicationPasswordCreate>,
+) -> Result<Json<ScimApplicationPassword>, WebError> {
+    state
+        .qe_w_ref
+        .scim_person_application_create_password(client_auth_info, kopid.eventid, id, request)
+        .await
+        .map(Json::from)
+        .map_err(WebError::from)
+}
+
+#[utoipa::path(
+    get,
+    path = "/scim/v1/Person/{id}/Application/{apppwd_uuid}",
+    responses(
+        DefaultApiResponse,
+    ),
+    security(("token_jwt" = [])),
+    tag = "scim",
+    operation_id = "scim_person_id_application_delete_password"
+)]
+async fn scim_person_id_application_delete_password(
+    State(state): State<ServerState>,
+    Path((id, apppwd_id)): Path<(String, Uuid)>,
+    Extension(kopid): Extension<KOpId>,
+    VerifiedClientInformation(client_auth_info): VerifiedClientInformation,
+) -> Result<Json<()>, WebError> {
+    state
+        .qe_w_ref
+        .scim_person_application_delete_password(client_auth_info, kopid.eventid, id, apppwd_id)
+        .await
+        .map(Json::from)
+        .map_err(WebError::from)
+}
+
+#[utoipa::path(
+    get,
+    path = "/scim/v1/Application",
+    responses(
+        (status = 200, content_type=APPLICATION_JSON, body=ScimListResponse),
+        ApiResponseWithout200,
+    ),
+    security(("token_jwt" = [])),
+    tag = "scim",
+    operation_id = "scim_application_get"
+)]
+async fn scim_application_get(
+    State(state): State<ServerState>,
+    Extension(kopid): Extension<KOpId>,
+    VerifiedClientInformation(client_auth_info): VerifiedClientInformation,
+    Query(scim_entry_get_query): Query<ScimEntryGetQuery>,
+) -> Result<Json<ScimListResponse>, WebError> {
+    state
+        .qe_r_ref
+        .scim_entry_search(
+            client_auth_info,
+            kopid.eventid,
+            EntryClass::Application.into(),
+            scim_entry_get_query,
+        )
+        .await
+        .map(Json::from)
+        .map_err(WebError::from)
+}
+
+#[utoipa::path(
+    post,
+    path = "/scim/v1/Application",
+    request_body = ScimEntryPostGeneric,
+    responses(
+        (status = 200, content_type=APPLICATION_JSON, body=ScimEntry),
+        ApiResponseWithout200,
+    ),
+    security(("token_jwt" = [])),
+    tag = "scim",
+    operation_id = "scim_application_post"
+)]
+async fn scim_application_post(
+    State(state): State<ServerState>,
+    Extension(kopid): Extension<KOpId>,
+    VerifiedClientInformation(client_auth_info): VerifiedClientInformation,
+    Json(entry_post): Json<ScimEntryPostGeneric>,
+) -> Result<Json<ScimEntryKanidm>, WebError> {
+    state
+        .qe_w_ref
+        .scim_entry_create(
+            client_auth_info,
+            kopid.eventid,
+            &[
+                EntryClass::Account,
+                EntryClass::ServiceAccount,
+                EntryClass::Application,
+            ],
+            entry_post,
+        )
+        .await
+        .map(Json::from)
+        .map_err(WebError::from)
+}
+
+#[utoipa::path(
+    get,
+    path = "/scim/v1/Application/{id}",
+    responses(
+        (status = 200, content_type=APPLICATION_JSON, body=ScimEntry),
+        ApiResponseWithout200,
+    ),
+    security(("token_jwt" = [])),
+    tag = "scim",
+    operation_id = "scim_application_id_get"
+)]
+async fn scim_application_id_get(
+    State(state): State<ServerState>,
+    Path(id): Path<String>,
+    Extension(kopid): Extension<KOpId>,
+    VerifiedClientInformation(client_auth_info): VerifiedClientInformation,
+) -> Result<Json<ScimEntryKanidm>, WebError> {
+    state
+        .qe_r_ref
+        .scim_entry_id_get(
+            client_auth_info,
+            kopid.eventid,
+            id,
+            EntryClass::Application,
+            ScimEntryGetQuery::default(),
+        )
+        .await
+        .map(Json::from)
+        .map_err(WebError::from)
+}
+
+#[utoipa::path(
+    delete,
+    path = "/scim/v1/Application/{id}",
+    responses(
+        (status = 200, content_type=APPLICATION_JSON),
+        ApiResponseWithout200,
+    ),
+    security(("token_jwt" = [])),
+    tag = "scim",
+    operation_id = "scim_application_id_delete"
+)]
+async fn scim_application_id_delete(
+    State(state): State<ServerState>,
+    Path(id): Path<String>,
+    Extension(kopid): Extension<KOpId>,
+    VerifiedClientInformation(client_auth_info): VerifiedClientInformation,
+) -> Result<Json<()>, WebError> {
+    state
+        .qe_w_ref
+        .scim_entry_id_delete(client_auth_info, kopid.eventid, id, EntryClass::Application)
+        .await
+        .map(Json::from)
+        .map_err(WebError::from)
+}
+
+#[utoipa::path(
+    get,
+    path = "/scim/v1/Class",
+    responses(
+        (status = 200, content_type=APPLICATION_JSON, body=ScimListResponse),
+        ApiResponseWithout200,
+    ),
+    security(("token_jwt" = [])),
+    tag = "scim",
+    operation_id = "scim_schema_class_get"
+)]
+async fn scim_schema_class_get(
+    State(state): State<ServerState>,
+    Extension(kopid): Extension<KOpId>,
+    VerifiedClientInformation(client_auth_info): VerifiedClientInformation,
+    Query(scim_entry_get_query): Query<ScimEntryGetQuery>,
+) -> Result<Json<ScimListResponse>, WebError> {
+    state
+        .qe_r_ref
+        .scim_entry_search(
+            client_auth_info,
+            kopid.eventid,
+            EntryClass::ClassType.into(),
+            scim_entry_get_query,
+        )
+        .await
+        .map(Json::from)
+        .map_err(WebError::from)
+}
+
+#[utoipa::path(
+    get,
+    path = "/scim/v1/Attribute",
+    responses(
+        (status = 200, content_type=APPLICATION_JSON, body=ScimListResponse),
+        ApiResponseWithout200,
+    ),
+    security(("token_jwt" = [])),
+    tag = "scim",
+    operation_id = "scim_schema_attribute_get"
+)]
+async fn scim_schema_attribute_get(
+    State(state): State<ServerState>,
+    Extension(kopid): Extension<KOpId>,
+    VerifiedClientInformation(client_auth_info): VerifiedClientInformation,
+    Query(scim_entry_get_query): Query<ScimEntryGetQuery>,
+) -> Result<Json<ScimListResponse>, WebError> {
+    state
+        .qe_r_ref
+        .scim_entry_search(
+            client_auth_info,
+            kopid.eventid,
+            EntryClass::AttributeType.into(),
+            scim_entry_get_query,
+        )
+        .await
+        .map(Json::from)
+        .map_err(WebError::from)
+}
+
+#[utoipa::path(
+    get,
+    path = "/scim/v1/Message",
+    responses(
+        (status = 200, content_type=APPLICATION_JSON, body=ScimListResponse),
+        ApiResponseWithout200,
+    ),
+    security(("token_jwt" = [])),
+    tag = "scim",
+    operation_id = "scim_message_get"
+)]
+async fn scim_message_get(
+    State(state): State<ServerState>,
+    Extension(kopid): Extension<KOpId>,
+    VerifiedClientInformation(client_auth_info): VerifiedClientInformation,
+    Query(scim_entry_get_query): Query<ScimEntryGetQuery>,
+) -> Result<Json<ScimListResponse>, WebError> {
+    state
+        .qe_r_ref
+        .scim_entry_search(
+            client_auth_info,
+            kopid.eventid,
+            EntryClass::OutboundMessage.into(),
+            scim_entry_get_query,
+        )
+        .await
+        .map(Json::from)
+        .map_err(WebError::from)
+}
+
+#[utoipa::path(
+    get,
+    path = "/scim/v1/Message/{id}",
+    responses(
+        (status = 200, content_type=APPLICATION_JSON, body=ScimEntry),
+        ApiResponseWithout200,
+    ),
+    security(("token_jwt" = [])),
+    tag = "scim",
+    operation_id = "scim_message_id_get"
+)]
+async fn scim_message_id_get(
+    State(state): State<ServerState>,
+    Path(id): Path<String>,
+    Extension(kopid): Extension<KOpId>,
+    VerifiedClientInformation(client_auth_info): VerifiedClientInformation,
+    Query(scim_entry_get_query): Query<ScimEntryGetQuery>,
+) -> Result<Json<ScimEntryKanidm>, WebError> {
+    state
+        .qe_r_ref
+        .scim_entry_id_get(
+            client_auth_info,
+            kopid.eventid,
+            id,
+            EntryClass::OutboundMessage,
+            scim_entry_get_query,
+        )
+        .await
+        .map(Json::from)
+        .map_err(WebError::from)
+}
+
+#[utoipa::path(
+    get,
+    path = "/scim/v1/Message/_ready",
+    responses(
+        (status = 200, content_type=APPLICATION_JSON, body=ScimListResponse),
+        ApiResponseWithout200,
+    ),
+    security(("token_jwt" = [])),
+    tag = "scim",
+    operation_id = "scim_message_ready_get"
+)]
+async fn scim_message_ready_get(
+    State(state): State<ServerState>,
+    Extension(kopid): Extension<KOpId>,
+    VerifiedClientInformation(client_auth_info): VerifiedClientInformation,
+) -> Result<Json<ScimListResponse>, WebError> {
+    //
+    state
+        .qe_r_ref
+        .scim_message_ready_search(client_auth_info, kopid.eventid)
+        .await
+        .map(Json::from)
+        .map_err(WebError::from)
+}
+
+#[utoipa::path(
+    delete,
+    path = "/scim/v1/Message/{id}/_sent",
+    responses(
+        (status = 200, content_type=APPLICATION_JSON),
+        ApiResponseWithout200,
+    ),
+    security(("token_jwt" = [])),
+    tag = "scim",
+    operation_id = "scim_message_id_sent_post"
+)]
+async fn scim_message_id_sent_post(
+    State(state): State<ServerState>,
+    Path(message_id): Path<Uuid>,
+    Extension(kopid): Extension<KOpId>,
+    VerifiedClientInformation(client_auth_info): VerifiedClientInformation,
+) -> Result<Json<()>, WebError> {
+    state
+        .qe_w_ref
+        .scim_message_id_sent(client_auth_info, kopid.eventid, message_id)
+        .await
+        .map(Json::from)
+        .map_err(WebError::from)
+}
+
+#[utoipa::path(
+    get,
+    path = "/scim/v1/Person/{id}/_messages/_send_test",
+    responses(
+        (status = 200, content_type=APPLICATION_JSON, body=ScimEntry),
+        ApiResponseWithout200,
+    ),
+    security(("token_jwt" = [])),
+    tag = "scim",
+    operation_id = "scim_person_id_message_send_test_get"
+)]
+async fn scim_person_id_message_send_test_get(
+    State(state): State<ServerState>,
+    Path(id): Path<String>,
+    Extension(kopid): Extension<KOpId>,
+    VerifiedClientInformation(client_auth_info): VerifiedClientInformation,
+) -> Result<Json<()>, WebError> {
+    state
+        .qe_w_ref
+        .scim_person_message_send_test(client_auth_info, kopid.eventid, id)
+        .await
+        .map(Json::from)
+        .map_err(WebError::from)
+}
+
+#[instrument(level = "debug", skip_all, name = "https_v1_scim_route_setup")]
 pub fn route_setup() -> Router<ServerState> {
     Router::new()
         .route(
@@ -390,23 +869,23 @@ pub fn route_setup() -> Router<ServerState> {
             get(sync_account_get).post(sync_account_post),
         )
         .route(
-            "/v1/sync_account/:id",
+            "/v1/sync_account/{id}",
             get(sync_account_id_get).patch(sync_account_id_patch),
         )
         .route(
-            "/v1/sync_account/:id/_attr/:attr",
+            "/v1/sync_account/{id}/_attr/{attr}",
             get(sync_account_id_attr_get).put(sync_account_id_attr_put),
         )
         .route(
-            "/v1/sync_account/:id/_finalise",
+            "/v1/sync_account/{id}/_finalise",
             get(sync_account_id_finalise_get),
         )
         .route(
-            "/v1/sync_account/:id/_terminate",
+            "/v1/sync_account/{id}/_terminate",
             get(sync_account_id_terminate_get),
         )
         .route(
-            "/v1/sync_account/:id/_sync_token",
+            "/v1/sync_account/{id}/_sync_token",
             post(sync_account_token_post).delete(sync_account_token_delete),
         )
         // https://datatracker.ietf.org/doc/html/rfc7644#section-3.2
@@ -473,11 +952,33 @@ pub fn route_setup() -> Router<ServerState> {
         //  Entry    /Entry/{id}      GET                    Retrieve a generic entry
         //                                                   of any kind from the database.
         //                                                   {id} is any unique id.
-        .route("/scim/v1/Entry/:id", get(scim_entry_id_get))
+        .route(
+            "/scim/v1/Entry",
+            get(scim_entry_get)
+                .post(scim_entry_post)
+                .put(scim_entry_put),
+        )
+        .route(
+            "/scim/v1/Entry/{id}",
+            get(scim_entry_id_get).delete(scim_entry_id_delete),
+        )
         //  Person   /Person/{id}     GET                    Retrieve a a person from the
         //                                                   database.
         //                                                   {id} is any unique id.
-        .route("/scim/v1/Person/:id", get(scim_person_id_get))
+        .route("/scim/v1/Person/{id}", get(scim_person_id_get))
+        .route(
+            "/scim/v1/Person/{id}/Application/_create_password",
+            post(scim_person_id_application_create_password),
+        )
+        .route(
+            "/scim/v1/Person/{id}/Application/{apppwd_id}",
+            delete(scim_person_id_application_delete_password),
+        )
+        //  Person   /Person/{id}/_messages/_send_test
+        .route(
+            "/scim/v1/Person/{id}/_message/_send_test",
+            get(scim_person_id_message_send_test_get),
+        )
         //
         //  Sync     /Sync            GET                    Retrieve the current
         //                                                   sync state associated
@@ -486,6 +987,38 @@ pub fn route_setup() -> Router<ServerState> {
         //
         //                            POST                   Send a sync update
         //
+        //
+        //  Application   /Application     Post              Create a new application
+        //
+        .route(
+            "/scim/v1/Application",
+            get(scim_application_get).post(scim_application_post),
+        )
+        //  Application   /Application/{id}     Delete      Delete the application identified by id
+        //
+        .route(
+            "/scim/v1/Application/{id}",
+            get(scim_application_id_get).delete(scim_application_id_delete),
+        )
+        //  Class      /Class          GET                  List or query Schema Classes
+        //
+        .route("/scim/v1/Class", get(scim_schema_class_get))
+        //  Attribute /Attribute          GET               List or query Schema Attributes
+        //
+        .route("/scim/v1/Attribute", get(scim_schema_attribute_get))
+        //  Message    /Message          GET               List or query queued Messages
+        //                               POST              Create a new message for sending.
+        .route("/scim/v1/Message", get(scim_message_get))
+        //  Message    /Message/_ready   GET               List Messages that are ready to be sent
+        .route("/scim/v1/Message/_ready", get(scim_message_ready_get))
+        //  Message    /Message/{id}    GET                Fetch message by id
+        .route("/scim/v1/Message/{id}", get(scim_message_id_get))
+        //  Message    /Message/{id}/_sent     POST         Mark this message as having been processed and sent
+        .route(
+            "/scim/v1/Message/{id}/_sent",
+            post(scim_message_id_sent_post),
+        )
+        // Synchronisation routes.
         .route(
             "/scim/v1/Sync",
             post(scim_sync_post)

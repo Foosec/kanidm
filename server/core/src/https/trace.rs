@@ -1,104 +1,102 @@
 //! Reimplementation of tower-http's DefaultMakeSpan that only runs at "INFO" level for our own needs.
 
-use axum::http::{Request, StatusCode};
+use crate::https::LoggerType;
+use axum::http::Request;
 use kanidm_proto::constants::KOPID;
-use sketching::event_dynamic_lvl;
-use tower_http::LatencyUnit;
+use tower_http::trace::OnRequest;
 use tracing::{Level, Span};
-
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 /// The default way Spans will be created for Trace.
 ///
-#[derive(Debug, Clone)]
-pub struct DefaultMakeSpanKanidmd {}
-
-impl DefaultMakeSpanKanidmd {
-    /// Create a new `DefaultMakeSpanKanidmd`.
-    pub fn new() -> Self {
-        Self {}
-    }
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct SpanCreator {
+    pub(crate) log_engine: LoggerType,
 }
 
-impl Default for DefaultMakeSpanKanidmd {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<B> tower_http::trace::MakeSpan<B> for DefaultMakeSpanKanidmd {
+impl<B> tower_http::trace::MakeSpan<B> for SpanCreator {
     fn make_span(&mut self, request: &Request<B>) -> Span {
         // Needs to be at info to ensure that there is always a span for each
         // tracing event to hook into.
+        //
+        // NOTE: There is a directive in the logging pipeline setup to force this
+        // span to always be at the info level. If this is not done, then there
+        // will not be an event uuid available which causes TONS of problems. Like
+        // crashing.
         tracing::span!(
             Level::INFO,
             "request",
             method = %request.method(),
             uri = %request.uri(),
             version = ?request.version(),
+            kopid = tracing::field::Empty, // filled in later
+            connection_address = tracing::field::Empty, // filled in later
+            client_address = tracing::field::Empty, // filled in later
+            status_code = tracing::field::Empty, // filled in later, used by tracing forest
+            http.response.status_code = tracing::field::Empty, // filled in later, used by otel
+            latency = tracing::field::Empty, // filled in later
         )
     }
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct DefaultOnResponseKanidmd {
-    #[allow(dead_code)]
-    level: Level,
-    #[allow(dead_code)]
-    latency_unit: LatencyUnit,
-    #[allow(dead_code)]
-    include_headers: bool,
-}
-
-impl DefaultOnResponseKanidmd {
-    #[allow(dead_code)]
-    pub fn new() -> Self {
-        Self::default()
+impl<B> OnRequest<B> for SpanCreator {
+    fn on_request(&mut self, request: &axum::http::Request<B>, span: &Span) {
+        if let Some(client_conn_info) = request.extensions().get::<crate::https::ClientConnInfo>() {
+            span.record(
+                "connection_address",
+                client_conn_info.connection_addr.to_string(),
+            );
+            span.record(
+                "client_address",
+                client_conn_info.client_ip_addr.to_string(),
+            );
+        };
     }
 }
 
-impl Default for DefaultOnResponseKanidmd {
-    fn default() -> Self {
-        Self {
-            level: Level::INFO,
-            latency_unit: LatencyUnit::Millis,
-            include_headers: false,
-        }
-    }
-}
-
-impl<B> tower_http::trace::OnResponse<B> for DefaultOnResponseKanidmd {
+impl<B> tower_http::trace::OnResponse<B> for SpanCreator {
     fn on_response(
         self,
         response: &axum::response::Response<B>,
         latency: std::time::Duration,
-        _span: &Span,
+        span: &Span,
     ) {
+        if let Some(client_conn_info) = response.extensions().get::<crate::https::ClientConnInfo>()
+        {
+            span.record(
+                "connection_address",
+                client_conn_info.connection_addr.to_string(),
+            );
+            span.record(
+                "client_address",
+                client_conn_info.client_ip_addr.to_string(),
+            );
+        };
+
         let kopid = match response.headers().get(KOPID) {
             Some(val) => val.to_str().unwrap_or("<invalid kopid>"),
             None => "<unknown>",
         };
-        let (level, msg) =
-            match response.status().is_success() || response.status().is_informational() {
-                true => (Level::DEBUG, "response sent"),
-                false => {
-                    if response.status().is_redirection() {
-                        (Level::INFO, "client redirection sent")
-                    } else if response.status().is_client_error() {
-                        if response.status() == StatusCode::NOT_FOUND {
-                            (Level::INFO, "client error")
-                        } else {
-                            (Level::WARN, "client error") // it worked, but there was an input error
-                        }
-                    } else {
-                        (Level::ERROR, "error handling request") // oh no the server failed
-                    }
-                }
-            };
-        event_dynamic_lvl!(
-            level,
-            ?latency,
-            status_code = response.status().as_u16(),
-            kopid = kopid,
-            msg
-        );
+
+        if self.log_engine == LoggerType::OpenTelemetry {
+            span.record(
+                self.log_engine.status_code_field(),
+                response.status().as_u16(),
+            );
+            match response.status().is_success() {
+                true => span.set_status(opentelemetry::trace::Status::Ok),
+                false => span.set_status(opentelemetry::trace::Status::error(format!(
+                    "HTTP {}",
+                    response.status().as_u16()
+                ))),
+            }
+        } else {
+            span.record(
+                self.log_engine.status_code_field(),
+                response.status().as_u16() as u64,
+            );
+            // don't need these in otel because they're alreayd in th
+            span.record("latency", latency.as_millis());
+        }
+        span.record("kopid", kopid);
     }
 }

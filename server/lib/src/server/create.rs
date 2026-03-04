@@ -7,7 +7,7 @@ impl QueryServerWriteTransaction<'_> {
     /// The create event is a raw, read only representation of the request
     /// that was made to us, including information about the identity
     /// performing the request.
-    pub fn create(&mut self, ce: &CreateEvent) -> Result<(), OperationError> {
+    pub fn create(&mut self, ce: &CreateEvent) -> Result<Option<Vec<Uuid>>, OperationError> {
         if !ce.ident.is_internal() {
             security_info!(name = %ce.ident, "create initiator");
         }
@@ -41,7 +41,7 @@ impl QueryServerWriteTransaction<'_> {
         // are valid to create within the set of replication transitions. This
         // means they *can not* be recycled or tombstones!
         if candidates.iter().any(|e| e.mask_recycled_ts().is_none()) {
-            admin_warn!("Refusing to create invalid entries that are attempting to bypass replication state machine.");
+            warn!("Refusing to create invalid entries that are attempting to bypass replication state machine.");
             return Err(OperationError::AccessDenied);
         }
 
@@ -128,6 +128,23 @@ impl QueryServerWriteTransaction<'_> {
         {
             self.changed_flags.insert(ChangeFlag::OAUTH2)
         }
+
+        if !self.changed_flags.contains(ChangeFlag::OAUTH2_CLIENT)
+            && commit_cand
+                .iter()
+                .any(|e| e.attribute_equality(Attribute::Class, &EntryClass::OAuth2Client.into()))
+        {
+            self.changed_flags.insert(ChangeFlag::OAUTH2_CLIENT)
+        }
+
+        if !self.changed_flags.contains(ChangeFlag::FEATURE)
+            && commit_cand
+                .iter()
+                .any(|e| e.attribute_equality(Attribute::Class, &EntryClass::Feature.into()))
+        {
+            self.changed_flags.insert(ChangeFlag::FEATURE)
+        }
+
         if !self.changed_flags.contains(ChangeFlag::DOMAIN)
             && commit_cand
                 .iter()
@@ -174,15 +191,26 @@ impl QueryServerWriteTransaction<'_> {
         } else {
             admin_info!("Create operation success");
         }
-        Ok(())
+
+        if ce.return_created_uuids {
+            Ok(Some(commit_cand.iter().map(|e| e.get_uuid()).collect()))
+        } else {
+            Ok(None)
+        }
     }
 
-    pub fn internal_create(
-        &mut self,
-        entries: Vec<Entry<EntryInit, EntryNew>>,
-    ) -> Result<(), OperationError> {
+    pub fn internal_create(&mut self, entries: Vec<EntryInitNew>) -> Result<(), OperationError> {
         let ce = CreateEvent::new_internal(entries);
-        self.create(&ce)
+        self.create(&ce).map(|_| ())
+    }
+
+    pub fn impersonate_create(
+        &mut self,
+        ident: &Identity,
+        entries: Vec<EntryInitNew>,
+    ) -> Result<(), OperationError> {
+        let ce = CreateEvent::new_impersonate_identity(ident.clone(), entries);
+        self.create(&ce).map(|_| ())
     }
 }
 
@@ -195,9 +223,11 @@ mod tests {
     async fn test_create_user(server: &QueryServer) {
         let mut server_txn = server.write(duration_from_epoch_now()).await.unwrap();
         let filt = filter!(f_eq(Attribute::Name, PartialValue::new_iname("testperson")));
-        let admin = server_txn.internal_search_uuid(UUID_ADMIN).expect("failed");
+        let idm_admin = server_txn
+            .internal_search_uuid(UUID_IDM_ADMIN)
+            .expect("failed");
 
-        let se1 = SearchEvent::new_impersonate_entry(admin, filt);
+        let se1 = SearchEvent::new_impersonate_entry(idm_admin, filt);
 
         let mut e = entry_init!(
             (Attribute::Class, EntryClass::Object.to_value()),
@@ -250,19 +280,11 @@ mod tests {
             Attribute::NameHistory,
             Value::AuditLogString(server_txn.get_txn_cid().clone(), "testperson".to_string()),
         );
-        // this is kinda ugly but since ecdh keys are generated we don't have any other way
-        let key = r2
-            .first()
-            .unwrap()
-            .get_ava_single_eckey_private(Attribute::IdVerificationEcKey)
-            .unwrap();
-
-        e.add_ava(
-            Attribute::IdVerificationEcKey,
-            Value::EcKeyPrivate(key.clone()),
-        );
 
         let expected = vec![Arc::new(e.into_sealed_committed())];
+
+        error!("{:#?}", r2);
+        error!("{:#?}", expected);
 
         assert_eq!(r2, expected);
 
@@ -277,15 +299,16 @@ mod tests {
         // Create on server a
         let filt = filter!(f_eq(Attribute::Name, PartialValue::new_iname("testperson")));
 
-        let admin = server_a_txn
-            .internal_search_uuid(UUID_ADMIN)
+        let idm_admin = server_a_txn
+            .internal_search_uuid(UUID_IDM_ADMIN)
             .expect("failed");
-        let se_a = SearchEvent::new_impersonate_entry(admin, filt.clone());
+        let se_a = SearchEvent::new_impersonate_entry(idm_admin, filt.clone());
 
-        let admin = server_b_txn
-            .internal_search_uuid(UUID_ADMIN)
+        // Can't clone admin here as these are two separate servers.
+        let idm_admin = server_b_txn
+            .internal_search_uuid(UUID_IDM_ADMIN)
             .expect("failed");
-        let se_b = SearchEvent::new_impersonate_entry(admin, filt);
+        let se_b = SearchEvent::new_impersonate_entry(idm_admin, filt);
 
         let e = entry_init!(
             (Attribute::Class, EntryClass::Person.to_value()),

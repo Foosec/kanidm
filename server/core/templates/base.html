@@ -20,12 +20,14 @@
 			defer></script>
 		<link rel="stylesheet"
 			href="/pkg/style.css?v=((crate::https::cache_buster::get_cache_buster_key()))" />
+		<link rel="stylesheet"
+			href="/pkg/override.css?v=((crate::https::cache_buster::get_cache_buster_key()))" />
 
 		(% block head %)(% endblock %)
 	</head>
 	<body class="flex-column d-flex h-100">
 		(% block body %)(% endblock %)
-		<footer class="footer mt-auto py-3 bs-secondary-bg text-end">
+		<footer class="footer mt-auto py-3 bg-body-tertiary text-end">
 			<div class="container">
 				<span class="text-muted">Powered by <a
 						href="https://kanidm.com">Kanidm</a></span>

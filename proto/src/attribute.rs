@@ -1,11 +1,10 @@
-use serde::{Deserialize, Serialize};
-use utoipa::ToSchema;
-
 use crate::constants::*;
 use crate::internal::OperationError;
+use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::fmt;
 use std::str::FromStr;
+use utoipa::ToSchema;
 
 pub use smartstring::alias::String as AttrString;
 
@@ -13,15 +12,18 @@ pub use smartstring::alias::String as AttrString;
     Serialize, Deserialize, Clone, Debug, Eq, PartialEq, PartialOrd, Ord, Hash, Default, ToSchema,
 )]
 #[cfg_attr(test, derive(enum_iterator::Sequence))]
-#[serde(rename_all = "lowercase", try_from = "&str", into = "AttrString")]
+#[serde(rename_all = "lowercase", from = "String", into = "AttrString")]
 pub enum Attribute {
     Account,
     AccountExpire,
     AccountValidFrom,
+    AccountSoftlockExpire,
     AcpCreateAttr,
     AcpCreateClass,
     AcpEnable,
     AcpModifyClass,
+    AcpModifyPresentClass,
+    AcpModifyRemoveClass,
     AcpModifyPresentAttr,
     AcpModifyRemovedAttr,
     AcpReceiver,
@@ -30,6 +32,7 @@ pub enum Attribute {
     AcpTargetScope,
     ApiTokenSession,
     ApplicationPassword,
+    ApplicationUrl,
     AttestedPasskeys,
     #[default]
     Attr,
@@ -39,6 +42,7 @@ pub enum Attribute {
     AuthPasswordMinimumLength,
     BadlistPassword,
     Certificate,
+    CascadeDeleted,
     Claim,
     Class,
     ClassName,
@@ -48,6 +52,7 @@ pub enum Attribute {
     CredentialUpdateIntentToken,
     CredentialTypeMinimum,
     DeniedName,
+    DeleteAfter,
     Description,
     DirectMemberOf,
     DisplayName,
@@ -64,6 +69,7 @@ pub enum Attribute {
     DynGroup,
     DynGroupFilter,
     DynMember,
+    Enabled,
     Email,
     EmailAlternative,
     EmailPrimary,
@@ -77,15 +83,20 @@ pub enum Attribute {
     GidNumber,
     GrantUiHint,
     Group,
+    HmacNameHistory,
+    HomeDirectory,
     IdVerificationEcKey,
     Image,
     Index,
+    Indexed,
+    InMemoriam,
     IpaNtHash,
     IpaSshPubKey,
     JwsEs256PrivateKey,
     KeyActionRotate,
     KeyActionRevoke,
     KeyActionImportJwsEs256,
+    KeyActionImportJwsRs256,
     KeyInternalData,
     KeyProvider,
     LastModifiedCid,
@@ -101,9 +112,12 @@ pub enum Attribute {
     LinkedGroup,
     LoginShell,
     Mail,
+    MailDestination,
     May,
     Member,
+    MemberCreateOnce,
     MemberOf,
+    MessageTemplate,
     MultiValue,
     Must,
     Name,
@@ -113,10 +127,14 @@ pub enum Attribute {
     NsAccountLock,
     OAuth2AllowInsecureClientDisablePkce,
     OAuth2AllowLocalhostRedirect,
+    OAuth2AuthorisationEndpoint,
+    OAuth2ClientId,
+    OAuth2ClientSecret,
     OAuth2ConsentScopeMap,
     OAuth2DeviceFlowEnable,
     OAuth2JwtLegacyCryptoEnable,
     OAuth2PreferShortUsername,
+    OAuth2RequestScopes,
     OAuth2RsBasicSecret,
     OAuth2RsClaimMap,
     OAuth2RsImplicitScopes,
@@ -128,6 +146,11 @@ pub enum Attribute {
     OAuth2RsTokenKey,
     OAuth2Session,
     OAuth2StrictRedirectUri,
+    OAuth2TokenEndpoint,
+    OAuth2AccountCredentialUuid,
+    OAuth2AccountProvider,
+    OAuth2AccountUniqueUserId,
+    OAuth2ConsentPromptEnable,
     ObjectClass,
     OtherNoIndex,
     PassKeys,
@@ -142,10 +165,13 @@ pub enum Attribute {
     Refers,
     Replicated,
     Rs256PrivateKeyDer,
+    S256,
     /// A set of scim schemas. This is similar to a kanidm class.
     #[serde(rename = "schemas")]
     ScimSchemas,
     Scope,
+    SendAfter,
+    SentAt,
     SourceUuid,
     Spn,
     /// An LDAP-compatible sshpublickey
@@ -186,6 +212,14 @@ pub enum Attribute {
     NonExist,
     #[cfg(any(debug_assertions, test, feature = "test"))]
     TestAttr,
+    #[cfg(test)]
+    TestAttrA,
+    #[cfg(test)]
+    TestAttrB,
+    #[cfg(test)]
+    TestAttrC,
+    #[cfg(test)]
+    TestAttrD,
     #[cfg(any(debug_assertions, test, feature = "test"))]
     TestNumber,
     #[cfg(any(debug_assertions, test, feature = "test"))]
@@ -224,6 +258,12 @@ impl From<&str> for Attribute {
     }
 }
 
+impl From<String> for Attribute {
+    fn from(value: String) -> Self {
+        Self::inner_from_str(value.as_str())
+    }
+}
+
 impl<'a> From<&'a Attribute> for &'a str {
     fn from(val: &'a Attribute) -> Self {
         val.as_str()
@@ -250,10 +290,13 @@ impl Attribute {
             Attribute::Account => ATTR_ACCOUNT,
             Attribute::AccountExpire => ATTR_ACCOUNT_EXPIRE,
             Attribute::AccountValidFrom => ATTR_ACCOUNT_VALID_FROM,
+            Attribute::AccountSoftlockExpire => ATTR_ACCOUNT_SOFTLOCK_EXPIRE,
             Attribute::AcpCreateAttr => ATTR_ACP_CREATE_ATTR,
             Attribute::AcpCreateClass => ATTR_ACP_CREATE_CLASS,
             Attribute::AcpEnable => ATTR_ACP_ENABLE,
             Attribute::AcpModifyClass => ATTR_ACP_MODIFY_CLASS,
+            Attribute::AcpModifyPresentClass => ATTR_ACP_MODIFY_PRESENT_CLASS,
+            Attribute::AcpModifyRemoveClass => ATTR_ACP_MODIFY_REMOVE_CLASS,
             Attribute::AcpModifyPresentAttr => ATTR_ACP_MODIFY_PRESENTATTR,
             Attribute::AcpModifyRemovedAttr => ATTR_ACP_MODIFY_REMOVEDATTR,
             Attribute::AcpReceiver => ATTR_ACP_RECEIVER,
@@ -262,6 +305,7 @@ impl Attribute {
             Attribute::AcpTargetScope => ATTR_ACP_TARGET_SCOPE,
             Attribute::ApiTokenSession => ATTR_API_TOKEN_SESSION,
             Attribute::ApplicationPassword => ATTR_APPLICATION_PASSWORD,
+            Attribute::ApplicationUrl => ATTR_APPLICATION_URL,
             Attribute::AttestedPasskeys => ATTR_ATTESTED_PASSKEYS,
             Attribute::Attr => ATTR_ATTR,
             Attribute::AttributeName => ATTR_ATTRIBUTENAME,
@@ -270,6 +314,7 @@ impl Attribute {
             Attribute::AuthPasswordMinimumLength => ATTR_AUTH_PASSWORD_MINIMUM_LENGTH,
             Attribute::BadlistPassword => ATTR_BADLIST_PASSWORD,
             Attribute::Certificate => ATTR_CERTIFICATE,
+            Attribute::CascadeDeleted => ATTR_CASCADE_DELETED,
             Attribute::Claim => ATTR_CLAIM,
             Attribute::Class => ATTR_CLASS,
             Attribute::ClassName => ATTR_CLASSNAME,
@@ -279,6 +324,7 @@ impl Attribute {
             Attribute::CredentialUpdateIntentToken => ATTR_CREDENTIAL_UPDATE_INTENT_TOKEN,
             Attribute::CredentialTypeMinimum => ATTR_CREDENTIAL_TYPE_MINIMUM,
             Attribute::DeniedName => ATTR_DENIED_NAME,
+            Attribute::DeleteAfter => ATTR_DELETE_AFTER,
             Attribute::Description => ATTR_DESCRIPTION,
             Attribute::DirectMemberOf => ATTR_DIRECTMEMBEROF,
             Attribute::DisplayName => ATTR_DISPLAYNAME,
@@ -295,6 +341,7 @@ impl Attribute {
             Attribute::DynGroup => ATTR_DYNGROUP,
             Attribute::DynGroupFilter => ATTR_DYNGROUP_FILTER,
             Attribute::DynMember => ATTR_DYNMEMBER,
+            Attribute::Enabled => ATTR_ENABLED,
             Attribute::Email => ATTR_EMAIL,
             Attribute::EmailAlternative => ATTR_EMAIL_ALTERNATIVE,
             Attribute::EmailPrimary => ATTR_EMAIL_PRIMARY,
@@ -308,15 +355,20 @@ impl Attribute {
             Attribute::GidNumber => ATTR_GIDNUMBER,
             Attribute::GrantUiHint => ATTR_GRANT_UI_HINT,
             Attribute::Group => ATTR_GROUP,
+            Attribute::HmacNameHistory => ATTR_HMAC_NAME_HISTORY,
+            Attribute::HomeDirectory => ATTR_HOME_DIRECTORY,
             Attribute::IdVerificationEcKey => ATTR_ID_VERIFICATION_ECKEY,
             Attribute::Image => ATTR_IMAGE,
             Attribute::Index => ATTR_INDEX,
+            Attribute::Indexed => ATTR_INDEXED,
+            Attribute::InMemoriam => ATTR_IN_MEMORIAM,
             Attribute::IpaNtHash => ATTR_IPANTHASH,
             Attribute::IpaSshPubKey => ATTR_IPASSHPUBKEY,
             Attribute::JwsEs256PrivateKey => ATTR_JWS_ES256_PRIVATE_KEY,
             Attribute::KeyActionRotate => ATTR_KEY_ACTION_ROTATE,
             Attribute::KeyActionRevoke => ATTR_KEY_ACTION_REVOKE,
             Attribute::KeyActionImportJwsEs256 => ATTR_KEY_ACTION_IMPORT_JWS_ES256,
+            Attribute::KeyActionImportJwsRs256 => ATTR_KEY_ACTION_IMPORT_JWS_RS256,
             Attribute::KeyInternalData => ATTR_KEY_INTERNAL_DATA,
             Attribute::KeyProvider => ATTR_KEY_PROVIDER,
             Attribute::LastModifiedCid => ATTR_LAST_MODIFIED_CID,
@@ -331,9 +383,12 @@ impl Attribute {
             Attribute::LinkedGroup => ATTR_LINKEDGROUP,
             Attribute::LoginShell => ATTR_LOGINSHELL,
             Attribute::Mail => ATTR_MAIL,
+            Attribute::MailDestination => ATTR_MAIL_DESTINATION,
             Attribute::May => ATTR_MAY,
             Attribute::Member => ATTR_MEMBER,
+            Attribute::MemberCreateOnce => ATTR_MEMBER_CREATE_ONCE,
             Attribute::MemberOf => ATTR_MEMBEROF,
+            Attribute::MessageTemplate => ATTR_MESSAGE_TEMPLATE,
             Attribute::MultiValue => ATTR_MULTIVALUE,
             Attribute::Must => ATTR_MUST,
             Attribute::Name => ATTR_NAME,
@@ -345,10 +400,14 @@ impl Attribute {
                 ATTR_OAUTH2_ALLOW_INSECURE_CLIENT_DISABLE_PKCE
             }
             Attribute::OAuth2AllowLocalhostRedirect => ATTR_OAUTH2_ALLOW_LOCALHOST_REDIRECT,
+            Attribute::OAuth2AuthorisationEndpoint => ATTR_OAUTH2_AUTHORISATION_ENDPOINT,
+            Attribute::OAuth2ClientId => ATTR_OAUTH2_CLIENT_ID,
+            Attribute::OAuth2ClientSecret => ATTR_OAUTH2_CLIENT_SECRET,
             Attribute::OAuth2ConsentScopeMap => ATTR_OAUTH2_CONSENT_SCOPE_MAP,
             Attribute::OAuth2DeviceFlowEnable => ATTR_OAUTH2_DEVICE_FLOW_ENABLE,
             Attribute::OAuth2JwtLegacyCryptoEnable => ATTR_OAUTH2_JWT_LEGACY_CRYPTO_ENABLE,
             Attribute::OAuth2PreferShortUsername => ATTR_OAUTH2_PREFER_SHORT_USERNAME,
+            Attribute::OAuth2RequestScopes => ATTR_OAUTH2_REQUEST_SCOPES,
             Attribute::OAuth2RsBasicSecret => ATTR_OAUTH2_RS_BASIC_SECRET,
             Attribute::OAuth2RsClaimMap => ATTR_OAUTH2_RS_CLAIM_MAP,
             Attribute::OAuth2RsImplicitScopes => ATTR_OAUTH2_RS_IMPLICIT_SCOPES,
@@ -360,6 +419,11 @@ impl Attribute {
             Attribute::OAuth2RsTokenKey => ATTR_OAUTH2_RS_TOKEN_KEY,
             Attribute::OAuth2Session => ATTR_OAUTH2_SESSION,
             Attribute::OAuth2StrictRedirectUri => ATTR_OAUTH2_STRICT_REDIRECT_URI,
+            Attribute::OAuth2TokenEndpoint => ATTR_OAUTH2_TOKEN_ENDPOINT,
+            Attribute::OAuth2AccountCredentialUuid => ATTR_OAUTH2_ACCOUNT_CREDENTIAL_UUID,
+            Attribute::OAuth2AccountProvider => ATTR_OAUTH2_ACCOUNT_PROVIDER,
+            Attribute::OAuth2AccountUniqueUserId => ATTR_OAUTH2_ACCOUNT_UNIQUE_USER_ID,
+            Attribute::OAuth2ConsentPromptEnable => ATTR_OAUTH2_CONSENT_PROMPT_ENABLE,
             Attribute::ObjectClass => ATTR_OBJECTCLASS,
             Attribute::OtherNoIndex => ATTR_OTHER_NO_INDEX,
             Attribute::PassKeys => ATTR_PASSKEYS,
@@ -374,8 +438,11 @@ impl Attribute {
             Attribute::Refers => ATTR_REFERS,
             Attribute::Replicated => ATTR_REPLICATED,
             Attribute::Rs256PrivateKeyDer => ATTR_RS256_PRIVATE_KEY_DER,
+            Attribute::S256 => ATTR_S256,
             Attribute::Scope => ATTR_SCOPE,
             Attribute::ScimSchemas => ATTR_SCIM_SCHEMAS,
+            Attribute::SendAfter => ATTR_SEND_AFTER,
+            Attribute::SentAt => ATTR_SENT_AT,
             Attribute::SourceUuid => ATTR_SOURCE_UUID,
             Attribute::Spn => ATTR_SPN,
             Attribute::SshPublicKey => ATTR_SSH_PUBLICKEY,
@@ -413,6 +480,16 @@ impl Attribute {
             Attribute::NonExist => TEST_ATTR_NON_EXIST,
             #[cfg(any(debug_assertions, test, feature = "test"))]
             Attribute::TestAttr => TEST_ATTR_TEST_ATTR,
+
+            #[cfg(test)]
+            Attribute::TestAttrA => TEST_ATTR_TEST_ATTR_A,
+            #[cfg(test)]
+            Attribute::TestAttrB => TEST_ATTR_TEST_ATTR_B,
+            #[cfg(test)]
+            Attribute::TestAttrC => TEST_ATTR_TEST_ATTR_C,
+            #[cfg(test)]
+            Attribute::TestAttrD => TEST_ATTR_TEST_ATTR_D,
+
             #[cfg(any(debug_assertions, test, feature = "test"))]
             Attribute::Extra => TEST_ATTR_EXTRA,
             #[cfg(any(debug_assertions, test, feature = "test"))]
@@ -434,10 +511,13 @@ impl Attribute {
             ATTR_ACCOUNT => Attribute::Account,
             ATTR_ACCOUNT_EXPIRE => Attribute::AccountExpire,
             ATTR_ACCOUNT_VALID_FROM => Attribute::AccountValidFrom,
+            ATTR_ACCOUNT_SOFTLOCK_EXPIRE => Attribute::AccountSoftlockExpire,
             ATTR_ACP_CREATE_ATTR => Attribute::AcpCreateAttr,
             ATTR_ACP_CREATE_CLASS => Attribute::AcpCreateClass,
             ATTR_ACP_ENABLE => Attribute::AcpEnable,
             ATTR_ACP_MODIFY_CLASS => Attribute::AcpModifyClass,
+            ATTR_ACP_MODIFY_PRESENT_CLASS => Attribute::AcpModifyPresentClass,
+            ATTR_ACP_MODIFY_REMOVE_CLASS => Attribute::AcpModifyRemoveClass,
             ATTR_ACP_MODIFY_PRESENTATTR => Attribute::AcpModifyPresentAttr,
             ATTR_ACP_MODIFY_REMOVEDATTR => Attribute::AcpModifyRemovedAttr,
             ATTR_ACP_RECEIVER => Attribute::AcpReceiver,
@@ -446,6 +526,7 @@ impl Attribute {
             ATTR_ACP_TARGET_SCOPE => Attribute::AcpTargetScope,
             ATTR_API_TOKEN_SESSION => Attribute::ApiTokenSession,
             ATTR_APPLICATION_PASSWORD => Attribute::ApplicationPassword,
+            ATTR_APPLICATION_URL => Attribute::ApplicationUrl,
             ATTR_ATTESTED_PASSKEYS => Attribute::AttestedPasskeys,
             ATTR_ATTR => Attribute::Attr,
             ATTR_ATTRIBUTENAME => Attribute::AttributeName,
@@ -454,6 +535,7 @@ impl Attribute {
             ATTR_AUTH_PASSWORD_MINIMUM_LENGTH => Attribute::AuthPasswordMinimumLength,
             ATTR_BADLIST_PASSWORD => Attribute::BadlistPassword,
             ATTR_CERTIFICATE => Attribute::Certificate,
+            ATTR_CASCADE_DELETED => Attribute::CascadeDeleted,
             ATTR_CLAIM => Attribute::Claim,
             ATTR_CLASS => Attribute::Class,
             ATTR_CLASSNAME => Attribute::ClassName,
@@ -463,6 +545,7 @@ impl Attribute {
             ATTR_CREDENTIAL_UPDATE_INTENT_TOKEN => Attribute::CredentialUpdateIntentToken,
             ATTR_CREDENTIAL_TYPE_MINIMUM => Attribute::CredentialTypeMinimum,
             ATTR_DENIED_NAME => Attribute::DeniedName,
+            ATTR_DELETE_AFTER => Attribute::DeleteAfter,
             ATTR_DESCRIPTION => Attribute::Description,
             ATTR_DIRECTMEMBEROF => Attribute::DirectMemberOf,
             ATTR_DISPLAYNAME => Attribute::DisplayName,
@@ -479,6 +562,7 @@ impl Attribute {
             ATTR_DYNGROUP => Attribute::DynGroup,
             ATTR_DYNGROUP_FILTER => Attribute::DynGroupFilter,
             ATTR_DYNMEMBER => Attribute::DynMember,
+            ATTR_ENABLED => Attribute::Enabled,
             ATTR_EMAIL => Attribute::Email,
             ATTR_EMAIL_ALTERNATIVE => Attribute::EmailAlternative,
             ATTR_EMAIL_PRIMARY => Attribute::EmailPrimary,
@@ -492,15 +576,20 @@ impl Attribute {
             ATTR_GIDNUMBER => Attribute::GidNumber,
             ATTR_GRANT_UI_HINT => Attribute::GrantUiHint,
             ATTR_GROUP => Attribute::Group,
+            ATTR_HMAC_NAME_HISTORY => Attribute::HmacNameHistory,
+            ATTR_HOME_DIRECTORY => Attribute::HomeDirectory,
             ATTR_ID_VERIFICATION_ECKEY => Attribute::IdVerificationEcKey,
             ATTR_IMAGE => Attribute::Image,
             ATTR_INDEX => Attribute::Index,
+            ATTR_INDEXED => Attribute::Indexed,
+            ATTR_IN_MEMORIAM => Attribute::InMemoriam,
             ATTR_IPANTHASH => Attribute::IpaNtHash,
             ATTR_IPASSHPUBKEY => Attribute::IpaSshPubKey,
             ATTR_JWS_ES256_PRIVATE_KEY => Attribute::JwsEs256PrivateKey,
             ATTR_KEY_ACTION_ROTATE => Attribute::KeyActionRotate,
             ATTR_KEY_ACTION_REVOKE => Attribute::KeyActionRevoke,
             ATTR_KEY_ACTION_IMPORT_JWS_ES256 => Attribute::KeyActionImportJwsEs256,
+            ATTR_KEY_ACTION_IMPORT_JWS_RS256 => Attribute::KeyActionImportJwsRs256,
             ATTR_KEY_INTERNAL_DATA => Attribute::KeyInternalData,
             ATTR_KEY_PROVIDER => Attribute::KeyProvider,
             ATTR_LAST_MODIFIED_CID => Attribute::LastModifiedCid,
@@ -515,9 +604,12 @@ impl Attribute {
             ATTR_LIMIT_SEARCH_MAX_RESULTS => Attribute::LimitSearchMaxResults,
             ATTR_LIMIT_SEARCH_MAX_FILTER_TEST => Attribute::LimitSearchMaxFilterTest,
             ATTR_MAIL => Attribute::Mail,
+            ATTR_MAIL_DESTINATION => Attribute::MailDestination,
             ATTR_MAY => Attribute::May,
             ATTR_MEMBER => Attribute::Member,
+            ATTR_MEMBER_CREATE_ONCE => Attribute::MemberCreateOnce,
             ATTR_MEMBEROF => Attribute::MemberOf,
+            ATTR_MESSAGE_TEMPLATE => Attribute::MessageTemplate,
             ATTR_MULTIVALUE => Attribute::MultiValue,
             ATTR_MUST => Attribute::Must,
             ATTR_NAME => Attribute::Name,
@@ -529,10 +621,14 @@ impl Attribute {
                 Attribute::OAuth2AllowInsecureClientDisablePkce
             }
             ATTR_OAUTH2_ALLOW_LOCALHOST_REDIRECT => Attribute::OAuth2AllowLocalhostRedirect,
+            ATTR_OAUTH2_AUTHORISATION_ENDPOINT => Attribute::OAuth2AuthorisationEndpoint,
+            ATTR_OAUTH2_CLIENT_ID => Attribute::OAuth2ClientId,
+            ATTR_OAUTH2_CLIENT_SECRET => Attribute::OAuth2ClientSecret,
             ATTR_OAUTH2_CONSENT_SCOPE_MAP => Attribute::OAuth2ConsentScopeMap,
             ATTR_OAUTH2_DEVICE_FLOW_ENABLE => Attribute::OAuth2DeviceFlowEnable,
             ATTR_OAUTH2_JWT_LEGACY_CRYPTO_ENABLE => Attribute::OAuth2JwtLegacyCryptoEnable,
             ATTR_OAUTH2_PREFER_SHORT_USERNAME => Attribute::OAuth2PreferShortUsername,
+            ATTR_OAUTH2_REQUEST_SCOPES => Attribute::OAuth2RequestScopes,
             ATTR_OAUTH2_RS_BASIC_SECRET => Attribute::OAuth2RsBasicSecret,
             ATTR_OAUTH2_RS_CLAIM_MAP => Attribute::OAuth2RsClaimMap,
             ATTR_OAUTH2_RS_IMPLICIT_SCOPES => Attribute::OAuth2RsImplicitScopes,
@@ -544,6 +640,11 @@ impl Attribute {
             ATTR_OAUTH2_RS_TOKEN_KEY => Attribute::OAuth2RsTokenKey,
             ATTR_OAUTH2_SESSION => Attribute::OAuth2Session,
             ATTR_OAUTH2_STRICT_REDIRECT_URI => Attribute::OAuth2StrictRedirectUri,
+            ATTR_OAUTH2_TOKEN_ENDPOINT => Attribute::OAuth2TokenEndpoint,
+            ATTR_OAUTH2_ACCOUNT_CREDENTIAL_UUID => Attribute::OAuth2AccountCredentialUuid,
+            ATTR_OAUTH2_ACCOUNT_PROVIDER => Attribute::OAuth2AccountProvider,
+            ATTR_OAUTH2_ACCOUNT_UNIQUE_USER_ID => Attribute::OAuth2AccountUniqueUserId,
+            ATTR_OAUTH2_CONSENT_PROMPT_ENABLE => Attribute::OAuth2ConsentPromptEnable,
             ATTR_OBJECTCLASS => Attribute::ObjectClass,
             ATTR_OTHER_NO_INDEX => Attribute::OtherNoIndex,
             ATTR_PASSKEYS => Attribute::PassKeys,
@@ -558,7 +659,10 @@ impl Attribute {
             ATTR_REFERS => Attribute::Refers,
             ATTR_REPLICATED => Attribute::Replicated,
             ATTR_RS256_PRIVATE_KEY_DER => Attribute::Rs256PrivateKeyDer,
+            ATTR_S256 => Attribute::S256,
             ATTR_SCIM_SCHEMAS => Attribute::ScimSchemas,
+            ATTR_SEND_AFTER => Attribute::SendAfter,
+            ATTR_SENT_AT => Attribute::SentAt,
             ATTR_SCOPE => Attribute::Scope,
             ATTR_SOURCE_UUID => Attribute::SourceUuid,
             ATTR_SPN => Attribute::Spn,
@@ -597,6 +701,16 @@ impl Attribute {
             TEST_ATTR_NON_EXIST => Attribute::NonExist,
             #[cfg(any(debug_assertions, test, feature = "test"))]
             TEST_ATTR_TEST_ATTR => Attribute::TestAttr,
+
+            #[cfg(test)]
+            TEST_ATTR_TEST_ATTR_A => Attribute::TestAttrA,
+            #[cfg(test)]
+            TEST_ATTR_TEST_ATTR_B => Attribute::TestAttrB,
+            #[cfg(test)]
+            TEST_ATTR_TEST_ATTR_C => Attribute::TestAttrC,
+            #[cfg(test)]
+            TEST_ATTR_TEST_ATTR_D => Attribute::TestAttrD,
+
             #[cfg(any(debug_assertions, test, feature = "test"))]
             TEST_ATTR_EXTRA => Attribute::Extra,
             #[cfg(any(debug_assertions, test, feature = "test"))]
@@ -633,14 +747,25 @@ impl From<Attribute> for String {
 
 /// Sub attributes are a component of SCIM, allowing tagged sub properties of a complex
 /// attribute to be accessed.
-#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq, PartialOrd, Ord, Hash)]
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq, PartialOrd, Ord, Hash, ToSchema)]
 #[serde(rename_all = "lowercase", try_from = "&str", into = "AttrString")]
 pub enum SubAttribute {
     /// Denotes a primary value.
     Primary,
+    /// The type of value
+    Type,
+    /// The data associated to a value
+    Value,
 
     #[cfg(not(test))]
+    #[schema(value_type = String)]
     Custom(AttrString),
+}
+
+impl fmt::Display for SubAttribute {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
 }
 
 impl From<SubAttribute> for AttrString {
@@ -667,6 +792,8 @@ impl SubAttribute {
     pub fn as_str(&self) -> &str {
         match self {
             SubAttribute::Primary => SUB_ATTR_PRIMARY,
+            SubAttribute::Type => SUB_ATTR_TYPE,
+            SubAttribute::Value => SUB_ATTR_VALUE,
             #[cfg(not(test))]
             SubAttribute::Custom(s) => s,
         }
@@ -679,6 +806,8 @@ impl SubAttribute {
         // to limit length of str?
         match value.to_lowercase().as_str() {
             SUB_ATTR_PRIMARY => SubAttribute::Primary,
+            SUB_ATTR_TYPE => SubAttribute::Type,
+            SUB_ATTR_VALUE => SubAttribute::Value,
 
             #[cfg(not(test))]
             _ => SubAttribute::Custom(AttrString::from(value)),
@@ -722,9 +851,7 @@ mod test {
             let attr2 = Attribute::from(attr.as_str());
             assert!(
                 attr == attr2,
-                "Round-trip failed for {} <=> {} check you've implemented a from and to string",
-                attr,
-                attr2
+                "Round-trip failed for {attr} <=> {attr2} check you've implemented a from and to string"
             );
         }
     }

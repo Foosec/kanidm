@@ -104,8 +104,11 @@ impl ValueSetT for ValueSetDateTime {
         false
     }
 
-    fn lessthan(&self, _pv: &PartialValue) -> bool {
-        false
+    fn lessthan(&self, pv: &PartialValue) -> bool {
+        match pv {
+            PartialValue::DateTime(u) => self.set.iter().all(|set_value| set_value < u),
+            _ => false,
+        }
     }
 
     fn len(&self) -> usize {
@@ -210,9 +213,9 @@ mod tests {
         let odt = OffsetDateTime::UNIX_EPOCH + Duration::from_secs(69_420);
         let vs: ValueSet = ValueSetDateTime::new(odt);
 
-        crate::valueset::scim_json_reflexive(vs.clone(), r#""1970-01-01T19:17:00Z""#);
+        crate::valueset::scim_json_reflexive(&vs, r#""1970-01-01T19:17:00Z""#);
 
         // Test that we can parse json values into a valueset.
-        crate::valueset::scim_json_put_reflexive::<ValueSetDateTime>(vs, &[])
+        crate::valueset::scim_json_put_reflexive::<ValueSetDateTime>(&vs, &[])
     }
 }

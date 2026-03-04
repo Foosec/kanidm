@@ -1,9 +1,7 @@
 use std::convert::TryFrom;
 
 use hashbrown::{HashMap as Map, HashSet};
-use kanidm_proto::internal::{
-    BackupCodesView, CredentialDetail, CredentialDetailType, OperationError,
-};
+use kanidm_proto::internal::{CredentialDetail, CredentialDetailType, OperationError};
 use uuid::Uuid;
 use webauthn_rs::prelude::{AuthenticationResult, Passkey, SecurityKey};
 use webauthn_rs_core::proto::{Credential as WebauthnCredential, CredentialV3};
@@ -363,7 +361,7 @@ impl Credential {
         Password::new(policy, cleartext)
             .map_err(|e| {
                 error!(crypto_err = ?e);
-                e.into()
+                OperationError::CryptographyError
             })
             .map(Self::new_from_password)
     }
@@ -376,7 +374,7 @@ impl Credential {
         Password::new(policy, cleartext)
             .map_err(|e| {
                 error!(crypto_err = ?e);
-                e.into()
+                OperationError::CryptographyError
             })
             .map(Self::new_from_generatedpassword)
     }
@@ -391,7 +389,7 @@ impl Credential {
         Password::new(policy, cleartext)
             .map_err(|e| {
                 error!(crypto_err = ?e);
-                e.into()
+                OperationError::CryptographyError
             })
             .map(|pw| self.update_password(pw))
     }
@@ -404,14 +402,14 @@ impl Credential {
         let valid = self.password_ref().and_then(|pw| {
             pw.verify(cleartext).map_err(|e| {
                 error!(crypto_err = ?e);
-                e.into()
+                OperationError::CryptographyError
             })
         })?;
 
         if valid {
             let pw = Password::new(policy, cleartext).map_err(|e| {
                 error!(crypto_err = ?e);
-                e.into()
+                OperationError::CryptographyError
             })?;
 
             // Note, during update_password we normally rotate the uuid, here we
@@ -597,7 +595,7 @@ impl Credential {
         self.password_ref().and_then(|pw| {
             pw.verify(cleartext).map_err(|e| {
                 error!(crypto_err = ?e);
-                e.into()
+                OperationError::CryptographyError
             })
         })
     }
@@ -803,24 +801,6 @@ impl Credential {
                 // Rotate the credential id on any change to invalidate sessions.
                 uuid: Uuid::new_v4(),
             }),
-            _ => Err(OperationError::InvalidAccountState(
-                "Non-MFA credential type".to_string(),
-            )),
-        }
-    }
-
-    pub(crate) fn get_backup_code_view(&self) -> Result<BackupCodesView, OperationError> {
-        match &self.type_ {
-            CredentialType::PasswordMfa(_, _, _, opt_bc) => opt_bc
-                .as_ref()
-                .ok_or_else(|| {
-                    OperationError::InvalidAccountState(
-                        "No backup codes are available for this account".to_string(),
-                    )
-                })
-                .map(|bc| BackupCodesView {
-                    backup_codes: bc.code_set.clone().into_iter().collect(),
-                }),
             _ => Err(OperationError::InvalidAccountState(
                 "Non-MFA credential type".to_string(),
             )),

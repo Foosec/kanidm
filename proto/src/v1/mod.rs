@@ -13,9 +13,11 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 mod auth;
+mod message;
 mod unix;
 
 pub use self::auth::*;
+pub use self::message::*;
 pub use self::unix::*;
 
 /// The type of Account in use.
@@ -63,7 +65,7 @@ pub enum UatStatusState {
 impl fmt::Display for UatStatusState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            UatStatusState::ExpiresAt(odt) => write!(f, "expires at {}", odt),
+            UatStatusState::ExpiresAt(odt) => write!(f, "expires at {odt}"),
             UatStatusState::NeverExpires => write!(f, "never expires"),
             UatStatusState::Revoked => write!(f, "revoked"),
         }
@@ -105,6 +107,8 @@ pub struct ApiTokenGenerate {
     #[serde(with = "time::serde::timestamp::option")]
     pub expiry: Option<time::OffsetDateTime>,
     pub read_write: bool,
+    #[serde(default)]
+    pub compact: bool,
 }
 
 /* ===== low level proto types ===== */
@@ -120,7 +124,7 @@ impl fmt::Display for Entry {
         writeln!(f, "---")?;
         self.attrs
             .iter()
-            .try_for_each(|(k, vs)| vs.iter().try_for_each(|v| writeln!(f, "{}: {}", k, v)))
+            .try_for_each(|(k, vs)| vs.iter().try_for_each(|v| writeln!(f, "{k}: {v}")))
     }
 }
 

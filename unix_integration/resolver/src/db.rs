@@ -1,18 +1,19 @@
-use std::convert::TryFrom;
-use std::fmt;
-
 use crate::idprovider::interface::{GroupToken, Id, UserToken};
 use async_trait::async_trait;
+use kanidm_hsm_crypto::structures::{LoadableHmacS256Key, LoadableStorageKey};
 use libc::umask;
 use rusqlite::{Connection, OptionalExtension};
+use serde::{de::DeserializeOwned, Serialize};
+use std::convert::TryFrom;
+use std::fmt;
 use tokio::sync::{Mutex, MutexGuard};
 use uuid::Uuid;
 
-use serde::{de::DeserializeOwned, Serialize};
-
-use kanidm_hsm_crypto::{LoadableHmacKey, LoadableMachineKey};
-
 const DBV_MAIN: &str = "main";
+// This is in *pages* for sqlite. The default page size is 4096 bytes. So to achieve
+// 32MB we need to divide by this.
+const SQLITE_PAGE_SIZE: i64 = 4096;
+const CACHE_SIZE: i64 = 32_i64.saturating_mul((1024 * 1024) / SQLITE_PAGE_SIZE);
 
 #[async_trait]
 pub trait Cache {
@@ -77,6 +78,37 @@ impl Db {
             DbError::Sqlite
         })?;
         let _ = unsafe { umask(before) };
+
+        // Setup WAL/COW mode.
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .map_err(|error| {
+                error!(
+                    "sqlite journal_mode=WAL error: {:?} db_path={:?}",
+                    error, path
+                );
+                DbError::Sqlite
+            })?;
+
+        // synchronous=normal is safe for WAL
+        conn.pragma_update(None, "synchronous", "NORMAL")
+            .map_err(|error| {
+                error!(
+                    "sqlite synchronous=NORMAL error: {:?} db_path={:?}",
+                    error, path
+                );
+                DbError::Sqlite
+            })?;
+
+        conn.pragma_update(None, "cache_size", CACHE_SIZE)
+            .map_err(|error| {
+                error!(
+                    "sqlite cache_size={} error: {:?} db_path={:?}",
+                    CACHE_SIZE, error, path
+                );
+                DbError::Sqlite
+            })?;
+
+        conn.set_prepared_statement_cache_capacity(32);
 
         Ok(Db {
             conn: Mutex::new(conn),
@@ -331,12 +363,6 @@ impl DbTxn<'_> {
 
 impl DbTxn<'_> {
     pub fn migrate(&mut self) -> Result<(), CacheError> {
-        self.conn.set_prepared_statement_cache_capacity(16);
-        self.conn
-            .prepare("PRAGMA journal_mode=WAL;")
-            .and_then(|mut wal_stmt| wal_stmt.query([]).map(|_| ()))
-            .map_err(|e| self.sqlite_error("account_t create", &e))?;
-
         // This definition can never change.
         self.conn
             .execute(
@@ -432,11 +458,84 @@ impl DbTxn<'_> {
             self.clear_hsm()?;
         }
 
-        self.set_db_version(DBV_MAIN, 1)?;
+        if db_version < 2 {
+            self.conn
+                .execute(
+                    "CREATE INDEX IF NOT EXISTS account_t_uuid_idx ON account_t ( uuid )",
+                    [],
+                )
+                .map_err(|e| self.sqlite_error("account_t uuid index create", &e))?;
+
+            self.conn
+                .execute(
+                    "CREATE INDEX IF NOT EXISTS account_t_name_idx ON account_t ( name )",
+                    [],
+                )
+                .map_err(|e| self.sqlite_error("account_t name index create", &e))?;
+
+            self.conn
+                .execute(
+                    "CREATE INDEX IF NOT EXISTS account_t_spn_idx ON account_t ( spn )",
+                    [],
+                )
+                .map_err(|e| self.sqlite_error("account_t spn index create", &e))?;
+
+            self.conn
+                .execute(
+                    "CREATE INDEX IF NOT EXISTS account_t_gidnumber_idx ON account_t ( gidnumber )",
+                    [],
+                )
+                .map_err(|e| self.sqlite_error("account_t gidnumber index create", &e))?;
+
+            self.conn
+                .execute(
+                    "CREATE INDEX IF NOT EXISTS group_t_uuid_idx ON group_t ( uuid )",
+                    [],
+                )
+                .map_err(|e| self.sqlite_error("group_t uuid index create", &e))?;
+
+            self.conn
+                .execute(
+                    "CREATE INDEX IF NOT EXISTS group_t_name_idx ON group_t ( name )",
+                    [],
+                )
+                .map_err(|e| self.sqlite_error("group_t name index create", &e))?;
+
+            self.conn
+                .execute(
+                    "CREATE INDEX IF NOT EXISTS group_t_spn_idx ON group_t ( spn )",
+                    [],
+                )
+                .map_err(|e| self.sqlite_error("group_t spn index create", &e))?;
+
+            self.conn
+                .execute(
+                    "CREATE INDEX IF NOT EXISTS group_t_gidnumber_idx ON group_t ( gidnumber )",
+                    [],
+                )
+                .map_err(|e| self.sqlite_error("group_t gidnumber index create", &e))?;
+
+            self.conn
+                .execute(
+                    "CREATE INDEX IF NOT EXISTS memberof_t_g_uuid_idx ON memberof_t ( g_uuid )",
+                    [],
+                )
+                .map_err(|e| self.sqlite_error("memberof_t g_uuid index create", &e))?;
+
+            self.conn
+                .execute(
+                    "CREATE INDEX IF NOT EXISTS memberof_t_a_uuid_idx ON memberof_t ( a_uuid )",
+                    [],
+                )
+                .map_err(|e| self.sqlite_error("memberof_t a_uuid index create", &e))?;
+        }
+
+        self.set_db_version(DBV_MAIN, 2)?;
 
         Ok(())
     }
 
+    #[instrument(level = "debug", skip_all)]
     pub fn commit(mut self) -> Result<(), CacheError> {
         if self.committed {
             error!("Invalid state, SQL transaction was already committed!");
@@ -492,7 +591,7 @@ impl DbTxn<'_> {
         Ok(())
     }
 
-    pub fn get_hsm_machine_key(&mut self) -> Result<Option<LoadableMachineKey>, CacheError> {
+    pub fn get_hsm_root_storage_key(&mut self) -> Result<Option<LoadableStorageKey>, CacheError> {
         let mut stmt = self
             .conn
             .prepare("SELECT value FROM hsm_int_t WHERE key = 'mk'")
@@ -513,9 +612,9 @@ impl DbTxn<'_> {
         }
     }
 
-    pub fn insert_hsm_machine_key(
+    pub fn insert_hsm_root_storage_key(
         &mut self,
-        machine_key: &LoadableMachineKey,
+        machine_key: &LoadableStorageKey,
     ) -> Result<(), CacheError> {
         let data = serde_json::to_vec(machine_key).map_err(|e| {
             error!("insert_hsm_machine_key json error -> {:?}", e);
@@ -537,7 +636,7 @@ impl DbTxn<'_> {
         .map_err(|e| self.sqlite_error("execute", &e))
     }
 
-    pub fn get_hsm_hmac_key(&mut self) -> Result<Option<LoadableHmacKey>, CacheError> {
+    pub fn get_hsm_hmac_key(&mut self) -> Result<Option<LoadableHmacS256Key>, CacheError> {
         let mut stmt = self
             .conn
             .prepare("SELECT value FROM hsm_int_t WHERE key = 'hmac'")
@@ -558,7 +657,10 @@ impl DbTxn<'_> {
         }
     }
 
-    pub fn insert_hsm_hmac_key(&mut self, hmac_key: &LoadableHmacKey) -> Result<(), CacheError> {
+    pub fn insert_hsm_hmac_key(
+        &mut self,
+        hmac_key: &LoadableHmacS256Key,
+    ) -> Result<(), CacheError> {
         let data = serde_json::to_vec(hmac_key).map_err(|e| {
             error!("insert_hsm_hmac_key json error -> {:?}", e);
             CacheError::SerdeJson
@@ -579,6 +681,7 @@ impl DbTxn<'_> {
         .map_err(|e| self.sqlite_error("execute", &e))
     }
 
+    #[instrument(level = "debug", skip_all)]
     pub fn get_account(&mut self, account_id: &Id) -> Result<Option<(UserToken, u64)>, CacheError> {
         let data = match account_id {
             Id::Name(n) => self.get_account_data_name(n.as_str()),
@@ -613,6 +716,7 @@ impl DbTxn<'_> {
         }
     }
 
+    #[instrument(level = "debug", skip_all)]
     pub fn get_accounts(&mut self) -> Result<Vec<UserToken>, CacheError> {
         let mut stmt = self
             .conn
@@ -642,6 +746,7 @@ impl DbTxn<'_> {
             .collect())
     }
 
+    #[instrument(level = "debug", skip_all)]
     pub fn update_account(&mut self, account: &UserToken, expire: u64) -> Result<(), CacheError> {
         let data = serde_json::to_vec(account).map_err(|e| {
             error!("update_account json error -> {:?}", e);
@@ -738,6 +843,7 @@ impl DbTxn<'_> {
         })
     }
 
+    #[instrument(level = "debug", skip_all)]
     pub fn delete_account(&mut self, a_uuid: Uuid) -> Result<(), CacheError> {
         let account_uuid = a_uuid.as_hyphenated().to_string();
 
@@ -758,6 +864,7 @@ impl DbTxn<'_> {
             .map_err(|e| self.sqlite_error("account_t delete", &e))
     }
 
+    #[instrument(level = "debug", skip_all)]
     pub fn get_group(&mut self, grp_id: &Id) -> Result<Option<(GroupToken, u64)>, CacheError> {
         let data = match grp_id {
             Id::Name(n) => self.get_group_data_name(n.as_str()),
@@ -792,6 +899,7 @@ impl DbTxn<'_> {
         }
     }
 
+    #[instrument(level = "debug", skip_all)]
     pub fn get_group_members(&mut self, g_uuid: Uuid) -> Result<Vec<UserToken>, CacheError> {
         let mut stmt = self
             .conn
@@ -821,6 +929,7 @@ impl DbTxn<'_> {
             .collect()
     }
 
+    #[instrument(level = "debug", skip_all)]
     pub fn get_groups(&mut self) -> Result<Vec<GroupToken>, CacheError> {
         let mut stmt = self
             .conn
@@ -850,6 +959,7 @@ impl DbTxn<'_> {
             .collect())
     }
 
+    #[instrument(level = "debug", skip_all)]
     pub fn update_group(&mut self, grp: &GroupToken, expire: u64) -> Result<(), CacheError> {
         let data = serde_json::to_vec(grp).map_err(|e| {
             error!("json error -> {:?}", e);
@@ -881,6 +991,7 @@ impl DbTxn<'_> {
         .map_err(|e| self.sqlite_error("execute", &e))
     }
 
+    #[instrument(level = "debug", skip_all)]
     pub fn delete_group(&mut self, g_uuid: Uuid) -> Result<(), CacheError> {
         let group_uuid = g_uuid.as_hyphenated().to_string();
         self.conn

@@ -1,15 +1,14 @@
-use crate::common::OpType;
-use std::collections::BTreeMap;
+use crate::OpType;
+use crate::{KanidmClientParser, OutputMode, RawOpt};
+use kanidm_proto::scim_v1::{
+    client::{ScimEntryPostGeneric, ScimEntryPutGeneric},
+    ScimEntryGetQuery,
+};
+use serde::de::DeserializeOwned;
 use std::error::Error;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
-
-use kanidm_proto::internal::{Filter, Modify, ModifyList};
-use kanidm_proto::v1::Entry;
-use serde::de::DeserializeOwned;
-
-use crate::{OutputMode, RawOpt};
 
 fn read_file<T: DeserializeOwned, P: AsRef<Path>>(path: P) -> Result<T, Box<dyn Error>> {
     let f = File::open(path)?;
@@ -19,30 +18,18 @@ fn read_file<T: DeserializeOwned, P: AsRef<Path>>(path: P) -> Result<T, Box<dyn 
 }
 
 impl RawOpt {
-    pub fn debug(&self) -> bool {
+    pub async fn exec(&self, opt: KanidmClientParser) {
         match self {
-            RawOpt::Search(sopt) => sopt.commonopts.debug,
-            RawOpt::Create(copt) => copt.commonopts.debug,
-            RawOpt::Modify(mopt) => mopt.commonopts.debug,
-            RawOpt::Delete(dopt) => dopt.commonopts.debug,
-        }
-    }
+            RawOpt::Search { filter } => {
+                let client = opt.to_client(OpType::Read).await;
 
-    pub async fn exec(&self) {
-        match self {
-            RawOpt::Search(sopt) => {
-                let client = sopt.commonopts.to_client(OpType::Read).await;
-
-                let filter: Filter = match serde_json::from_str(sopt.filter.as_str()) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        error!("Error parsing filter -> {:?}", e);
-                        return;
-                    }
+                let query = ScimEntryGetQuery {
+                    filter: Some(filter.clone()),
+                    ..Default::default()
                 };
 
-                match client.search(filter).await {
-                    Ok(rset) => match sopt.commonopts.output_mode {
+                match client.scim_v1_entry_query(query).await {
+                    Ok(rset) => match opt.output_mode {
                         #[allow(clippy::expect_used)]
                         OutputMode::Json => {
                             println!(
@@ -51,16 +38,20 @@ impl RawOpt {
                             )
                         }
                         OutputMode::Text => {
-                            rset.iter().for_each(|e| println!("{}", e));
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&rset)
+                                    .expect("Failed to serialize entry!")
+                            )
                         }
                     },
                     Err(e) => error!("Error -> {:?}", e),
                 }
             }
-            RawOpt::Create(copt) => {
-                let client = copt.commonopts.to_client(OpType::Write).await;
+            RawOpt::Create { file } => {
+                let client = opt.to_client(OpType::Write).await;
                 // Read the file?
-                let r_entries: Vec<BTreeMap<String, Vec<String>>> = match read_file(&copt.file) {
+                let entry: ScimEntryPostGeneric = match read_file(file) {
                     Ok(r) => r,
                     Err(e) => {
                         error!("Error -> {:?}", e);
@@ -68,24 +59,14 @@ impl RawOpt {
                     }
                 };
 
-                let entries = r_entries.into_iter().map(|b| Entry { attrs: b }).collect();
-
-                if let Err(e) = client.create(entries).await {
+                if let Err(e) = client.scim_v1_entry_create(entry).await {
                     error!("Error -> {:?}", e);
                 }
             }
-            RawOpt::Modify(mopt) => {
-                let client = mopt.commonopts.to_client(OpType::Write).await;
-                // Read the file?
-                let filter: Filter = match serde_json::from_str(mopt.filter.as_str()) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        error!("Error -> {:?}", e);
-                        return;
-                    }
-                };
+            RawOpt::Update { file } => {
+                let client = opt.to_client(OpType::Write).await;
 
-                let r_list: Vec<Modify> = match read_file(&mopt.file) {
+                let entry: ScimEntryPutGeneric = match read_file(file) {
                     Ok(r) => r,
                     Err(e) => {
                         error!("Error -> {:?}", e);
@@ -93,22 +74,14 @@ impl RawOpt {
                     }
                 };
 
-                let modlist = ModifyList::new_list(r_list);
-                if let Err(e) = client.modify(filter, modlist).await {
+                if let Err(e) = client.scim_v1_entry_update(entry).await {
                     error!("Error -> {:?}", e);
                 }
             }
-            RawOpt::Delete(dopt) => {
-                let client = dopt.commonopts.to_client(OpType::Write).await;
-                let filter: Filter = match serde_json::from_str(dopt.filter.as_str()) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        error!("Error -> {:?}", e);
-                        return;
-                    }
-                };
+            RawOpt::Delete { id } => {
+                let client = opt.to_client(OpType::Write).await;
 
-                if let Err(e) = client.delete(filter).await {
+                if let Err(e) = client.scim_v1_entry_delete(id).await {
                     error!("Error -> {:?}", e);
                 }
             }

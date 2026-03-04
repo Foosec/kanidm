@@ -1,16 +1,3 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::time::Duration;
-
-use kanidm_proto::internal::{
-    BackupCodesView, CredentialStatus, UatPurpose, UiHint, UserAuthToken,
-};
-use kanidm_proto::v1::{UatStatus, UatStatusState, UnixGroupToken, UnixUserToken};
-use time::OffsetDateTime;
-use uuid::Uuid;
-use webauthn_rs::prelude::{
-    AttestedPasskey as AttestedPasskeyV4, AuthenticationResult, CredentialID, Passkey as PasskeyV4,
-};
-
 use super::accountpolicy::ResolvedAccountPolicy;
 use super::group::{load_account_policy, load_all_groups_from_account, Group, Unix};
 use crate::constants::UUID_ANONYMOUS;
@@ -26,7 +13,16 @@ use crate::prelude::*;
 use crate::schema::SchemaTransaction;
 use crate::value::{IntentTokenState, PartialValue, SessionState, Value};
 use kanidm_lib_crypto::CryptoPolicy;
+use kanidm_proto::internal::{CredentialStatus, UatPurpose, UiHint, UserAuthToken};
+use kanidm_proto::v1::{UatStatus, UatStatusState, UnixGroupToken, UnixUserToken};
 use sshkey_attest::proto::PublicKey as SshPublicKey;
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
+use time::OffsetDateTime;
+use uuid::Uuid;
+use webauthn_rs::prelude::{
+    AttestedPasskey as AttestedPasskeyV4, AuthenticationResult, CredentialID, Passkey as PasskeyV4,
+};
 
 #[derive(Debug, Clone)]
 pub struct UnixExtensions {
@@ -43,11 +39,18 @@ impl UnixExtensions {
 }
 
 #[derive(Default, Debug, Clone)]
+pub struct OAuth2AccountCredential {
+    pub(crate) provider: Uuid,
+    pub(crate) cred_id: Uuid,
+    pub(crate) user_id: String,
+}
+
+#[derive(Default, Debug, Clone)]
 pub struct Account {
     // To make this self-referential, we'll need to likely make Entry Pin<Arc<_>>
     // so that we can make the references work.
-    pub name: String,
-    pub spn: String,
+    spn: String,
+    name: Option<String>,
     pub displayname: String,
     pub uuid: Uuid,
     pub sync_parent_uuid: Option<Uuid>,
@@ -57,6 +60,7 @@ pub struct Account {
     pub attested_passkeys: BTreeMap<Uuid, (String, AttestedPasskeyV4)>,
     pub valid_from: Option<OffsetDateTime>,
     pub expire: Option<OffsetDateTime>,
+    softlock_expire: Option<OffsetDateTime>,
     pub radius_secret: Option<String>,
     pub ui_hints: BTreeSet<UiHint>,
     pub mail_primary: Option<String>,
@@ -65,6 +69,23 @@ pub struct Account {
     pub(crate) unix_extn: Option<UnixExtensions>,
     pub(crate) sshkeys: BTreeMap<String, SshPublicKey>,
     pub apps_pwds: BTreeMap<Uuid, Vec<ApplicationPassword>>,
+    pub(crate) oauth2_client_provider: Option<OAuth2AccountCredential>,
+    pub updated_at: Option<Cid>,
+}
+
+#[cfg(test)]
+impl From<crate::migration_data::BuiltinAccount> for crate::idm::account::Account {
+    fn from(value: crate::migration_data::BuiltinAccount) -> Self {
+        Self {
+            name: Some(value.name.to_string()),
+            uuid: value.uuid,
+            displayname: value.displayname.to_string(),
+            spn: format!("{}@example.com", value.name),
+            mail_primary: None,
+            mail: Vec::with_capacity(0),
+            ..Default::default()
+        }
+    }
 }
 
 macro_rules! try_from_entry {
@@ -77,8 +98,7 @@ macro_rules! try_from_entry {
         // Now extract our needed attributes
         let name = $value
             .get_ava_single_iname(Attribute::Name)
-            .map(|s| s.to_string())
-            .ok_or(OperationError::MissingAttribute(Attribute::Name))?;
+            .map(|s| s.to_string());
 
         let displayname = $value
             .get_ava_single_utf8(Attribute::DisplayName)
@@ -117,6 +137,8 @@ macro_rules! try_from_entry {
         let valid_from = $value.get_ava_single_datetime(Attribute::AccountValidFrom);
 
         let expire = $value.get_ava_single_datetime(Attribute::AccountExpire);
+
+        let softlock_expire = $value.get_ava_single_datetime(Attribute::AccountSoftlockExpire);
 
         let radius_secret = $value
             .get_ava_single_secret(Attribute::RadiusSecret)
@@ -190,6 +212,32 @@ macro_rules! try_from_entry {
             .cloned()
             .unwrap_or_default();
 
+        let maybe_account_provider = $value.get_ava_single_refer(Attribute::OAuth2AccountProvider);
+
+        let maybe_account_unique_user_id =
+            $value.get_ava_single_utf8(Attribute::OAuth2AccountUniqueUserId);
+
+        let maybe_account_credential_id =
+            $value.get_ava_single_uuid(Attribute::OAuth2AccountCredentialUuid);
+
+        let oauth2_client_provider = match (
+            maybe_account_provider,
+            maybe_account_unique_user_id,
+            maybe_account_credential_id,
+        ) {
+            (Some(provider), Some(user_id), Some(cred_id)) => Some(OAuth2AccountCredential {
+                provider,
+                cred_id,
+                user_id: user_id.to_string(),
+            }),
+            _ => None,
+        };
+
+        let updated_at: Option<Cid> = $value
+            .get_ava_set(Attribute::LastModifiedCid)
+            .cloned()
+            .and_then(|u| u.to_cid_single());
+
         Ok(Account {
             uuid,
             name,
@@ -201,6 +249,7 @@ macro_rules! try_from_entry {
             attested_passkeys,
             valid_from,
             expire,
+            softlock_expire,
             radius_secret,
             spn,
             ui_hints,
@@ -210,6 +259,8 @@ macro_rules! try_from_entry {
             unix_extn,
             sshkeys,
             apps_pwds,
+            oauth2_client_provider,
+            updated_at,
         })
     }};
 }
@@ -225,6 +276,18 @@ impl Account {
 
     pub(crate) fn sshkeys(&self) -> &BTreeMap<String, SshPublicKey> {
         &self.sshkeys
+    }
+
+    pub(crate) fn spn(&self) -> &str {
+        self.spn.as_str()
+    }
+
+    pub(crate) fn name(&self) -> &str {
+        self.name.as_deref().unwrap_or(self.spn.as_str())
+    }
+
+    pub(crate) fn softlock_expire(&self) -> Option<OffsetDateTime> {
+        self.softlock_expire
     }
 
     #[instrument(level = "trace", skip_all)]
@@ -281,7 +344,6 @@ impl Account {
         ct: Duration,
         account_policy: &ResolvedAccountPolicy,
     ) -> Option<UserAuthToken> {
-        // TODO: Apply policy to this expiry time.
         // We have to remove the nanoseconds because when we transmit this / serialise it we drop
         // the nanoseconds, but if we haven't done a serialise on the server our db cache has the
         // ns value which breaks some checks.
@@ -292,17 +354,13 @@ impl Account {
         let limit_search_max_filter_test = account_policy.limit_search_max_filter_test();
 
         // Note that currently the auth_session time comes from policy, but the already-privileged
-        // session bound is hardcoded.
-        let expiry = Some(
-            OffsetDateTime::UNIX_EPOCH
-                + ct
-                + Duration::from_secs(account_policy.authsession_expiry() as u64),
-        );
-        let limited_expiry = Some(
-            OffsetDateTime::UNIX_EPOCH
-                + ct
-                + Duration::from_secs(DEFAULT_AUTH_SESSION_LIMITED_EXPIRY as u64),
-        );
+        // session bound is hardcoded. This mostly affects admin/idm_admin breakglass accounts.
+        let expiry = OffsetDateTime::UNIX_EPOCH
+            + ct
+            + Duration::from_secs(account_policy.authsession_expiry() as u64);
+        let limited_expiry = OffsetDateTime::UNIX_EPOCH
+            + ct
+            + Duration::from_secs(DEFAULT_AUTH_SESSION_LIMITED_EXPIRY as u64);
 
         let (purpose, expiry) = match scope {
             // Issue an invalid/expired session.
@@ -315,14 +373,22 @@ impl Account {
             SessionScope::ReadOnly => (UatPurpose::ReadOnly, expiry),
             SessionScope::ReadWrite => {
                 // These sessions are always rw, and so have limited life.
-                (UatPurpose::ReadWrite { expiry }, limited_expiry)
+                // Ensure that we take the lower of the two bounds.
+                let capped = std::cmp::min(expiry, limited_expiry);
+
+                (
+                    UatPurpose::ReadWrite {
+                        expiry: Some(capped),
+                    },
+                    capped,
+                )
             }
             SessionScope::PrivilegeCapable => (UatPurpose::ReadWrite { expiry: None }, expiry),
         };
 
         Some(UserAuthToken {
             session_id,
-            expiry,
+            expiry: Some(expiry),
             issued_at,
             purpose,
             uuid: self.uuid,
@@ -474,8 +540,10 @@ impl Account {
         self.mail.iter().for_each(|m| {
             inputs.push(m.as_str());
         });
-        inputs.push(self.name.as_str());
         inputs.push(self.spn.as_str());
+        if let Some(name) = self.name.as_ref() {
+            inputs.push(name)
+        }
         inputs.push(self.displayname.as_str());
         if let Some(s) = self.radius_secret.as_deref() {
             inputs.push(s);
@@ -654,13 +722,6 @@ impl Account {
             .ok_or(OperationError::NoMatchingAttributes)
     }
 
-    pub(crate) fn to_backupcodesview(&self) -> Result<BackupCodesView, OperationError> {
-        self.primary
-            .as_ref()
-            .ok_or(OperationError::InvalidState)
-            .and_then(|cred| cred.get_backup_code_view())
-    }
-
     pub(crate) fn existing_credential_id_list(&self) -> Option<Vec<CredentialID>> {
         // TODO!!!
         // Used in registrations only for disallowing existing credentials.
@@ -755,7 +816,7 @@ impl Account {
             for ap in v.iter() {
                 let password_verified = ap.password.verify(cleartext).map_err(|e| {
                     error!(crypto_err = ?e);
-                    e.into()
+                    OperationError::CryptographyError
                 })?;
 
                 if password_verified {
@@ -781,18 +842,6 @@ impl Account {
         Ok(None)
     }
 
-    pub(crate) fn generate_application_password_mod(
-        &self,
-        application: Uuid,
-        label: &str,
-        cleartext: &str,
-        policy: &CryptoPolicy,
-    ) -> Result<ModifyList<ModifyInvalid>, OperationError> {
-        let ap = ApplicationPassword::new(application, label, cleartext, policy)?;
-        let vap = Value::ApplicationPassword(ap);
-        Ok(ModifyList::new_append(Attribute::ApplicationPassword, vap))
-    }
-
     pub(crate) fn to_unixusertoken(&self, ct: Duration) -> Result<UnixUserToken, OperationError> {
         let (gidnumber, shell, sshkeys, groups) = match &self.unix_extn {
             Some(ue) => {
@@ -809,7 +858,7 @@ impl Account {
         let groups: Vec<UnixGroupToken> = groups.iter().map(|g| g.to_unixgrouptoken()).collect();
 
         Ok(UnixUserToken {
-            name: self.name.clone(),
+            name: self.name().into(),
             spn: self.spn.clone(),
             displayname: self.displayname.clone(),
             gidnumber,
@@ -819,6 +868,22 @@ impl Account {
             sshkeys,
             valid: self.is_within_valid_time(ct),
         })
+    }
+
+    pub(crate) fn oauth2_client_provider(&self) -> Option<&OAuth2AccountCredential> {
+        self.oauth2_client_provider.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn setup_oauth2_client_provider(
+        &mut self,
+        client_provider: &crate::idm::oauth2_client::OAuth2ClientProvider,
+    ) {
+        self.oauth2_client_provider = Some(OAuth2AccountCredential {
+            provider: client_provider.uuid,
+            cred_id: Uuid::new_v4(),
+            user_id: self.spn.clone(),
+        });
     }
 }
 
@@ -917,13 +982,13 @@ impl IdmServerProxyWriteTransaction<'_> {
 
         // Remove the service account class.
         // Add the person class.
-        let mut new_classes = prev_classes.clone();
-        new_classes.remove(EntryClass::ServiceAccount.into());
-        new_classes.insert(EntryClass::Person.into());
+        let mut new_iutf8es = prev_classes.clone();
+        new_iutf8es.remove(EntryClass::ServiceAccount.into());
+        new_iutf8es.insert(EntryClass::Person.into());
 
         // diff the schema attrs, and remove the ones that are service_account only.
         let (_added, removed) = schema_ref
-            .query_attrs_difference(&prev_classes, &new_classes)
+            .query_attrs_difference(&prev_classes, &new_iutf8es)
             .map_err(|se| {
                 admin_error!("While querying the schema, it reported that requested classes may not be present indicating a possible corruption");
                 OperationError::SchemaViolation(

@@ -1,11 +1,12 @@
-use std::fmt;
-use std::time::Duration;
-
+use crate::prelude::JsonValue;
 use hashbrown::HashSet;
 use kanidm_proto::internal::ImageType;
+use kanidm_proto::v1::OutboundMessage;
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::time::Duration;
 use url::Url;
 use uuid::Uuid;
 use webauthn_rs::prelude::{
@@ -13,9 +14,9 @@ use webauthn_rs::prelude::{
     SecurityKey as SecurityKeyV4,
 };
 use webauthn_rs_core::proto::{COSEKey, UserVerificationPolicy};
-
 // Re-export this as though it was here.
 use crate::repl::cid::Cid;
+use crypto_glue::{s256::Sha256Output, traits::Zeroizing};
 pub use kanidm_lib_crypto::DbPasswordV1;
 
 #[derive(Serialize, Deserialize, Debug, Ord, PartialOrd, PartialEq, Eq, Clone)]
@@ -148,6 +149,8 @@ impl std::fmt::Debug for DbBackupCodeV1 {
     }
 }
 
+// Allow as this is used in serde, but compiler gets that wrong.
+#[allow(dead_code)]
 // We have to allow this as serde expects &T for the fn sig.
 #[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_false(b: &bool) -> bool {
@@ -426,20 +429,6 @@ pub struct DbValueTaggedStringV1 {
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
-pub struct DbValueEmailAddressV1 {
-    pub d: String,
-    #[serde(skip_serializing_if = "is_false", default)]
-    pub p: bool,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct DbValuePhoneNumberV1 {
-    pub d: String,
-    #[serde(skip_serializing_if = "is_false", default)]
-    pub p: bool,
-}
-
-#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct DbValueAddressV1 {
     #[serde(rename = "f")]
     pub formatted: String,
@@ -505,6 +494,8 @@ pub enum DbValueAccessScopeV1 {
 pub enum DbValueIdentityId {
     #[serde(rename = "v1i")]
     V1Internal,
+    #[serde(rename = "v2i")]
+    V2Internal(Uuid),
     #[serde(rename = "v1u")]
     V1Uuid(Uuid),
     #[serde(rename = "v1s")]
@@ -539,6 +530,19 @@ pub enum DbValueAuthTypeV1 {
     Passkey,
     #[serde(rename = "ap")]
     AttestedPasskey,
+    #[serde(rename = "ot")]
+    OAuth2Trust,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone, Default)]
+pub enum DbValueSessionExtMetadataV1 {
+    #[default]
+    None,
+    OAuth2 {
+        access_expires_at: Duration,
+        access_token: String,
+        refresh_token: Option<String>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone)]
@@ -606,6 +610,8 @@ pub enum DbValueSession {
         scope: DbValueAccessScopeV1,
         #[serde(rename = "t")]
         type_: DbValueAuthTypeV1,
+        #[serde(rename = "x", default)]
+        ext_metadata: DbValueSessionExtMetadataV1,
     },
 }
 
@@ -692,7 +698,10 @@ pub enum DbValueImage {
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone)]
 pub enum DbValueKeyUsage {
     JwsEs256,
+    JwsHs256,
+    JwsRs256,
     JweA128GCM,
+    HkdfS256,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone)]
@@ -710,7 +719,7 @@ pub enum DbValueKeyInternal {
         valid_from: u64,
         status: DbValueKeyStatus,
         status_cid: DbCidV1,
-        der: Vec<u8>,
+        der: Zeroizing<Vec<u8>>,
     },
 }
 
@@ -763,6 +772,10 @@ pub enum DbValueSetV2 {
     Spn(Vec<(String, String)>),
     #[serde(rename = "UI")]
     Uint32(Vec<u32>),
+    #[serde(rename = "I64")]
+    Int64(Vec<i64>),
+    #[serde(rename = "U64")]
+    Uint64(Vec<u64>),
     #[serde(rename = "CI")]
     Cid(Vec<DbCidV1>),
     #[serde(rename = "NU")]
@@ -800,9 +813,9 @@ pub enum DbValueSetV2 {
     #[serde(rename = "AS")]
     Session(Vec<DbValueSession>),
     #[serde(rename = "JE")]
-    JwsKeyEs256(Vec<Vec<u8>>),
+    JwsKeyEs256(Vec<Zeroizing<Vec<u8>>>),
     #[serde(rename = "JR")]
-    JwsKeyRs256(Vec<Vec<u8>>),
+    JwsKeyRs256(Vec<Zeroizing<Vec<u8>>>),
     #[serde(rename = "OZ")]
     Oauth2Session(Vec<DbValueOauth2Session>),
     #[serde(rename = "UH")]
@@ -829,6 +842,12 @@ pub enum DbValueSetV2 {
     Certificate(Vec<DbValueCertificate>),
     #[serde(rename = "AP")]
     ApplicationPassword(Vec<DbValueApplicationPassword>),
+    #[serde(rename = "JO")]
+    Json(JsonValue),
+    #[serde(rename = "MS")]
+    Message(OutboundMessage),
+    #[serde(rename = "S256")]
+    Sha256(BTreeSet<Sha256Output>),
 }
 
 impl DbValueSetV2 {
@@ -849,6 +868,8 @@ impl DbValueSetV2 {
             DbValueSetV2::SshKey(set) => set.len(),
             DbValueSetV2::Spn(set) => set.len(),
             DbValueSetV2::Uint32(set) => set.len(),
+            DbValueSetV2::Int64(set) => set.len(),
+            DbValueSetV2::Uint64(set) => set.len(),
             DbValueSetV2::Cid(set) => set.len(),
             DbValueSetV2::NsUniqueId(set) => set.len(),
             DbValueSetV2::DateTime(set) => set.len(),
@@ -882,6 +903,8 @@ impl DbValueSetV2 {
             DbValueSetV2::KeyInternal(set) => set.len(),
             DbValueSetV2::Certificate(set) => set.len(),
             DbValueSetV2::ApplicationPassword(set) => set.len(),
+            DbValueSetV2::Sha256(set) => set.len(),
+            DbValueSetV2::Json(_) | DbValueSetV2::Message(_) => 1,
         }
     }
 

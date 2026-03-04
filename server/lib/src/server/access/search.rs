@@ -1,14 +1,15 @@
-use crate::prelude::*;
-use std::collections::BTreeSet;
-
+use super::migration::{MIGRATION_ENTRY_CLASSES, MIGRATION_IGNORE_CLASSES};
 use super::profiles::{
     AccessControlReceiverCondition, AccessControlSearchResolved, AccessControlTargetCondition,
 };
-use super::AccessResult;
+use super::AccessSrchResult;
+use crate::prelude::*;
+use std::collections::BTreeSet;
+use std::ops::Sub;
 use std::sync::Arc;
 
 pub(super) enum SearchResult {
-    Denied,
+    Deny,
     Grant,
     Allow(BTreeSet<Attribute>),
 }
@@ -23,32 +24,40 @@ pub(super) fn apply_search_access(
     // that.
     let mut denied = false;
     let mut grant = false;
-    let mut constrain = BTreeSet::default();
+    let constrain = BTreeSet::default();
     let mut allow = BTreeSet::default();
 
     // The access control profile
     match search_filter_entry(ident, related_acp, entry) {
-        AccessResult::Denied => denied = true,
-        AccessResult::Grant => grant = true,
-        AccessResult::Ignore => {}
-        AccessResult::Constrain(mut set) => constrain.append(&mut set),
-        AccessResult::Allow(mut set) => allow.append(&mut set),
+        AccessSrchResult::Deny => denied = true,
+        AccessSrchResult::Grant => grant = true,
+        AccessSrchResult::Ignore => {}
+        // AccessSrchResult::Constrain { mut attr } => constrain.append(&mut attr),
+        AccessSrchResult::Allow { mut attr } => allow.append(&mut attr),
     };
 
     match search_oauth2_filter_entry(ident, entry) {
-        AccessResult::Denied => denied = true,
-        AccessResult::Grant => grant = true,
-        AccessResult::Ignore => {}
-        AccessResult::Constrain(mut set) => constrain.append(&mut set),
-        AccessResult::Allow(mut set) => allow.append(&mut set),
+        AccessSrchResult::Deny => denied = true,
+        AccessSrchResult::Grant => grant = true,
+        AccessSrchResult::Ignore => {}
+        // AccessSrchResult::Constrain { mut attr } => constrain.append(&mut attr),
+        AccessSrchResult::Allow { mut attr } => allow.append(&mut attr),
+    };
+
+    match search_applications_filter_entry(ident, entry) {
+        AccessSrchResult::Deny => denied = true,
+        AccessSrchResult::Grant => grant = true,
+        AccessSrchResult::Ignore => {}
+        // AccessSrchResult::Constrain { mut attr } => constrain.append(&mut attr),
+        AccessSrchResult::Allow { mut attr } => allow.append(&mut attr),
     };
 
     match search_sync_account_filter_entry(ident, entry) {
-        AccessResult::Denied => denied = true,
-        AccessResult::Grant => grant = true,
-        AccessResult::Ignore => {}
-        AccessResult::Constrain(mut set) => constrain.append(&mut set),
-        AccessResult::Allow(mut set) => allow.append(&mut set),
+        AccessSrchResult::Deny => denied = true,
+        AccessSrchResult::Grant => grant = true,
+        AccessSrchResult::Ignore => {}
+        // AccessSrchResult::Constrain{ mut attr } => constrain.append(&mut attr),
+        AccessSrchResult::Allow { mut attr } => allow.append(&mut attr),
     };
 
     // We'll add more modules later.
@@ -56,7 +65,7 @@ pub(super) fn apply_search_access(
     // Now finalise the decision.
 
     if denied {
-        SearchResult::Denied
+        SearchResult::Deny
     } else if grant {
         SearchResult::Grant
     } else {
@@ -74,17 +83,38 @@ fn search_filter_entry(
     ident: &Identity,
     related_acp: &[AccessControlSearchResolved],
     entry: &Arc<EntrySealedCommitted>,
-) -> AccessResult {
+) -> AccessSrchResult {
     // If this is an internal search, return our working set.
     match &ident.origin {
-        IdentType::Internal => {
+        IdentType::Internal(InternalRole::System) => {
             trace!(uuid = ?entry.get_display_id(), "Internal operation, bypassing access check");
             // No need to check ACS
-            return AccessResult::Grant;
+            return AccessSrchResult::Grant;
+        }
+        IdentType::Internal(InternalRole::Migration) => {
+            trace!(uuid = ?entry.get_display_id(), "Internal migration");
+
+            let valid_migration_class = entry
+                .get_ava_as_iutf8(Attribute::Class)
+                .map(|classes| {
+                    trace!(?classes);
+                    let classes = classes.sub(&MIGRATION_IGNORE_CLASSES);
+                    classes.is_subset(&MIGRATION_ENTRY_CLASSES)
+                })
+                .unwrap_or(false);
+
+            if valid_migration_class {
+                // Can proceed.
+                trace!("grant");
+                return AccessSrchResult::Grant;
+            } else {
+                trace!("deny");
+                return AccessSrchResult::Deny;
+            }
         }
         IdentType::Synch(_) => {
             security_debug!(uuid = ?entry.get_display_id(), "Blocking sync check");
-            return AccessResult::Denied;
+            return AccessSrchResult::Deny;
         }
         IdentType::User(_) => {}
     };
@@ -95,7 +125,7 @@ fn search_filter_entry(
             security_debug!(
                 "denied ❌ - identity access scope 'Synchronise' is not permitted to search"
             );
-            return AccessResult::Denied;
+            return AccessSrchResult::Deny;
         }
         AccessScope::ReadOnly | AccessScope::ReadWrite => {
             // As you were
@@ -120,7 +150,7 @@ fn search_filter_entry(
                     // to our uuid or a group we are in as an entry manager.
 
                     // Note, while schema has this as single value, we currently
-                    // fetch it as a multivalue btreeset for future incase we allow
+                    // fetch it as a multivalue btreeset for future in case we allow
                     // multiple entry manager by in future.
                     if let Some(entry_manager_uuids) = entry.get_ava_refer(Attribute::EntryManagedBy) {
                         let group_check = ident_memberof
@@ -146,31 +176,35 @@ fn search_filter_entry(
             match &acs.target_condition {
                 AccessControlTargetCondition::Scope(f_res) => {
                     if !entry.entry_match_no_index(f_res) {
-                        security_debug!(entry = ?entry.get_display_id(), acs = %acs.acp.acp.name, "entry DOES NOT match acs");
+                        debug!(entry = ?entry.get_display_id(), acs = %acs.acp.acp.name, action="search_filter", "entry DOES NOT match acs");
                         return None
                     }
                 }
             };
 
             // -- Conditions pass -- release the attributes.
-
-            security_debug!(entry = ?entry.get_display_id(), acs = %acs.acp.acp.name, "acs applied to entry");
+            debug!(entry = ?entry.get_display_id(), acs = %acs.acp.acp.name, "acs applied to entry");
             // add search_attrs to allowed.
             Some(acs.acp.attrs.iter().cloned())
         })
         .flatten()
         .collect();
 
-    AccessResult::Allow(allowed_attrs)
+    AccessSrchResult::Allow {
+        attr: allowed_attrs,
+    }
 }
 
-fn search_oauth2_filter_entry(ident: &Identity, entry: &Arc<EntrySealedCommitted>) -> AccessResult {
+fn search_oauth2_filter_entry(
+    ident: &Identity,
+    entry: &Arc<EntrySealedCommitted>,
+) -> AccessSrchResult {
     match &ident.origin {
-        IdentType::Internal | IdentType::Synch(_) => AccessResult::Ignore,
+        IdentType::Internal(_) | IdentType::Synch(_) => AccessSrchResult::Ignore,
         IdentType::User(iuser) => {
             if iuser.entry.get_uuid() == UUID_ANONYMOUS {
                 debug!("Anonymous can't access OAuth2 entries, ignoring");
-                return AccessResult::Ignore;
+                return AccessSrchResult::Ignore;
             }
 
             let contains_o2_rs = entry
@@ -190,16 +224,63 @@ fn search_oauth2_filter_entry(ident: &Identity, entry: &Arc<EntrySealedCommitted
             if contains_o2_rs && contains_o2_scope_member {
                 security_debug!(entry = ?entry.get_uuid(), ident = ?iuser.entry.get_uuid2rdn(), "ident is a memberof a group granted an oauth2 scope by this entry");
 
-                return AccessResult::Allow(btreeset!(
-                    Attribute::Class,
-                    Attribute::DisplayName,
-                    Attribute::Uuid,
-                    Attribute::Name,
-                    Attribute::OAuth2RsOriginLanding,
-                    Attribute::Image
-                ));
+                return AccessSrchResult::Allow {
+                    attr: btreeset!(
+                        Attribute::Class,
+                        Attribute::DisplayName,
+                        Attribute::Uuid,
+                        Attribute::Name,
+                        Attribute::OAuth2RsOriginLanding,
+                        Attribute::Image
+                    ),
+                };
             }
-            AccessResult::Ignore
+            AccessSrchResult::Ignore
+        }
+    }
+}
+
+fn search_applications_filter_entry(
+    ident: &Identity,
+    entry: &Arc<EntrySealedCommitted>,
+) -> AccessSrchResult {
+    match &ident.origin {
+        IdentType::Internal(_) | IdentType::Synch(_) => AccessSrchResult::Ignore,
+        IdentType::User(iuser) => {
+            if iuser.entry.get_uuid() == UUID_ANONYMOUS {
+                debug!("Anonymous can't access application entries, ignoring");
+                return AccessSrchResult::Ignore;
+            }
+
+            let contains_application = entry
+                .get_ava_as_iutf8(Attribute::Class)
+                .map(|set| {
+                    trace!(?set);
+                    set.contains(&EntryClass::Application.to_string())
+                })
+                .unwrap_or(false);
+
+            let contains_application_linked_group = entry
+                .get_ava_single_refer(Attribute::LinkedGroup)
+                .and_then(|group_uuid| ident.get_memberof().map(|mo| mo.contains(&group_uuid)))
+                .unwrap_or(false);
+
+            trace!(?entry);
+
+            if contains_application && contains_application_linked_group {
+                security_debug!(entry = ?entry.get_uuid(), ident = ?iuser.entry.get_uuid2rdn(), "ident is a memberof a group granted application access for this entry");
+
+                return AccessSrchResult::Allow {
+                    attr: btreeset!(
+                        Attribute::Class,
+                        Attribute::DisplayName,
+                        Attribute::Uuid,
+                        Attribute::Name,
+                        Attribute::LinkedGroup
+                    ),
+                };
+            }
+            AccessSrchResult::Ignore
         }
     }
 }
@@ -207,9 +288,9 @@ fn search_oauth2_filter_entry(ident: &Identity, entry: &Arc<EntrySealedCommitted
 fn search_sync_account_filter_entry(
     ident: &Identity,
     entry: &Arc<EntrySealedCommitted>,
-) -> AccessResult {
+) -> AccessSrchResult {
     match &ident.origin {
-        IdentType::Internal | IdentType::Synch(_) => AccessResult::Ignore,
+        IdentType::Internal(_) | IdentType::Synch(_) => AccessSrchResult::Ignore,
         IdentType::User(iuser) => {
             // Is the user a synced object?
             let is_user_sync_account = iuser
@@ -244,16 +325,18 @@ fn search_sync_account_filter_entry(
                         // We finally got here!
                         security_debug!(entry = ?entry.get_uuid(), ident = ?iuser.entry.get_uuid2rdn(), "ident is a synchronised account from this sync account");
 
-                        return AccessResult::Allow(btreeset!(
-                            Attribute::Class,
-                            Attribute::Uuid,
-                            Attribute::SyncCredentialPortal
-                        ));
+                        return AccessSrchResult::Allow {
+                            attr: btreeset!(
+                                Attribute::Class,
+                                Attribute::Uuid,
+                                Attribute::SyncCredentialPortal
+                            ),
+                        };
                     }
                 }
             }
             // Fall through
-            AccessResult::Ignore
+            AccessSrchResult::Ignore
         }
     }
 }

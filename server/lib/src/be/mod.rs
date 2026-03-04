@@ -4,20 +4,6 @@
 //! is to persist content safely to disk, load that content, and execute queries
 //! utilising indexes in the most effective way possible.
 
-use std::collections::BTreeMap;
-use std::fs;
-use std::ops::DerefMut;
-use std::sync::Arc;
-use std::time::Duration;
-
-use concread::cowcell::*;
-use hashbrown::{HashMap as Map, HashSet};
-use idlset::v2::IDLBitRange;
-use idlset::AndNot;
-use kanidm_proto::internal::{ConsistencyError, OperationError};
-use tracing::{trace, trace_span};
-use uuid::Uuid;
-
 use crate::be::dbentry::{DbBackup, DbEntry};
 use crate::be::dbrepl::DbReplMeta;
 use crate::entry::Entry;
@@ -31,6 +17,23 @@ use crate::repl::ruv::{
 };
 use crate::utils::trigraph_iter;
 use crate::value::{IndexType, Value};
+use concread::cowcell::*;
+use hashbrown::{HashMap as Map, HashSet};
+use idlset::v2::IDLBitRange;
+use idlset::AndNot;
+use kanidm_proto::backup::BackupCompression;
+use kanidm_proto::internal::{ConsistencyError, OperationError};
+use std::collections::BTreeMap;
+use std::io::prelude::*;
+use std::ops::DerefMut;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+use tracing::{trace, trace_span};
+use uuid::Uuid;
+
+use flate2::write::GzEncoder;
+use flate2::Compression;
 
 pub(crate) mod dbentry;
 pub(crate) mod dbrepl;
@@ -56,7 +59,7 @@ const FILTER_SUBSTR_TEST_THRESHOLD: usize = 4;
 #[derive(Debug, Clone)]
 /// Limits on the resources a single event can consume. These are defined per-event
 /// as they are derived from the userAuthToken based on that individual session
-pub(crate) struct Limits {
+pub struct Limits {
     pub unindexed_allow: bool,
     pub search_max_results: usize,
     pub search_max_filter_test: usize,
@@ -101,7 +104,7 @@ pub enum IdList {
     /// The value is not indexed, and must be assumed that all entries may match.
     AllIds,
     /// The index is "fuzzy" like a bloom filter (perhaps superset is a better description) -
-    /// it containes all elements that do match, but may have extra elements that don't.
+    /// it contains all elements that do match, but may have extra elements that don't.
     /// This requires the caller to perform a filter test to assert that all
     /// returned entries match all assertions within the filter.
     Partial(IDLBitRange),
@@ -132,7 +135,7 @@ impl IdxMeta {
 
 #[derive(Clone)]
 pub struct BackendConfig {
-    path: String,
+    path: PathBuf,
     pool_size: u32,
     db_name: &'static str,
     fstype: FsType,
@@ -141,10 +144,16 @@ pub struct BackendConfig {
 }
 
 impl BackendConfig {
-    pub fn new(path: &str, pool_size: u32, fstype: FsType, arcsize: Option<usize>) -> Self {
+    pub fn new(
+        path: Option<&Path>,
+        pool_size: u32,
+        fstype: FsType,
+        arcsize: Option<usize>,
+    ) -> Self {
         BackendConfig {
             pool_size,
-            path: path.to_string(),
+            // This means if path is None, that "" implies an sqlite in memory/ram only database.
+            path: path.unwrap_or_else(|| Path::new("")).to_path_buf(),
             db_name: "main",
             fstype,
             arcsize,
@@ -154,7 +163,7 @@ impl BackendConfig {
     pub(crate) fn new_test(db_name: &'static str) -> Self {
         BackendConfig {
             pool_size: 1,
-            path: "".to_string(),
+            path: PathBuf::from(""),
             db_name,
             fstype: FsType::Generic,
             arcsize: Some(2048),
@@ -278,9 +287,22 @@ pub trait BackendTransaction {
                     (IdList::AllIds, FilterPlan::PresUnindexed(attr.clone()))
                 }
             }
-            FilterResolved::LessThan(attr, _subvalue, _idx) => {
-                // We have no process for indexing this right now.
-                (IdList::AllIds, FilterPlan::LessThanUnindexed(attr.clone()))
+            FilterResolved::LessThan(attr, _subvalue, idx) => {
+                if idx.is_some() {
+                    // TODO: Temporary but we get the PRESENCE index for Ordering operations to
+                    // reduce the amount of entries we need to filter in memory. In future we need
+                    // a true ordering index, but that's a large block of work on it's own. For now
+                    // this already helps a lot for in memory processing.
+                    match self.get_idlayer().get_idl(attr, IndexType::Presence, "_")? {
+                        Some(idl) => (
+                            IdList::Partial(idl),
+                            FilterPlan::LessThanIndexed(attr.clone()),
+                        ),
+                        None => (IdList::AllIds, FilterPlan::LessThanCorrupt(attr.clone())),
+                    }
+                } else {
+                    (IdList::AllIds, FilterPlan::LessThanUnindexed(attr.clone()))
+                }
             }
             FilterResolved::Or(l, _) => {
                 // Importantly if this has no inner elements, this returns
@@ -549,10 +571,11 @@ pub trait BackendTransaction {
                         }
                         (_, fp) => {
                             plan.push(fp);
-                            filter_error!(
+                            let setplan = FilterPlan::InclusionInvalid(plan);
+                            error!(
+                                ?setplan,
                                 "Inclusion is unable to proceed - all terms must be fully indexed!"
                             );
-                            let setplan = FilterPlan::InclusionInvalid(plan);
                             return Ok((IdList::Partial(IDLBitRange::new()), setplan));
                         }
                     }
@@ -935,7 +958,14 @@ pub trait BackendTransaction {
         self.get_ruv().verify(&entries, results);
     }
 
-    fn backup(&mut self, dst_path: &str) -> Result<(), OperationError> {
+    fn backup<OUT>(
+        &mut self,
+        mut output: OUT,
+        compression: BackupCompression,
+    ) -> Result<(), OperationError>
+    where
+        OUT: std::io::Write,
+    {
         let repl_meta = self.get_ruv().to_db_backup_ruv();
 
         // load all entries into RAM, may need to change this later
@@ -982,12 +1012,32 @@ pub trait BackendTransaction {
             OperationError::SerdeJsonError
         })?;
 
-        fs::write(dst_path, serialized_entries_str)
-            .map(|_| ())
-            .map_err(|e| {
-                admin_error!(?e, "fs::write error");
-                OperationError::FsError
-            })
+        match compression {
+            BackupCompression::NoCompression => {
+                output
+                    .write(serialized_entries_str.as_bytes())
+                    .map_err(|e| {
+                        error!(?e, "fs::write error");
+                        OperationError::FsError
+                    })?;
+            }
+            BackupCompression::Gzip => {
+                let mut encoder = GzEncoder::new(&mut output, Compression::best());
+                encoder
+                    .write_all(serialized_entries_str.as_bytes())
+                    .map_err(|e| {
+                        error!(?e, "Gzip compression error writing backup");
+                        OperationError::FsError
+                    })?;
+            }
+        }
+
+        output.flush().map_err(|err| {
+            error!(?err, "Unable to flush backup output stream");
+            OperationError::FsError
+        })?;
+
+        Ok(())
     }
 
     fn name2uuid(&mut self, name: &str) -> Result<Option<Uuid>, OperationError> {
@@ -1211,7 +1261,7 @@ impl<'a> BackendWriteTransaction<'a> {
     }
 
     #[instrument(level = "debug", name = "be::incremental_prepare", skip_all)]
-    pub fn incremental_prepare<'x>(
+    pub fn incremental_prepare(
         &mut self,
         entry_meta: &[EntryIncrementalNew],
     ) -> Result<Vec<Arc<EntrySealedCommitted>>, OperationError> {
@@ -1427,20 +1477,21 @@ impl<'a> BackendWriteTransaction<'a> {
         if self.is_idx_slopeyness_generated()? {
             trace!("Indexing slopes available");
         } else {
-            admin_warn!(
-                "No indexing slopes available. You should consider reindexing to generate these"
-            );
+            warn!("No indexing slopes available. You should consider reindexing to generate these");
         };
+
+        // TODO: I think anytime we update idx meta is when we should reindex in memory
+        // indexes.
+        // Probably needs to be similar to create_idxs so we iterate over the set of
+        // purely in memory idxs.
 
         // Setup idxkeys here. By default we set these all to "max slope" aka
         // all indexes are "equal" but also worse case unless analysed. If they
         // have been analysed, we can set the slope factor into here.
-        let idxkeys: Result<Map<_, _>, _> = idxkeys
+        let mut idxkeys = idxkeys
             .into_iter()
             .map(|k| self.get_idx_slope(&k).map(|slope| (k, slope)))
-            .collect();
-
-        let mut idxkeys = idxkeys?;
+            .collect::<Result<Map<_, _>, _>>()?;
 
         std::mem::swap(&mut self.idxmeta_wr.deref_mut().idxkeys, &mut idxkeys);
         Ok(())
@@ -1716,9 +1767,11 @@ impl<'a> BackendWriteTransaction<'a> {
         );
 
         // Purge the idxs
+        // TODO: Purge in memory idxs.
         self.idlayer.danger_purge_idxs()?;
 
         // Using the index metadata on the txn, create all our idx tables
+        // TODO: Needs to create all the in memory indexes.
         self.create_idxs()?;
 
         // Now, we need to iterate over everything in id2entry and index them
@@ -1738,7 +1791,7 @@ impl<'a> BackendWriteTransaction<'a> {
                 if immediate {
                     count += 1;
                     if count % 2500 == 0 {
-                        eprint!("{}", count);
+                        eprint!("{count}");
                     } else if count % 250 == 0 {
                         eprint!(".");
                     }
@@ -1811,28 +1864,36 @@ impl<'a> BackendWriteTransaction<'a> {
         Ok(slope)
     }
 
-    pub fn restore(&mut self, src_path: &str) -> Result<(), OperationError> {
-        let serialized_string = fs::read_to_string(src_path).map_err(|e| {
-            admin_error!("fs::read_to_string {:?}", e);
-            OperationError::FsError
-        })?;
-
-        self.danger_delete_all_db_content().map_err(|e| {
-            admin_error!("delete_all_db_content failed {:?}", e);
-            e
-        })?;
-
-        let idlayer = self.get_idlayer();
+    pub fn restore<IN>(
+        &mut self,
+        input: IN,
+        compression: BackupCompression,
+    ) -> Result<(), OperationError>
+    where
+        IN: std::io::Read,
+    {
         // load all entries into RAM, may need to change this later
         // if the size of the database compared to RAM is an issue
 
-        let dbbak_option: Result<DbBackup, serde_json::Error> =
-            serde_json::from_str(&serialized_string);
+        let dbbak_option: Result<DbBackup, serde_json::Error> = match compression {
+            BackupCompression::NoCompression => serde_json::from_reader(input),
+            BackupCompression::Gzip => {
+                let decoder = flate2::read::GzDecoder::new(input);
+                serde_json::from_reader(decoder)
+            }
+        };
 
         let dbbak = dbbak_option.map_err(|e| {
             admin_error!("serde_json error {:?}", e);
             OperationError::SerdeJsonError
         })?;
+
+        self.danger_delete_all_db_content().map_err(|e| {
+            error!("delete_all_db_content failed {:?}", e);
+            e
+        })?;
+
+        let idlayer = self.get_idlayer();
 
         let (dbentries, repl_meta, maybe_version) = match dbbak {
             DbBackup::V1(dbentries) => (dbentries, None, None),
@@ -2107,6 +2168,7 @@ fn get_idx_slope_default(ikey: &IdxKey) -> IdxSlope {
         (_, IndexType::Equality) => 45,
         (_, IndexType::SubString) => 90,
         (_, IndexType::Presence) => 90,
+        (_, IndexType::Ordering) => 120,
     }
 }
 
@@ -2124,7 +2186,7 @@ impl Backend {
         debug!(db_tickets = ?cfg.pool_size, profile = %env!("KANIDM_PROFILE_NAME"), cpu_flags = %env!("KANIDM_CPU_FLAGS"));
 
         // If in memory, reduce pool to 1
-        if cfg.path.is_empty() {
+        if cfg.path.as_os_str().is_empty() {
             cfg.pool_size = 1;
         }
 
@@ -2167,6 +2229,10 @@ impl Backend {
                 e
             })?;
 
+        // Load/generate any in memory indexes.
+        // I think here we don't actually care about in memory indexes until
+        // later?
+
         // Now rebuild the ruv.
         let mut be_write = be.write()?;
         be_write
@@ -2189,7 +2255,7 @@ impl Backend {
         self.idlayer.try_quiesce();
     }
 
-    pub fn read(&self) -> Result<BackendReadTransaction, OperationError> {
+    pub fn read(&self) -> Result<BackendReadTransaction<'_>, OperationError> {
         Ok(BackendReadTransaction {
             idlayer: self.idlayer.read()?,
             idxmeta: self.idxmeta.read(),
@@ -2197,7 +2263,7 @@ impl Backend {
         })
     }
 
-    pub fn write(&self) -> Result<BackendWriteTransaction, OperationError> {
+    pub fn write(&self) -> Result<BackendWriteTransaction<'_>, OperationError> {
         Ok(BackendWriteTransaction {
             idlayer: self.idlayer.write()?,
             idxmeta_wr: self.idxmeta.write(),
@@ -2210,13 +2276,6 @@ impl Backend {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-    use std::iter::FromIterator;
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    use idlset::v2::IDLBitRange;
-
     use super::super::entry::{Entry, EntryInit, EntryNew};
     use super::Limits;
     use super::{
@@ -2226,14 +2285,17 @@ mod tests {
     use crate::prelude::*;
     use crate::repl::cid::Cid;
     use crate::value::{IndexType, PartialValue, Value};
+    use idlset::v2::IDLBitRange;
+    use kanidm_proto::backup::BackupCompression;
+    use std::iter::FromIterator;
+    use std::sync::{Arc, LazyLock};
+    use std::time::Duration;
 
-    lazy_static! {
-        static ref CID_ZERO: Cid = Cid::new_zero();
-        static ref CID_ONE: Cid = Cid::new_count(1);
-        static ref CID_TWO: Cid = Cid::new_count(2);
-        static ref CID_THREE: Cid = Cid::new_count(3);
-        static ref CID_ADV: Cid = Cid::new_count(10);
-    }
+    static CID_ZERO: LazyLock<Cid> = LazyLock::new(|| Cid::new_zero());
+    static CID_ONE: LazyLock<Cid> = LazyLock::new(|| Cid::new_count(1));
+    static CID_TWO: LazyLock<Cid> = LazyLock::new(|| Cid::new_count(2));
+    static CID_THREE: LazyLock<Cid> = LazyLock::new(|| Cid::new_count(3));
+    static CID_ADV: LazyLock<Cid> = LazyLock::new(|| Cid::new_count(10));
 
     macro_rules! run_test {
         ($test_fn:expr) => {{
@@ -2416,7 +2478,7 @@ mod tests {
             let lims = Limits::unlimited();
 
             let r = be.search(&lims, &filt);
-            assert!(r.expect("Search failed!").len() == 0);
+            assert!(r.expect("Search failed!").is_empty());
         });
     }
 
@@ -2481,7 +2543,9 @@ mod tests {
             let vr2 = r2.into_sealed_committed();
 
             // Modify single
-            assert!(be.modify(&CID_ZERO, &[pre1], &[vr1.clone()]).is_ok());
+            assert!(be
+                .modify(&CID_ZERO, &[pre1], std::slice::from_ref(&vr1))
+                .is_ok());
             // Assert no other changes
             assert!(entry_attr_pres!(be, vr1, Attribute::TestAttr));
             assert!(!entry_attr_pres!(be, vr2, Attribute::TestAttr));
@@ -2554,7 +2618,9 @@ mod tests {
             // This sets up the RUV with the changes.
             let r1_ts = r1.to_tombstone(CID_ONE.clone()).into_sealed_committed();
 
-            assert!(be.modify(&CID_ONE, &[r1], &[r1_ts.clone()]).is_ok());
+            assert!(be
+                .modify(&CID_ONE, &[r1], std::slice::from_ref(&r1_ts))
+                .is_ok());
 
             let r2_ts = r2.to_tombstone(CID_TWO.clone()).into_sealed_committed();
             let r3_ts = r3.to_tombstone(CID_TWO.clone()).into_sealed_committed();
@@ -2600,11 +2666,6 @@ mod tests {
 
     #[test]
     fn test_be_backup_restore() {
-        let db_backup_file_name = format!(
-            "{}/.backup_test.json",
-            option_env!("OUT_DIR").unwrap_or("/tmp")
-        );
-        eprintln!(" ⚠️   {db_backup_file_name}");
         run_test!(|be: &mut BackendWriteTransaction| {
             // Important! Need db metadata setup!
             be.reset_db_s_uuid().unwrap();
@@ -2642,16 +2703,15 @@ mod tests {
             assert!(entry_exists!(be, e2));
             assert!(entry_exists!(be, e3));
 
-            let result = fs::remove_file(&db_backup_file_name);
+            let mut buf = std::io::Cursor::new(Vec::new());
 
-            if let Err(e) = result {
-                // if the error is the file is not found, that's what we want so continue,
-                // otherwise return the error
-                if e.kind() == std::io::ErrorKind::NotFound {}
-            }
+            be.backup(&mut buf, BackupCompression::Gzip)
+                .expect("Backup failed!");
 
-            be.backup(&db_backup_file_name).expect("Backup failed!");
-            be.restore(&db_backup_file_name).expect("Restore failed!");
+            buf.set_position(0);
+
+            be.restore(&mut buf, BackupCompression::Gzip)
+                .expect("Restore failed!");
 
             assert!(be.verify().is_empty());
         });
@@ -2659,11 +2719,6 @@ mod tests {
 
     #[test]
     fn test_be_backup_restore_tampered() {
-        let db_backup_file_name = format!(
-            "{}/.backup2_test.json",
-            option_env!("OUT_DIR").unwrap_or("/tmp")
-        );
-        eprintln!(" ⚠️   {db_backup_file_name}");
         run_test!(|be: &mut BackendWriteTransaction| {
             // Important! Need db metadata setup!
             be.reset_db_s_uuid().unwrap();
@@ -2700,20 +2755,16 @@ mod tests {
             assert!(entry_exists!(be, e2));
             assert!(entry_exists!(be, e3));
 
-            let result = fs::remove_file(&db_backup_file_name);
+            let mut buf = std::io::Cursor::new(Vec::new());
 
-            if let Err(e) = result {
-                // if the error is the file is not found, that's what we want so continue,
-                // otherwise return the error
-                if e.kind() == std::io::ErrorKind::NotFound {}
-            }
+            be.backup(&mut buf, BackupCompression::NoCompression)
+                .expect("Backup failed!");
 
-            be.backup(&db_backup_file_name).expect("Backup failed!");
+            // Rewind
+            buf.set_position(0);
 
-            // Now here, we need to tamper with the file.
-            let serialized_string = fs::read_to_string(&db_backup_file_name).unwrap();
-            trace!(?serialized_string);
-            let mut dbbak: DbBackup = serde_json::from_str(&serialized_string).unwrap();
+            // Now here, we need to tamper with the data.
+            let mut dbbak: DbBackup = serde_json::from_reader(&mut buf).unwrap();
 
             match &mut dbbak {
                 DbBackup::V5 {
@@ -2733,10 +2784,16 @@ mod tests {
                 }
             };
 
-            let serialized_entries_str = serde_json::to_string_pretty(&dbbak).unwrap();
-            fs::write(&db_backup_file_name, serialized_entries_str).unwrap();
+            buf.get_mut().clear();
+            buf.set_position(0);
 
-            be.restore(&db_backup_file_name).expect("Restore failed!");
+            serde_json::to_writer(&mut buf, &dbbak).unwrap();
+
+            // Rewind
+            buf.set_position(0);
+
+            be.restore(&mut buf, BackupCompression::NoCompression)
+                .expect("Restore failed!");
 
             assert!(be.verify().is_empty());
         });

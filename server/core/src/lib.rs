@@ -20,6 +20,7 @@
 #![deny(clippy::await_holding_lock)]
 #![deny(clippy::needless_pass_by_value)]
 #![deny(clippy::trivially_copy_pass_by_ref)]
+#![deny(clippy::indexing_slicing)]
 
 #[macro_use]
 extern crate tracing;
@@ -34,32 +35,41 @@ mod https;
 mod interval;
 mod ldaps;
 mod repl;
+mod tcp;
 mod utils;
 
-use std::fmt::{Display, Formatter};
-use std::sync::Arc;
-
+use crate::actors::{QueryServerReadV1, QueryServerWriteV1};
+use crate::admin::AdminActor;
+use crate::config::Configuration;
+use crate::interval::IntervalActor;
 use crate::utils::touch_file_or_quit;
 use compact_jwt::{JwsHs256Signer, JwsSigner};
+use crypto_glue::{
+    s256::{Sha256, Sha256Output},
+    traits::Digest,
+};
+use kanidm_proto::backup::BackupCompression;
+use kanidm_proto::config::ServerRole;
 use kanidm_proto::internal::OperationError;
+use kanidm_proto::scim_v1::client::ScimAssertGeneric;
 use kanidmd_lib::be::{Backend, BackendConfig, BackendTransaction};
 use kanidmd_lib::idm::ldap::LdapServer;
 use kanidmd_lib::prelude::*;
 use kanidmd_lib::schema::Schema;
 use kanidmd_lib::status::StatusActor;
 use kanidmd_lib::value::CredentialType;
-#[cfg(not(target_family = "windows"))]
-use libc::umask;
-
+use regex::Regex;
+use std::collections::BTreeSet;
+use std::fmt::{Display, Formatter};
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::LazyLock;
 use tokio::sync::broadcast;
-use tokio::sync::Notify;
 use tokio::task;
 
-use crate::actors::{QueryServerReadV1, QueryServerWriteV1};
-use crate::admin::AdminActor;
-use crate::config::{Configuration, ServerRole};
-use crate::interval::IntervalActor;
-use tokio::sync::mpsc;
+#[cfg(not(target_family = "windows"))]
+use libc::umask;
 
 // === internal setup helpers
 
@@ -80,7 +90,7 @@ fn setup_backend_vacuum(
     let pool_size: u32 = config.threads as u32;
 
     let cfg = BackendConfig::new(
-        config.db_path.as_str(),
+        config.db_path.as_deref(),
         pool_size,
         config.db_fs_type.unwrap_or_default(),
         config.db_arc_size,
@@ -116,8 +126,13 @@ async fn setup_qs_idms(
 
     // We generate a SINGLE idms only!
     let is_integration_test = config.integration_test_config.is_some();
-    let (idms, idms_delayed, idms_audit) =
-        IdmServer::new(query_server.clone(), &config.origin, is_integration_test).await?;
+    let (idms, idms_delayed, idms_audit) = IdmServer::new(
+        query_server.clone(),
+        &config.origin,
+        is_integration_test,
+        curtime,
+    )
+    .await?;
 
     Ok((query_server, idms, idms_delayed, idms_audit))
 }
@@ -182,7 +197,7 @@ pub fn dbscan_list_indexes_core(config: &Configuration) {
         Ok(mut idx_list) => {
             idx_list.sort_unstable();
             idx_list.iter().for_each(|idx_name| {
-                println!("{}", idx_name);
+                println!("{idx_name}");
             })
         }
         Err(e) => {
@@ -205,7 +220,7 @@ pub fn dbscan_list_id2entry_core(config: &Configuration) {
         Ok(mut id_list) => {
             id_list.sort_unstable_by_key(|k| k.0);
             id_list.iter().for_each(|(id, value)| {
-                println!("{:>8}: {}", id, value);
+                println!("{id:>8}: {value}");
             })
         }
         Err(e) => {
@@ -233,7 +248,7 @@ pub fn dbscan_list_index_core(config: &Configuration, index_name: &str) {
         Ok(mut idx_list) => {
             idx_list.sort_unstable_by(|a, b| a.0.cmp(&b.0));
             idx_list.iter().for_each(|(key, value)| {
-                println!("{:>50}: {:?}", key, value);
+                println!("{key:>50}: {value:?}");
             })
         }
         Err(e) => {
@@ -253,7 +268,7 @@ pub fn dbscan_get_id2entry_core(config: &Configuration, id: u64) {
     };
 
     match be_rotxn.get_id2entry(id) {
-        Ok((id, value)) => println!("{:>8}: {}", id, value),
+        Ok((id, value)) => println!("{id:>8}: {value}"),
         Err(e) => {
             error!("Failed to retrieve id2entry value: {:?}", e);
         }
@@ -278,7 +293,7 @@ pub fn dbscan_quarantine_id2entry_core(config: &Configuration, id: u64) {
         .and_then(|_| be_wrtxn.commit())
     {
         Ok(()) => {
-            println!("quarantined - {:>8}", id)
+            println!("quarantined - {id:>8}")
         }
         Err(e) => {
             error!("Failed to quarantine id2entry value: {:?}", e);
@@ -300,7 +315,7 @@ pub fn dbscan_list_quarantined_core(config: &Configuration) {
         Ok(mut id_list) => {
             id_list.sort_unstable_by_key(|k| k.0);
             id_list.iter().for_each(|(id, value)| {
-                println!("{:>8}: {}", id, value);
+                println!("{id:>8}: {value}");
             })
         }
         Err(e) => {
@@ -327,7 +342,7 @@ pub fn dbscan_restore_quarantined_core(config: &Configuration, id: u64) {
         .and_then(|_| be_wrtxn.commit())
     {
         Ok(()) => {
-            println!("restored - {:>8}", id)
+            println!("restored - {id:>8}")
         }
         Err(e) => {
             error!("Failed to restore quarantined id2entry value: {:?}", e);
@@ -335,7 +350,7 @@ pub fn dbscan_restore_quarantined_core(config: &Configuration, id: u64) {
     };
 }
 
-pub fn backup_server_core(config: &Configuration, dst_path: &str) {
+pub fn backup_server_core(config: &Configuration, dst_path: Option<&Path>) {
     let schema = match Schema::new() {
         Ok(s) => s,
         Err(e) => {
@@ -360,19 +375,55 @@ pub fn backup_server_core(config: &Configuration, dst_path: &str) {
         }
     };
 
-    let r = be_ro_txn.backup(dst_path);
-    match r {
-        Ok(_) => info!("Backup success!"),
-        Err(e) => {
-            error!("Backup failed: {:?}", e);
-            std::process::exit(1);
+    let compression = match config.online_backup.as_ref() {
+        Some(backup_config) => backup_config.compression,
+        None => BackupCompression::default(),
+    };
+
+    if let Some(dst_path) = dst_path {
+        if dst_path.exists() {
+            error!(
+                "backup file {} already exists, will not overwrite it.",
+                dst_path.display()
+            );
+            return;
         }
+
+        let output = match std::fs::File::create(dst_path) {
+            Ok(output) => output,
+            Err(err) => {
+                error!(?err, "File::create error creating {}", dst_path.display());
+                return;
+            }
+        };
+
+        match be_ro_txn.backup(output, compression) {
+            Ok(_) => info!("Backup success!"),
+            Err(e) => {
+                error!("Backup failed: {:?}", e);
+                std::process::exit(1);
+            }
+        };
+    } else {
+        // No path set, default to stdout
+        let stdout = std::io::stdout().lock();
+
+        match be_ro_txn.backup(stdout, compression) {
+            Ok(_) => info!("Backup success!"),
+            Err(e) => {
+                error!("Backup failed: {:?}", e);
+                std::process::exit(1);
+            }
+        };
     };
     // Let the txn abort, even on success.
 }
 
-pub async fn restore_server_core(config: &Configuration, dst_path: &str) {
-    touch_file_or_quit(config.db_path.as_str());
+pub async fn restore_server_core(config: &Configuration, dst_path: &Path) {
+    // If it's an in memory database, we don't need to touch anything
+    if let Some(db_path) = config.db_path.as_ref() {
+        touch_file_or_quit(db_path);
+    }
 
     // First, we provide the in-memory schema so that core attrs are indexed correctly.
     let schema = match Schema::new() {
@@ -401,7 +452,20 @@ pub async fn restore_server_core(config: &Configuration, dst_path: &str) {
             return;
         }
     };
-    let r = be_wr_txn.restore(dst_path).and_then(|_| be_wr_txn.commit());
+
+    let compression = BackupCompression::identify_file(dst_path);
+
+    let input = match std::fs::File::open(dst_path) {
+        Ok(output) => output,
+        Err(err) => {
+            error!(?err, "File::open error reading {}", dst_path.display());
+            return;
+        }
+    };
+
+    let r = be_wr_txn
+        .restore(input, compression)
+        .and_then(|_| be_wr_txn.commit());
 
     if r.is_err() {
         error!("Failed to restore database: {:?}", r);
@@ -492,7 +556,7 @@ pub fn vacuum_server_core(config: &Configuration) {
     let schema = match Schema::new() {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("Failed to setup in memory schema: {:?}", e);
+            eprintln!("Failed to setup in memory schema: {e:?}");
             std::process::exit(1);
         }
     };
@@ -504,7 +568,7 @@ pub fn vacuum_server_core(config: &Configuration) {
     match r {
         Ok(_) => eprintln!("Vacuum Success!"),
         Err(e) => {
-            eprintln!("Vacuum failed: {:?}", e);
+            eprintln!("Vacuum failed: {e:?}");
             std::process::exit(1);
         }
     };
@@ -514,7 +578,7 @@ pub async fn domain_rename_core(config: &Configuration) {
     let schema = match Schema::new() {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("Failed to setup in memory schema: {:?}", e);
+            eprintln!("Failed to setup in memory schema: {e:?}");
             std::process::exit(1);
         }
     };
@@ -637,19 +701,12 @@ pub fn cert_generate_core(config: &Configuration) {
         return;
     }
 
-    let origin = match Url::parse(&config.origin) {
-        Ok(url) => url,
-        Err(e) => {
-            error!(err = ?e, "Unable to parse origin URL - refusing to start. You must correct the value for origin. {:?}", config.origin);
+    let origin_domain = match config.origin.domain() {
+        Some(val) => val,
+        None => {
+            error!("origin does not contain a valid domain");
             std::process::exit(1);
         }
-    };
-
-    let origin_domain = if let Some(d) = origin.domain() {
-        d
-    } else {
-        error!("origin does not contain a valid domain");
-        std::process::exit(1);
     };
 
     let cert_root = match tls_key_path.parent() {
@@ -708,9 +765,149 @@ pub fn cert_generate_core(config: &Configuration) {
     info!("certificate generation complete");
 }
 
+static MIGRATION_PATH_RE: LazyLock<Regex> = LazyLock::new(|| {
+    #[allow(clippy::expect_used)]
+    Regex::new("^\\d\\d-.*\\.h?json$").expect("Invalid SPN regex found")
+});
+
+struct ScimMigration {
+    path: PathBuf,
+    hash: Sha256Output,
+    assertions: ScimAssertGeneric,
+}
+
+#[instrument(
+    level = "info",
+    fields(uuid = ?eventid),
+    skip_all,
+)]
+async fn migration_apply(
+    eventid: Uuid,
+    server_write_ref: &'static QueryServerWriteV1,
+    migration_path: &Path,
+) {
+    if !migration_path.exists() {
+        info!(migration_path = %migration_path.display(), "Migration path does not exist - migrations will be skipped.");
+        return;
+    }
+
+    let mut dir_ents = match tokio::fs::read_dir(migration_path).await {
+        Ok(dir_ents) => dir_ents,
+        Err(err) => {
+            error!(?err, "Unable to read migration directory.");
+            let diag = kanidm_lib_file_permissions::diagnose_path(migration_path);
+            info!(%diag);
+            return;
+        }
+    };
+
+    let mut migration_paths = Vec::with_capacity(8);
+
+    loop {
+        match dir_ents.next_entry().await {
+            Ok(Some(dir_ent)) => migration_paths.push(dir_ent.path()),
+            Ok(None) => {
+                // Complete,
+                break;
+            }
+            Err(err) => {
+                error!(?err, "Unable to read directory entries.");
+                return;
+            }
+        }
+    }
+
+    // Filter these.
+
+    let mut migration_paths: Vec<_> = migration_paths.into_iter()
+        .filter(|path| {
+            if !path.is_file() {
+                info!(path = %path.display(), "ignoring path that is not a file.");
+                return false;
+            }
+
+            let Some(file_name) = path.file_name().and_then(std::ffi::OsStr::to_str) else {
+                info!(path = %path.display(), "ignoring path that has no file name, or is not a valid utf-8 file name.");
+                return false;
+            };
+
+            if !MIGRATION_PATH_RE.is_match(file_name) {
+                info!(path = %path.display(), "ignoring file that does not match naming pattern.");
+                info!("expected pattern 'XX-NAME.json' where XX are two numbers, followed by a hypen, with the file extension .json");
+                return false;
+            }
+
+            true
+        })
+        .collect();
+
+    migration_paths.sort_unstable();
+    let mut migrations = Vec::with_capacity(migration_paths.len());
+
+    for migration_path in migration_paths {
+        info!(path = %migration_path.display(), "examining migration");
+
+        let migration_content = match tokio::fs::read(&migration_path).await {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                error!(?err, "Unable to read migration - it will be ignored.");
+                let diag = kanidm_lib_file_permissions::diagnose_path(&migration_path);
+                info!(%diag);
+                continue;
+            }
+        };
+
+        // Is it valid json?
+        let assertions: ScimAssertGeneric = match serde_hjson::from_slice(&migration_content) {
+            Ok(assertions) => assertions,
+            Err(err) => {
+                error!(?err, path = %migration_path.display(), "Invalid JSON SCIM Assertion");
+                continue;
+            }
+        };
+
+        // Hash the content.
+        let mut hasher = Sha256::new();
+        hasher.update(&migration_content);
+        let migration_hash: Sha256Output = hasher.finalize();
+
+        migrations.push(ScimMigration {
+            path: migration_path,
+            hash: migration_hash,
+            assertions,
+        });
+    }
+
+    let mut migration_ids = BTreeSet::new();
+    for migration in &migrations {
+        // BTreeSet returns false on duplicate value insertion.
+        if !migration_ids.insert(migration.assertions.id) {
+            error!(path = %migration.path.display(), uuid = ?migration.assertions.id, "Duplicate migration UUID found, refusing to proceed!!! All migrations must have a unique ID!!!");
+            return;
+        }
+    }
+
+    // Okay, we're setup to go - apply them all. Note that we do these
+    // separately, each migration occurs in its own transaction.
+    for ScimMigration {
+        path,
+        hash,
+        assertions,
+    } in migrations
+    {
+        if let Err(err) = server_write_ref
+            .handle_scim_migration_apply(eventid, assertions, hash)
+            .await
+        {
+            error!(?err, path = %path.display(), "Failed to apply migration");
+        };
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum CoreAction {
     Shutdown,
+    Reload,
 }
 
 pub(crate) enum TaskName {
@@ -723,6 +920,7 @@ pub(crate) enum TaskName {
     LdapActor,
     Replication,
     TlsAcceptorReload,
+    MigrationReload,
 }
 
 impl Display for TaskName {
@@ -740,6 +938,7 @@ impl Display for TaskName {
                 TaskName::LdapActor => "LDAP Acceptor Actor",
                 TaskName::Replication => "Replication",
                 TaskName::TlsAcceptorReload => "TlsAcceptor Reload Monitor",
+                TaskName::MigrationReload => "Migration Reload Monitor",
             }
         )
     }
@@ -748,7 +947,6 @@ impl Display for TaskName {
 pub struct CoreHandle {
     clean_shutdown: bool,
     tx: broadcast::Sender<CoreAction>,
-    tls_acceptor_reload_notify: Arc<Notify>,
     /// This stores a name for the handle, and the handle itself so we can tell which failed/succeeded at the end.
     handles: Vec<(TaskName, task::JoinHandle<()>)>,
 }
@@ -766,16 +964,19 @@ impl CoreHandle {
 
         // Wait on the handles.
         while let Some((handle_name, handle)) = self.handles.pop() {
+            debug!("Waiting for {handle_name} ...");
             if let Err(error) = handle.await {
-                eprintln!("Task {} failed to finish: {:?}", handle_name, error);
+                eprintln!("Task {handle_name} failed to finish: {error:?}");
             }
         }
 
         self.clean_shutdown = true;
     }
 
-    pub async fn tls_acceptor_reload(&mut self) {
-        self.tls_acceptor_reload_notify.notify_one()
+    pub async fn reload(&mut self) {
+        if self.tx.send(CoreAction::Reload).is_err() {
+            eprintln!("No receivers acked reload request.");
+        }
     }
 }
 
@@ -970,6 +1171,7 @@ pub async fn create_server_core(
                 Ok(action) = broadcast_rx.recv() => {
                     match action {
                         CoreAction::Shutdown => break,
+                        CoreAction::Reload => {},
                     }
                 }
             }
@@ -985,6 +1187,7 @@ pub async fn create_server_core(
                 Ok(action) = broadcast_rx.recv() => {
                     match action {
                         CoreAction::Shutdown => break,
+                        CoreAction::Reload => {},
                     }
                 }
                 audit_event = idms_audit.audit_rx().recv() => {
@@ -1004,16 +1207,51 @@ pub async fn create_server_core(
         info!("Stopped {}", TaskName::AuditdActor);
     });
 
+    // Run the migrations *once*, only in production though.
+    let migration_path = config
+        .migration_path
+        .clone()
+        .unwrap_or(PathBuf::from(env!("KANIDM_SERVER_MIGRATION_PATH")));
+
+    if config.integration_test_config.is_none() {
+        let eventid = Uuid::new_v4();
+        migration_apply(eventid, server_write_ref, migration_path.as_path()).await;
+    }
+
+    // Setup the Migration Reload Trigger.
+    let mut broadcast_rx = broadcast_tx.subscribe();
+    let migration_reload_handle = task::spawn(async move {
+        loop {
+            tokio::select! {
+                Ok(action) = broadcast_rx.recv() => {
+                    match action {
+                        CoreAction::Shutdown => break,
+                        CoreAction::Reload => {
+                            // Read the migrations.
+                            // Apply them.
+                            let eventid = Uuid::new_v4();
+                            migration_apply(
+                                eventid,
+                                server_write_ref,
+                                migration_path.as_path(),
+                            ).await;
+
+                            info!("Migration reload complete");
+                        },
+                    }
+                }
+            }
+        }
+        info!("Stopped {}", TaskName::MigrationReload);
+    });
+
     // Setup a TLS Acceptor Reload trigger.
 
     let mut broadcast_rx = broadcast_tx.subscribe();
-    let tls_acceptor_reload_notify = Arc::new(Notify::new());
-    let tls_accepter_reload_task_notify = tls_acceptor_reload_notify.clone();
     let tls_config = config.tls_config.clone();
 
-    let ldap_configured = config.ldapaddress.is_some();
-    let (ldap_tls_acceptor_reload_tx, ldap_tls_acceptor_reload_rx) = mpsc::channel(1);
-    let (http_tls_acceptor_reload_tx, http_tls_acceptor_reload_rx) = mpsc::channel(1);
+    let (tls_acceptor_reload_tx, _tls_acceptor_reload_rx) = broadcast::channel(1);
+    let tls_acceptor_reload_tx_c = tls_acceptor_reload_tx.clone();
 
     let tls_acceptor_reload_handle = task::spawn(async move {
         loop {
@@ -1021,31 +1259,27 @@ pub async fn create_server_core(
                 Ok(action) = broadcast_rx.recv() => {
                     match action {
                         CoreAction::Shutdown => break,
-                    }
-                }
-                _ = tls_accepter_reload_task_notify.notified() => {
-                    let tls_acceptor = match crypto::setup_tls(&tls_config) {
-                        Ok(Some(tls_acc)) => tls_acc,
-                        Ok(None) => {
-                            warn!("TLS not configured, ignoring reload request.");
-                            continue;
-                        }
-                        Err(err) => {
-                            error!(?err, "Failed to configure and reload TLS acceptor");
-                            continue;
-                        }
-                    };
+                        CoreAction::Reload => {
+                            let tls_acceptor = match crypto::setup_tls(&tls_config) {
+                                Ok(Some(tls_acc)) => tls_acc,
+                                Ok(None) => {
+                                    warn!("TLS not configured, ignoring reload request.");
+                                    continue;
+                                }
+                                Err(err) => {
+                                    error!(?err, "Failed to configure and reload TLS acceptor");
+                                    continue;
+                                }
+                            };
 
-                    // We don't log here as the receivers will notify when they have completed
-                    // the reload.
-                    if ldap_configured &&
-                        ldap_tls_acceptor_reload_tx.send(tls_acceptor.clone()).await.is_err() {
-                            error!("ldap tls acceptor did not accept the reload, the server may have failed!");
-                        };
-                    if http_tls_acceptor_reload_tx.send(tls_acceptor.clone()).await.is_err() {
-                        error!("http tls acceptor did not accept the reload, the server may have failed!");
-                        break;
-                    };
+                            // We don't log here as the receivers will notify when they have completed
+                            // the reload.
+                            if tls_acceptor_reload_tx_c.send(tls_acceptor).is_err() {
+                                error!("TLS acceptor did not accept the reload, the server may have failed!");
+                            };
+                            info!("TLS acceptor reload notification sent");
+                        },
+                    }
                 }
             }
         }
@@ -1076,16 +1310,17 @@ pub async fn create_server_core(
     };
 
     // If we have been requested to init LDAP, configure it now.
-    let maybe_ldap_acceptor_handle = match &config.ldapaddress {
+    let maybe_ldap_acceptor_handles = match &config.ldapbindaddress {
         Some(la) => {
             let opt_ldap_ssl_acceptor = maybe_tls_acceptor.clone();
 
             let h = ldaps::create_ldap_server(
-                la.as_str(),
+                la,
                 opt_ldap_ssl_acceptor,
                 server_read_ref,
-                broadcast_tx.subscribe(),
-                ldap_tls_acceptor_reload_rx,
+                &broadcast_tx,
+                &tls_acceptor_reload_tx,
+                config.ldap_client_address_info.trusted_tcp_info(),
             )
             .await?;
             Some(h)
@@ -1116,11 +1351,11 @@ pub async fn create_server_core(
         }
     };
 
-    let maybe_http_acceptor_handle = if config_test {
+    let maybe_http_acceptor_handles = if config_test {
         admin_info!("This config rocks! 🪨 ");
         None
     } else {
-        let h: task::JoinHandle<()> = match https::create_https_server(
+        let handles: Vec<task::JoinHandle<()>> = https::create_https_server(
             config.clone(),
             jws_signer,
             status_ref,
@@ -1128,33 +1363,30 @@ pub async fn create_server_core(
             server_read_ref,
             broadcast_tx.clone(),
             maybe_tls_acceptor,
-            http_tls_acceptor_reload_rx,
+            &tls_acceptor_reload_tx,
         )
         .await
-        {
-            Ok(h) => h,
-            Err(e) => {
-                error!("Failed to start HTTPS server -> {:?}", e);
-                return Err(());
-            }
-        };
+        .inspect_err(|err| {
+            error!(?err, "Failed to start HTTPS server");
+        })?;
+
         if config.role != ServerRole::WriteReplicaNoUI {
             admin_info!("ready to rock! 🪨  UI available at: {}", config.origin);
         } else {
             admin_info!("ready to rock! 🪨 ");
         }
-        Some(h)
+        Some(handles)
     };
 
     // If we are NOT in integration test mode, start the admin socket now
     let maybe_admin_sock_handle = if config.integration_test_config.is_none() {
-        let broadcast_rx = broadcast_tx.subscribe();
+        let broadcast_tx_ = broadcast_tx.clone();
 
         let admin_handle = AdminActor::create_admin_sock(
             config.adminbindpath.as_str(),
             server_write_ref,
             server_read_ref,
-            broadcast_rx,
+            broadcast_tx_,
             maybe_repl_ctrl_tx,
         )
         .await?;
@@ -1169,6 +1401,7 @@ pub async fn create_server_core(
         (TaskName::DelayedActionActor, delayed_handle),
         (TaskName::AuditdActor, auditd_handle),
         (TaskName::TlsAcceptorReload, tls_acceptor_reload_handle),
+        (TaskName::MigrationReload, migration_reload_handle),
     ];
 
     if let Some(backup_handle) = maybe_backup_handle {
@@ -1179,12 +1412,16 @@ pub async fn create_server_core(
         handles.push((TaskName::AdminSocket, admin_sock_handle))
     }
 
-    if let Some(ldap_handle) = maybe_ldap_acceptor_handle {
-        handles.push((TaskName::LdapActor, ldap_handle))
+    if let Some(ldap_handles) = maybe_ldap_acceptor_handles {
+        for ldap_handle in ldap_handles {
+            handles.push((TaskName::LdapActor, ldap_handle))
+        }
     }
 
-    if let Some(http_handle) = maybe_http_acceptor_handle {
-        handles.push((TaskName::HttpsServer, http_handle))
+    if let Some(http_handles) = maybe_http_acceptor_handles {
+        for http_handle in http_handles {
+            handles.push((TaskName::HttpsServer, http_handle))
+        }
     }
 
     if let Some(repl_handle) = maybe_repl_handle {
@@ -1193,7 +1430,6 @@ pub async fn create_server_core(
 
     Ok(CoreHandle {
         clean_shutdown: false,
-        tls_acceptor_reload_notify,
         tx: broadcast_tx,
         handles,
     })

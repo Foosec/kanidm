@@ -17,6 +17,9 @@
 #![deny(clippy::needless_pass_by_value)]
 #![deny(clippy::trivially_copy_pass_by_ref)]
 
+pub mod backup;
+pub mod cli;
+pub mod config;
 pub mod constants;
 pub mod internal;
 pub mod messages;

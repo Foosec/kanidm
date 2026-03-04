@@ -1,11 +1,20 @@
+use crate::https::ServerState;
+use crate::https::{extractors::ClientConnInfo, LoggerType};
 use axum::{
     body::Body,
+    extract::{connect_info::ConnectInfo, State},
+    http::{header::HeaderName, StatusCode},
     http::{HeaderValue, Request},
     middleware::Next,
-    response::Response,
+    response::{IntoResponse, Response},
+    RequestExt,
 };
-use kanidm_proto::constants::{KOPID, KVERSION};
+use kanidm_proto::constants::{KOPID, KVERSION, X_FORWARDED_FOR};
+use std::net::IpAddr;
 use uuid::Uuid;
+
+#[allow(clippy::declare_interior_mutable_const)]
+const X_FORWARDED_FOR_HEADER: HeaderName = HeaderName::from_static(X_FORWARDED_FOR);
 
 pub(crate) mod caching;
 pub(crate) mod compression;
@@ -55,9 +64,22 @@ pub struct KOpId {
 
 /// This runs at the start of the request, adding an extension with `KOpId` which has useful things inside it.
 #[instrument(level = "trace", name = "kopid_middleware", skip_all)]
-pub async fn kopid_middleware(mut request: Request<Body>, next: Next) -> Response {
+pub async fn kopid_middleware(
+    state: State<ServerState>,
+    mut request: Request<Body>,
+    next: Next,
+) -> Response {
     // generate the event ID
-    let eventid = sketching::tracing_forest::id();
+    let eventid = match state.logging_pipeline {
+        LoggerType::TracingForest => sketching::tracing_forest::id(),
+        LoggerType::OpenTelemetry => {
+            // try to the current span ID and fail back to generating a Uuid
+            tracing::Span::current()
+                .id()
+                .map(|id| Uuid::from_u64_pair(0, id.into_u64()))
+                .unwrap_or(Uuid::new_v4())
+        }
+    };
 
     // insert the extension so we can pull it out later
     request.extensions_mut().insert(KOpId { eventid });
@@ -72,4 +94,101 @@ pub async fn kopid_middleware(mut request: Request<Body>, next: Next) -> Respons
         });
 
     response
+}
+
+// This middleware extracts the ip_address and client information, and stores it
+// in the request extensions for future layers to use it.
+pub async fn ip_address_middleware(
+    State(state): State<ServerState>,
+    mut request: Request<Body>,
+    next: Next,
+) -> Response {
+    match ip_address_middleware_inner(&state, &mut request).await {
+        Ok(trusted_client_ip) => {
+            // By this point, proxy-v2 AND x-forward-for have resolved, so we can finally insert this information.
+            request.extensions_mut().insert(trusted_client_ip);
+            next.run(request).await
+        }
+        Err(err_status_and_reason) => err_status_and_reason.into_response(),
+    }
+}
+
+async fn ip_address_middleware_inner(
+    state: &ServerState,
+    request: &mut Request<Body>,
+) -> Result<ClientConnInfo, (StatusCode, &'static str)> {
+    // Extract the IP and insert it to the request.
+    let ConnectInfo(ClientConnInfo {
+        connection_addr,
+        client_ip_addr,
+        client_cert,
+    }) = request
+        .extract_parts::<ConnectInfo<ClientConnInfo>>()
+        .await
+        .map_err(|_| {
+            error!("Connect info contains invalid data");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "connect info contains invalid data",
+            )
+        })?;
+
+    // to_canonical maps linux ipv4 in ipv6 to an ipv4 addr.
+    let connection_ip_addr = connection_addr.ip().to_canonical();
+
+    let trust_x_forward_for = state
+        .trust_x_forward_for_ips
+        .as_ref()
+        .map(|range| range.contains(&connection_ip_addr))
+        .unwrap_or_default();
+
+    let maybe_x_forward_for = request.headers().get(X_FORWARDED_FOR_HEADER);
+
+    let client_ip_addr = if trust_x_forward_for {
+        if let Some(x_forward_for) = maybe_x_forward_for {
+            debug!("processing {} header", X_FORWARDED_FOR);
+            // X forward for may be comma separated.
+            let first = x_forward_for
+                .to_str()
+                .map(|s|
+                    // Split on an optional comma, return the first result.
+                    s.split(',').next().unwrap_or(s))
+                .map_err(|_| {
+                    error!("{} contains invalid data structure", X_FORWARDED_FOR);
+                    (
+                        StatusCode::BAD_REQUEST,
+                        "x-forwarded-for contains invalid data structure",
+                    )
+                })?;
+
+            first.parse::<IpAddr>().map_err(|_| {
+                error!("{} contains invalid ip address", X_FORWARDED_FOR);
+                (
+                    StatusCode::BAD_REQUEST,
+                    "X-Forwarded-For contains invalid ip address",
+                )
+            })?
+        } else {
+            debug!(
+                "{} header not present from a trusted connection",
+                X_FORWARDED_FOR
+            );
+            client_ip_addr
+        }
+    } else {
+        if maybe_x_forward_for.is_some() {
+            debug!("Ignoring {} from untrusted connection", X_FORWARDED_FOR);
+        }
+        // This can either be the client_addr == connection_addr if there are
+        // no ip address trust sources, or this is the value as reported by
+        // proxy protocol header. If the proxy protocol header is used, then
+        // trust_x_forward_for can never have been true so we catch here.
+        client_ip_addr
+    };
+
+    Ok(ClientConnInfo {
+        connection_addr,
+        client_ip_addr,
+        client_cert,
+    })
 }

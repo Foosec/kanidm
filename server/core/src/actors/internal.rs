@@ -3,18 +3,18 @@
 //! admin unixd socket.
 
 use crate::{QueryServerReadV1, QueryServerWriteV1};
-use tracing::{Instrument, Level};
-
-use kanidmd_lib::prelude::*;
-
-use kanidmd_lib::{
-    event::{PurgeRecycledEvent, PurgeTombstoneEvent},
-    idm::delayed::DelayedAction,
-};
-
+use crypto_glue::s256::Sha256Output;
 use kanidm_proto::internal::{
     DomainInfo as ProtoDomainInfo, DomainUpgradeCheckReport as ProtoDomainUpgradeCheckReport,
 };
+use kanidm_proto::scim_v1::client::ScimAssertGeneric;
+use kanidmd_lib::prelude::*;
+use kanidmd_lib::{
+    event::{PurgeDeleteAfterEvent, PurgeRecycledEvent, PurgeTombstoneEvent},
+    idm::delayed::DelayedAction,
+    server::scim::ScimAssertEvent,
+};
+use tracing::{Instrument, Level};
 
 impl QueryServerReadV1 {
     #[instrument(
@@ -84,7 +84,7 @@ impl QueryServerWriteV1 {
             warn!("Unable to start purge recycled event, will retry later");
             return;
         };
-        let res = idms_prox_write
+        let _ = idms_prox_write
             .qs_write
             .purge_recycled()
             .and_then(|touched| {
@@ -94,16 +94,33 @@ impl QueryServerWriteV1 {
                 } else {
                     Ok(())
                 }
-            });
+            })
+            .inspect_err(|err| error!(?err, "Unable to purge recycle bin entries"));
+    }
 
-        match res {
-            Ok(()) => {
-                debug!("Purge recyclebin success");
-            }
-            Err(err) => {
-                error!(?err, "Unable to purge recyclebin");
-            }
-        }
+    #[instrument(
+        level = "info",
+        skip_all,
+        fields(uuid = ?msg.eventid)
+    )]
+    pub async fn handle_purge_delete_after_event(&self, msg: PurgeDeleteAfterEvent) {
+        let ct = duration_from_epoch_now();
+        let Ok(mut idms_prox_write) = self.idms.proxy_write(ct).await else {
+            warn!("Unable to start purge delete after event, will retry later");
+            return;
+        };
+        let _ = idms_prox_write
+            .qs_write
+            .purge_delete_after()
+            .and_then(|touched| {
+                // don't need to commit a txn with no changes
+                if touched > 0 {
+                    idms_prox_write.commit()
+                } else {
+                    Ok(())
+                }
+            })
+            .inspect_err(|err| error!(?err, "Unable to purge delete after entries"));
     }
 
     pub(crate) async fn handle_delayedaction(&self, da_batch: &mut Vec<DelayedAction>) {
@@ -189,6 +206,23 @@ impl QueryServerWriteV1 {
 
     #[instrument(
         level = "info",
+        skip(self, eventid),
+        fields(uuid = ?eventid)
+    )]
+    pub(crate) async fn handle_admin_disable_account(
+        &self,
+        name: String,
+        eventid: Uuid,
+    ) -> Result<(), OperationError> {
+        let ct = duration_from_epoch_now();
+        let mut idms_prox_write = self.idms.proxy_write(ct).await?;
+        idms_prox_write.disable_account(name.as_str())?;
+
+        idms_prox_write.commit()
+    }
+
+    #[instrument(
+        level = "info",
         skip_all,
         fields(uuid = ?eventid)
     )]
@@ -216,6 +250,27 @@ impl QueryServerWriteV1 {
         let mut idms_prox_write = self.idms.proxy_write(ct).await?;
 
         idms_prox_write.qs_write.domain_remigrate(level)?;
+
+        idms_prox_write.commit()
+    }
+
+    #[instrument(
+        level = "info",
+        fields(uuid = ?eventid),
+        skip_all,
+    )]
+    pub(crate) async fn handle_scim_migration_apply(
+        &self,
+        eventid: Uuid,
+        ScimAssertGeneric { id, assertions }: ScimAssertGeneric,
+        nonce: Sha256Output,
+    ) -> Result<(), OperationError> {
+        let assert_event = ScimAssertEvent::new_migration(assertions, id, Some(nonce));
+
+        let ct = duration_from_epoch_now();
+        let mut idms_prox_write = self.idms.proxy_write(ct).await?;
+
+        idms_prox_write.qs_write.scim_assert(assert_event)?;
 
         idms_prox_write.commit()
     }

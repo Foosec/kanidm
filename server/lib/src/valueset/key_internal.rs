@@ -4,6 +4,7 @@ use crate::server::keys::KeyId;
 use crate::value::{KeyStatus, KeyUsage};
 use crate::valueset::ScimResolveStatus;
 use crate::valueset::{DbValueSetV2, ValueSet};
+use crypto_glue::traits::Zeroizing;
 use kanidm_proto::scim_v1::server::ScimKeyInternal;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -15,7 +16,7 @@ pub struct KeyInternalData {
     pub valid_from: u64,
     pub status: KeyStatus,
     pub status_cid: Cid,
-    pub der: Vec<u8>,
+    pub der: Zeroizing<Vec<u8>>,
 }
 
 impl fmt::Debug for KeyInternalData {
@@ -41,7 +42,7 @@ impl ValueSetKeyInternal {
         valid_from: u64,
         status: KeyStatus,
         status_cid: Cid,
-        der: Vec<u8>,
+        der: Zeroizing<Vec<u8>>,
     ) -> Box<Self> {
         let map = BTreeMap::from([(
             id,
@@ -80,10 +81,13 @@ impl ValueSetKeyInternal {
                         der,
                     } => {
                         // Type cast, for now, these are both Vec<u8>
-                        let id: KeyId = id;
+                        let id = KeyId::from(id);
                         let usage = match usage {
                             DbValueKeyUsage::JwsEs256 => KeyUsage::JwsEs256,
+                            DbValueKeyUsage::JwsHs256 => KeyUsage::JwsHs256,
+                            DbValueKeyUsage::JwsRs256 => KeyUsage::JwsRs256,
                             DbValueKeyUsage::JweA128GCM => KeyUsage::JweA128GCM,
+                            DbValueKeyUsage::HkdfS256 => KeyUsage::HkdfS256,
                         };
                         let status_cid = status_cid.into();
                         let status = match status {
@@ -128,10 +132,13 @@ impl ValueSetKeyInternal {
                         der,
                     },
                 )| {
-                    let id: String = id.clone();
+                    let id: String = id.to_string();
                     let usage = match usage {
                         KeyUsage::JwsEs256 => DbValueKeyUsage::JwsEs256,
+                        KeyUsage::JwsHs256 => DbValueKeyUsage::JwsHs256,
+                        KeyUsage::JwsRs256 => DbValueKeyUsage::JwsRs256,
                         KeyUsage::JweA128GCM => DbValueKeyUsage::JweA128GCM,
+                        KeyUsage::HkdfS256 => DbValueKeyUsage::HkdfS256,
                     };
                     let status_cid = status_cid.into();
                     let status = match status {
@@ -253,7 +260,11 @@ impl ValueSetT for ValueSetKeyInternal {
     }
 
     fn generate_idx_eq_keys(&self) -> Vec<String> {
-        self.map.keys().map(hex::encode).collect()
+        self.map
+            .keys()
+            .map(KeyId::to_string)
+            // .map(hex::encode)
+            .collect()
     }
 
     fn syntax(&self) -> SyntaxType {
@@ -262,11 +273,11 @@ impl ValueSetT for ValueSetKeyInternal {
 
     fn validate(&self, _schema_attr: &crate::schema::SchemaAttribute) -> bool {
         // Validate that every key id is a valid iname.
-        self.map.keys().all(|s| {
+        self.map.keys().map(KeyId::as_str).all(|s| {
             // We validate these two first to prevent injection attacks.
             Value::validate_str_escapes(s)
                 && Value::validate_singleline(s)
-                && Value::validate_hexstr(s.as_str())
+                && Value::validate_hexstr(s)
         })
     }
 
@@ -288,7 +299,7 @@ impl ValueSetT for ValueSetKeyInternal {
                         OffsetDateTime::UNIX_EPOCH + Duration::from_secs(key_object.valid_from);
 
                     ScimKeyInternal {
-                        key_id: kid.clone(),
+                        key_id: kid.to_string(),
                         status: key_object.status.to_string(),
                         usage: key_object.usage.to_string(),
                         valid_from: odt,
@@ -304,7 +315,12 @@ impl ValueSetT for ValueSetKeyInternal {
     }
 
     fn to_partialvalue_iter(&self) -> Box<dyn Iterator<Item = crate::value::PartialValue> + '_> {
-        Box::new(self.map.keys().cloned().map(PartialValue::HexString))
+        Box::new(
+            self.map
+                .keys()
+                .map(KeyId::to_string)
+                .map(PartialValue::HexString),
+        )
     }
 
     fn to_value_iter(&self) -> Box<dyn Iterator<Item = crate::value::Value> + '_> {
@@ -395,16 +411,18 @@ impl ValueSetT for ValueSetKeyInternal {
 mod tests {
     use super::{KeyInternalData, ValueSetKeyInternal};
     use crate::prelude::*;
+    use crate::server::keys::KeyId;
     use crate::value::*;
+    use crypto_glue::traits::Zeroizing;
 
     #[test]
     fn test_valueset_key_internal_purge_trim() {
-        let kid = "test".to_string();
+        let kid = KeyId::from("test".to_string());
         let usage = KeyUsage::JwsEs256;
         let valid_from = 0;
         let status = KeyStatus::Valid;
         let status_cid = Cid::new_zero();
-        let der = Vec::with_capacity(0);
+        let der = Zeroizing::new(Vec::with_capacity(0));
 
         let mut vs_a: ValueSet =
             ValueSetKeyInternal::new(kid.clone(), usage, valid_from, status, status_cid, der);
@@ -434,12 +452,12 @@ mod tests {
 
     #[test]
     fn test_valueset_key_internal_merge_left() {
-        let kid = "test".to_string();
+        let kid = KeyId::from("test".to_string());
         let usage = KeyUsage::JwsEs256;
         let valid_from = 0;
         let status = KeyStatus::Valid;
         let status_cid = Cid::new_zero();
-        let der = Vec::with_capacity(0);
+        let der = Zeroizing::new(Vec::with_capacity(0));
 
         let mut vs_a: ValueSet = ValueSetKeyInternal::new(
             kid.clone(),
@@ -468,12 +486,12 @@ mod tests {
 
     #[test]
     fn test_valueset_key_internal_merge_right() {
-        let kid = "test".to_string();
+        let kid = KeyId::from("test".to_string());
         let usage = KeyUsage::JwsEs256;
         let valid_from = 0;
         let status = KeyStatus::Valid;
         let status_cid = Cid::new_zero();
-        let der = Vec::with_capacity(0);
+        let der = Zeroizing::new(Vec::with_capacity(0));
 
         let vs_a: ValueSet = ValueSetKeyInternal::new(
             kid.clone(),
@@ -503,16 +521,16 @@ mod tests {
 
     #[test]
     fn test_valueset_key_internal_repl_merge_left() {
-        let kid = "test".to_string();
+        let kid = KeyId::from("test".to_string());
         let usage = KeyUsage::JwsEs256;
         let valid_from = 0;
         let status = KeyStatus::Valid;
         let zero_cid = Cid::new_zero();
         let one_cid = Cid::new_count(1);
         let two_cid = Cid::new_count(2);
-        let der = Vec::with_capacity(0);
+        let der = Zeroizing::new(Vec::with_capacity(0));
 
-        let kid_2 = "key_2".to_string();
+        let kid_2 = KeyId::from("key_2".to_string());
 
         let vs_a: ValueSet = ValueSetKeyInternal::from_key_iter(
             [
@@ -552,7 +570,7 @@ mod tests {
 
         let key_internal_map = vs_r.as_key_internal_map().expect("Unable to access map");
 
-        eprintln!("{:?}", key_internal_map);
+        eprintln!("{key_internal_map:?}");
 
         assert_eq!(vs_r.len(), 1);
 
@@ -566,16 +584,16 @@ mod tests {
 
     #[test]
     fn test_valueset_key_internal_repl_merge_right() {
-        let kid = "test".to_string();
+        let kid = KeyId::from("test".to_string());
         let usage = KeyUsage::JwsEs256;
         let valid_from = 0;
         let status = KeyStatus::Valid;
         let zero_cid = Cid::new_zero();
         let one_cid = Cid::new_count(1);
         let two_cid = Cid::new_count(2);
-        let der = Vec::with_capacity(0);
+        let der = Zeroizing::new(Vec::with_capacity(0));
 
-        let kid_2 = "key_2".to_string();
+        let kid_2 = KeyId::from("key_2".to_string());
 
         let vs_a: ValueSet = ValueSetKeyInternal::from_key_iter(
             [
@@ -615,7 +633,7 @@ mod tests {
 
         let key_internal_map = vs_r.as_key_internal_map().expect("Unable to access map");
 
-        eprintln!("{:?}", key_internal_map);
+        eprintln!("{key_internal_map:?}");
 
         assert_eq!(vs_r.len(), 1);
 
@@ -629,12 +647,12 @@ mod tests {
 
     #[test]
     fn test_scim_key_internal() {
-        let kid = "test".to_string();
+        let kid = KeyId::from("test".to_string());
         let usage = KeyUsage::JwsEs256;
         let valid_from = 0;
         let status = KeyStatus::Valid;
         let status_cid = Cid::new_zero();
-        let der = Vec::with_capacity(0);
+        let der = Zeroizing::new(Vec::with_capacity(0));
 
         let vs: ValueSet =
             ValueSetKeyInternal::new(kid.clone(), usage, valid_from, status, status_cid, der);
@@ -649,6 +667,6 @@ mod tests {
   }
 ]
         "#;
-        crate::valueset::scim_json_reflexive(vs, data);
+        crate::valueset::scim_json_reflexive(&vs, data);
     }
 }

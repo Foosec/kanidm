@@ -268,12 +268,17 @@ async fn run_sync(
 
     // Preflight check.
     //  * can we connect to ldap?
-    let mut ldap_client = match LdapClientBuilder::new(&sync_config.ldap_uri)
-        .max_ber_size(sync_config.max_ber_size)
-        .add_tls_ca(&sync_config.ldap_ca)
-        .build()
-        .await
-    {
+    let ldap_client_builder =
+        LdapClientBuilder::new(&sync_config.ldap_uri).max_ber_size(sync_config.max_ber_size);
+
+    let ldap_client_builder = if let Some(ldap_ca) = sync_config.ldap_ca.as_ref() {
+        ldap_client_builder.add_tls_ca(ldap_ca)
+    } else {
+        let verify_ca = sync_config.ldap_verify_ca.unwrap_or(true);
+        ldap_client_builder.danger_accept_invalid_certs(!verify_ca)
+    };
+
+    let mut ldap_client = match ldap_client_builder.build().await {
         Ok(lc) => lc,
         Err(e) => {
             error!(?e, "Failed to connect to ldap");
@@ -655,7 +660,7 @@ fn ldap_to_scim_entry(
             .map(str::to_string);
 
         let password_import = if let Some(pw_prefix) = sync_config.person_password_prefix.as_ref() {
-            password_import.map(|s| format!("{}{}", pw_prefix, s))
+            password_import.map(|s| format!("{pw_prefix}{s}"))
         } else {
             password_import
         };
@@ -692,7 +697,7 @@ fn ldap_to_scim_entry(
                 set.into_iter()
                     .enumerate()
                     .map(|(i, value)| ScimSshPubKey {
-                        label: format!("sshpublickey-{}", i),
+                        label: format!("sshpublickey-{i}"),
                         value,
                     })
                     .collect()
@@ -836,7 +841,7 @@ fn config_security_checks(cfg_path: &Path) -> bool {
     if !cfg_path.exists() {
         // there's no point trying to start up if we can't read a usable config!
         error!(
-            "Config missing from {} - cannot start up. Quitting.",
+            "Couldn't find config file {} - cannot start up. Quitting.",
             cfg_path_str
         );
         false
@@ -877,7 +882,7 @@ fn main() {
         match EnvFilter::try_new("kanidm_client=debug,kanidm_ldap_sync=debug,ldap3_client=debug") {
             Ok(f) => f,
             Err(e) => {
-                eprintln!("ERROR! Unable to start tracing {:?}", e);
+                eprintln!("ERROR! Unable to start tracing {e:?}");
                 return;
             }
         }

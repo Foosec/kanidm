@@ -1,22 +1,22 @@
-use std::time::Duration;
-
+use crate::credential::totp::{Totp, TotpAlgo, TotpDigits};
+use crate::idm::server::{IdmServerProxyReadTransaction, IdmServerProxyWriteTransaction};
+use crate::prelude::*;
+use crate::schema::{SchemaClass, SchemaTransaction};
+use crate::value::ApiToken;
+use crate::valueset::ValueSetDateTime;
+use crate::valueset::ValueSetEmailAddress;
+use crate::valueset::ValueSetMessage;
 use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE},
     Engine as _,
 };
-
 use compact_jwt::{Jws, JwsCompact};
 use kanidm_proto::internal::{ApiTokenPurpose, ScimSyncToken};
 use kanidm_proto::scim_v1::*;
-use std::collections::{BTreeMap, BTreeSet};
-
-use crate::credential::totp::{Totp, TotpAlgo, TotpDigits};
-use crate::idm::server::{IdmServerProxyReadTransaction, IdmServerProxyWriteTransaction};
-use crate::prelude::*;
-use crate::value::ApiToken;
-
-use crate::schema::{SchemaClass, SchemaTransaction};
+use kanidm_proto::v1::OutboundMessage;
 use sshkey_attest::proto::PublicKey as SshPublicKey;
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 
 // Internals of a Scim Sync token
 
@@ -193,6 +193,70 @@ impl IdmServerProxyWriteTransaction<'_> {
                 e
             })
     }
+
+    pub fn scim_person_message_send_test(
+        &mut self,
+        ident: &Identity,
+        target: Uuid,
+    ) -> Result<(), OperationError> {
+        // Get the target entry.
+        let target_entry = self.qs_write.impersonate_search_uuid(target, ident)?;
+
+        let display_name = target_entry
+            .get_ava_single_utf8(Attribute::DisplayName)
+            .map(String::from)
+            .ok_or(OperationError::MissingAttribute(Attribute::DisplayName))?;
+
+        let mail_primary = target_entry
+            .get_ava_mail_primary(Attribute::Mail)
+            .map(String::from)
+            .ok_or(OperationError::MissingAttribute(Attribute::Mail))?;
+
+        // Create a message to send.
+
+        let curtime_odt = self.qs_write.get_curtime_odt();
+        let delete_after_odt = curtime_odt + DEFAULT_MESSAGE_RETENTION;
+
+        let mut e_msg: EntryInitNew = Entry::new();
+        e_msg.set_ava_set(
+            &Attribute::Class,
+            ValueSetIutf8::new(EntryClass::OutboundMessage.into()),
+        );
+        e_msg.set_ava_set(&Attribute::SendAfter, ValueSetDateTime::new(curtime_odt));
+        e_msg.set_ava_set(
+            &Attribute::DeleteAfter,
+            ValueSetDateTime::new(delete_after_odt),
+        );
+        e_msg.set_ava_set(
+            &Attribute::MessageTemplate,
+            ValueSetMessage::new(OutboundMessage::TestMessageV1 { display_name }),
+        );
+        e_msg.set_ava_set(
+            &Attribute::MailDestination,
+            ValueSetEmailAddress::new(mail_primary),
+        );
+
+        self.qs_write.impersonate_create(ident, vec![e_msg])
+    }
+
+    pub fn scim_message_mark_sent(
+        &mut self,
+        ident: &Identity,
+        message_id: Uuid,
+    ) -> Result<(), OperationError> {
+        let curtime_odt = self.qs_write.get_curtime_odt();
+
+        let filter = filter_all!(f_and(vec![
+            f_eq(Attribute::Uuid, PartialValue::Uuid(message_id)),
+            f_eq(Attribute::Class, EntryClass::OutboundMessage.into())
+        ]));
+
+        let modlist = ModifyList::new_set(Attribute::SentAt, ValueSetDateTime::new(curtime_odt));
+        let modify_event =
+            ModifyEvent::from_internal_parts(ident.clone(), &modlist, &filter, &self.qs_write)?;
+
+        self.qs_write.modify(&modify_event)
+    }
 }
 
 pub struct ScimSyncFinaliseEvent {
@@ -267,8 +331,7 @@ impl IdmServerProxyWriteTransaction<'_> {
         // TODO: This could benefit from a search that only grabs uuids?
         let existing_entries = self
             .qs_write
-            // .internal_search(f_all_sync.clone())
-            .internal_exists(f_all_sync.clone())
+            .internal_exists(&f_all_sync)
             .inspect_err(|_e| {
                 error!("Failed to determine existing entries set");
             })?;
@@ -521,7 +584,7 @@ impl IdmServerProxyWriteTransaction<'_> {
     > {
         // Assert the token is valid.
         let sync_uuid = match &sse.ident.origin {
-            IdentType::User(_) | IdentType::Internal => {
+            IdentType::User(_) | IdentType::Internal(_) => {
                 warn!("Ident type is not synchronise");
                 return Err(OperationError::AccessDenied);
             }
@@ -816,6 +879,24 @@ impl IdmServerProxyWriteTransaction<'_> {
                     ))
                 })
                 .map(|value| vec![Value::Uint32(value)]),
+            (SyntaxType::ReferenceUuid, false,
+                ScimValue::Simple(ScimAttr::String(value)),
+            ) => {
+                let maybe_uuid =
+                    self.qs_write.sync_external_id_to_uuid(value).map_err(|e| {
+                        error!(?e, "Unable to resolve external_id to uuid");
+                        e
+                    })?;
+
+                if let Some(uuid) = maybe_uuid {
+                    Ok(vec![Value::Refer(uuid)])
+                } else {
+                    debug!("Could not convert external_id to reference - {}", value);
+                    Err(OperationError::InvalidAttribute(format!(
+                        "Reference uuid must a uuid or external_id - {scim_attr_name}"
+                    )))
+                }
+            }
             (SyntaxType::ReferenceUuid, true, ScimValue::MultiComplex(values)) => {
                 // In this case, because it's a reference uuid only, despite the multicomplex structure, it's a list of
                 // "external_id" to external_ids. These *might* also be uuids. So we need to use sync_external_id_to_uuid
@@ -1446,7 +1527,7 @@ impl IdmServerProxyReadTransaction<'_> {
 
         // The ident *must* be a synchronise session.
         let sync_uuid = match &ident.origin {
-            IdentType::User(_) | IdentType::Internal => {
+            IdentType::User(_) | IdentType::Internal(_) => {
                 warn!("Ident type is not synchronise");
                 return Err(OperationError::AccessDenied);
             }

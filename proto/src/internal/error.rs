@@ -1,11 +1,9 @@
-use std::fmt::{Display, Formatter};
-
-use serde::{Deserialize, Serialize};
-use utoipa::ToSchema;
-use uuid::Uuid;
-
 use super::credupdate::PasswordFeedback;
 use crate::attribute::Attribute;
+use serde::{Deserialize, Serialize};
+use std::fmt::{Display, Formatter};
+use utoipa::ToSchema;
+use uuid::Uuid;
 
 /* ===== errors ===== */
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, ToSchema)]
@@ -28,7 +26,6 @@ pub enum SchemaError {
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum PluginError {
-    AttrUnique(String),
     Base(String),
     ReferentialIntegrity(String),
     CredImport(String),
@@ -67,7 +64,8 @@ pub enum ConsistencyError {
 #[derive(Serialize, Deserialize, Debug, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum OperationError {
-    // Logic errors, or "soft" errors.
+    // Logic errors, or "soft" errors. These are to guide the user or user-interface
+    // in some way.
     SessionExpired,
     DuplicateKey,
     DuplicateLabel,
@@ -105,6 +103,7 @@ pub enum OperationError {
     // Serialize & Deserialize this enum...
     MissingClass(String),
     MissingAttribute(Attribute),
+    AttributeUniqueness(Vec<Attribute>),
     MissingEntries,
     ModifyAssertionFailed,
     BackendEngine,
@@ -140,6 +139,10 @@ pub enum OperationError {
     /// When the DB is potentially over-loaded a timeout can occur starting
     /// your operation.
     DatabaseLockAcquisitionTimeout,
+    /// Your change would introduce a reference loop
+    ReferenceLoop,
+    /// This session is not able to re-authenticate and has static privileges
+    SessionMayNotReauth,
 
     // Specific internal errors.
     AU0001InvalidState,
@@ -149,11 +152,15 @@ pub enum OperationError {
     AU0005DelayedProcessFailure,
     AU0006CredentialMayNotReauthenticate,
     AU0007UserAuthTokenInvalid,
+    AU0008ClientAuthInfoPrevalidation,
 
     // Kanidm Generic Errors
     KG001TaskTimeout,
     KG002TaskCommFailure,
     KG003CacheClearFailed,
+    KG004UnknownFeatureUuid,
+    KG005HowDidYouEvenManageThis,
+    KG006DatastructureCorruption,
 
     // Credential Update Errors
     CU0001WebauthnAttestationNotTrusted,
@@ -213,6 +220,13 @@ pub enum OperationError {
     SC0024SshPublicKeySyntaxInvalid,
     SC0025UiHintSyntaxInvalid,
     SC0026Utf8SyntaxInvalid,
+    SC0027ClassSetInvalid,
+    SC0028CreatedUuidsInvalid,
+    SC0029PaginationOutOfBounds,
+    SC0030Sha256SyntaxInvalid,
+    SC0031Int64SyntaxInvalid,
+    SC0032Uint64SyntaxInvalid,
+    SC0033AssertionContainsDuplicateUuids,
     // Migration
     MG0001InvalidReMigrationLevel,
     MG0002RaiseDomainLevelExceedsMaximum,
@@ -223,6 +237,7 @@ pub enum OperationError {
     MG0007Oauth2StrictConstraintsNotMet,
     MG0008SkipUpgradeAttempted,
     MG0009InvalidTargetLevelForBootstrap,
+    MG0010DowngradeNotAllowed,
     //
     KP0001KeyProviderNotLoaded,
     KP0002KeyProviderInvalidClass,
@@ -270,6 +285,46 @@ pub enum OperationError {
     KP0043KeyObjectJweA128GCMEncryption,
     KP0044KeyObjectJwsPublicJwk,
 
+    KP0045KeyObjectImportJwsRs256DerInvalid,
+    KP0046KeyObjectSignerToVerifier,
+    KP0047KeyObjectPublicToDer,
+    KP0048KeyObjectJwtRs256Generation,
+    KP0049KeyObjectSignerToVerifier,
+    KP0050KeyObjectPrivateToDer,
+    KP0051KeyObjectPublicToDer,
+    KP0052KeyObjectJwsRs256DerInvalid,
+    KP0053KeyObjectSignerToVerifier,
+    KP0054KeyObjectJwsRs256DerInvalid,
+    KP0055KeyObjectJwsRs256DerInvalid,
+    KP0056KeyObjectJwsRs256Signature,
+    KP0057KeyObjectJwsNotAssociated,
+    KP0058KeyObjectJwsInvalid,
+    KP0059KeyObjectJwsKeyRevoked,
+    KP0060KeyObjectJwsPublicJwk,
+    KP0061KeyObjectNoActiveSigningKeys,
+    KP0062KeyProviderNoSuchKey,
+
+    KP0063KeyObjectJwsHs256DerInvalid,
+    KP0064KeyObjectSignerToVerifier,
+    KP0065KeyObjectJwtHs256Generation,
+    KP0066KeyObjectJwsHs256DerInvalid,
+    KP0067KeyObjectSignerToVerifier,
+    KP0068KeyObjectJwsHs256DerInvalid,
+    KP0069KeyObjectNoActiveSigningKeys,
+    KP0070KeyObjectJwsHs256Signature,
+    KP0071KeyObjectPrivateToDer,
+
+    KP0072KeyObjectHs256Invalid,
+    KP0073KeyObjectHs256Invalid,
+    KP0074KeyObjectNoActiveSigningKeys,
+    KP0075KeyObjectHmacInvalidLength,
+    KP0076KeyObjectHkdfOutputLengthInvalid,
+    KP0077KeyProviderNoSuchKey,
+    KP0078KeyObjectNotFound,
+    KP0079KeyObjectNotFound,
+
+    KP0080KeyProviderNoSuchKey,
+
     // Plugins
     PL0001GidOverlapsSystemRange,
 
@@ -277,6 +332,7 @@ pub enum OperationError {
     UI0001ChallengeSerialisation,
     UI0002InvalidState,
     UI0003InvalidOauth2Resume,
+    UI0004MemberAlreadyExists,
 
     // Unixd Things
     KU001InitWhileSessionActive,
@@ -298,14 +354,14 @@ impl PartialEq for OperationError {
 
 impl Display for OperationError {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        let mut output = format!("{:?}", self)
+        let mut output = format!("{self:?}")
             .split("::")
             .last()
             .unwrap_or("")
             .to_string();
 
         if let Some(msg) = self.message() {
-            output += &format!(" - {}", msg);
+            output += &format!(" - {msg}");
         };
         f.write_str(&output)
     }
@@ -346,9 +402,10 @@ impl OperationError {
             Self::InvalidReplChangeId => None,
             Self::InvalidAcpState(_) => None,
             Self::InvalidSchemaState(_) => None,
-            Self::InvalidAccountState(val) => Some(format!("Invalid account state: {}", val)),
-            Self::MissingClass(val) => Some(format!("Missing class: {}", val)),
-            Self::MissingAttribute(val) => Some(format!("Missing attribute: {}", val)),
+            Self::InvalidAccountState(val) => Some(format!("Invalid account state: {val}")),
+            Self::MissingClass(val) => Some(format!("Missing class: {val}")),
+            Self::MissingAttribute(val) => Some(format!("Missing attribute: {val}")),
+            Self::AttributeUniqueness(attrs) => Some(format!("The value of some attributes is not unique. {attrs:?}")),
             Self::MissingEntries => None,
             Self::ModifyAssertionFailed => None,
             Self::BackendEngine => None,
@@ -379,6 +436,8 @@ impl OperationError {
             Self::TransactionAlreadyCommitted => None,
             Self::ValueDenyName => None,
             Self::DatabaseLockAcquisitionTimeout => Some("Unable to acquire a database lock - the current server may be too busy. Try again later.".into()),
+            Self::ReferenceLoop => Some("The change you have made would introduce an invalid reference loop. Unable to proceed.".into()),
+            Self::SessionMayNotReauth => Some("The current session is not able to re-authenticate to elevate privileges to read-write.".into()),
 
     Self::AU0001InvalidState => Some("Invalid authentication session state for request".into()),
     Self::AU0002JwsSerialisation => Some("JWS serialisation failed".into()),
@@ -387,6 +446,7 @@ impl OperationError {
     Self::AU0005DelayedProcessFailure => Some("Delaying processing failure, unable to proceed".into()),
     Self::AU0006CredentialMayNotReauthenticate => Some("Credential may not reauthenticate".into()),
     Self::AU0007UserAuthTokenInvalid => Some("User auth token was unable to be generated".into()),
+    Self::AU0008ClientAuthInfoPrevalidation => Some("Client Authentication Info prevalidation did not occur when expected".into()),
 
             Self::CU0001WebauthnAttestationNotTrusted => None,
             Self::CU0002WebauthnRegistrationError => None,
@@ -403,6 +463,9 @@ impl OperationError {
             Self::KG001TaskTimeout => Some("Task timed out".into()),
             Self::KG002TaskCommFailure => Some("Inter-Task communication failure".into()),
             Self::KG003CacheClearFailed => Some("Failed to clear cache".into()),
+            Self::KG004UnknownFeatureUuid => None,
+            Self::KG005HowDidYouEvenManageThis => Some("You have damaged the fabric of space time and managed to perform an impossible action.".into()),
+            Self::KG006DatastructureCorruption => None,
             Self::KP0001KeyProviderNotLoaded => None,
             Self::KP0002KeyProviderInvalidClass => None,
             Self::KP0003KeyProviderInvalidType => None,
@@ -448,6 +511,44 @@ impl OperationError {
             Self::KP0042KeyObjectNoActiveEncryptionKeys => None,
             Self::KP0043KeyObjectJweA128GCMEncryption => None,
             Self::KP0044KeyObjectJwsPublicJwk => None,
+
+            Self::KP0045KeyObjectImportJwsRs256DerInvalid => None,
+            Self::KP0046KeyObjectSignerToVerifier => None,
+            Self::KP0047KeyObjectPublicToDer => None,
+            Self::KP0048KeyObjectJwtRs256Generation => None,
+            Self::KP0049KeyObjectSignerToVerifier => None,
+            Self::KP0050KeyObjectPrivateToDer => None,
+            Self::KP0051KeyObjectPublicToDer => None,
+            Self::KP0052KeyObjectJwsRs256DerInvalid => None,
+            Self::KP0053KeyObjectSignerToVerifier => None,
+            Self::KP0054KeyObjectJwsRs256DerInvalid => None,
+            Self::KP0055KeyObjectJwsRs256DerInvalid => None,
+            Self::KP0056KeyObjectJwsRs256Signature => None,
+            Self::KP0057KeyObjectJwsNotAssociated => None,
+            Self::KP0058KeyObjectJwsInvalid => None,
+            Self::KP0059KeyObjectJwsKeyRevoked => None,
+            Self::KP0060KeyObjectJwsPublicJwk => None,
+            Self::KP0061KeyObjectNoActiveSigningKeys => None,
+            Self::KP0062KeyProviderNoSuchKey => None,
+            Self::KP0063KeyObjectJwsHs256DerInvalid => None,
+            Self::KP0064KeyObjectSignerToVerifier => None,
+            Self::KP0065KeyObjectJwtHs256Generation => None,
+            Self::KP0066KeyObjectJwsHs256DerInvalid => None,
+            Self::KP0067KeyObjectSignerToVerifier => None,
+            Self::KP0068KeyObjectJwsHs256DerInvalid => None,
+            Self::KP0069KeyObjectNoActiveSigningKeys => None,
+            Self::KP0070KeyObjectJwsHs256Signature => None,
+            Self::KP0071KeyObjectPrivateToDer => None,
+            Self::KP0072KeyObjectHs256Invalid => None,
+            Self::KP0073KeyObjectHs256Invalid => None,
+            Self::KP0074KeyObjectNoActiveSigningKeys => None,
+            Self::KP0075KeyObjectHmacInvalidLength => None,
+            Self::KP0076KeyObjectHkdfOutputLengthInvalid => None,
+            Self::KP0077KeyProviderNoSuchKey => None,
+            Self::KP0078KeyObjectNotFound => None,
+            Self::KP0079KeyObjectNotFound => None,
+            Self::KP0080KeyProviderNoSuchKey => None,
+
             Self::KU001InitWhileSessionActive => Some("The session was active when the init function was called.".into()),
             Self::KU002ContinueWhileSessionInActive => Some("Attempted to continue auth session while current session is inactive".into()),
             Self::KU003PamAuthFailed => Some("Failed PAM account authentication step".into()),
@@ -464,6 +565,7 @@ impl OperationError {
             Self::MG0007Oauth2StrictConstraintsNotMet => Some("Migration Constraints Not Met - All OAuth2 clients must have strict-redirect-uri mode enabled.".into()),
             Self::MG0008SkipUpgradeAttempted => Some("Skip Upgrade Attempted.".into()),
             Self::MG0009InvalidTargetLevelForBootstrap => Some("The request target domain level was not valid for bootstrapping a new server instance".into()),
+            Self::MG0010DowngradeNotAllowed => Some("Downgrade Attempted".into()),
             Self::PL0001GidOverlapsSystemRange => None,
             Self::SC0001IncomingSshPublicKey => None,
             Self::SC0002ReferenceSyntaxInvalid => Some("A SCIM Reference Set contained invalid syntax and can not be processed.".into()),
@@ -492,16 +594,24 @@ impl OperationError {
             Self::SC0024SshPublicKeySyntaxInvalid => Some("A SCIM Ssh Public Key contained invalid syntax".into()),
             Self::SC0025UiHintSyntaxInvalid => Some("A SCIM UiHint contained invalid syntax".into()),
             Self::SC0026Utf8SyntaxInvalid => Some("A SCIM Utf8 String Scope Map contained invalid syntax".into()),
-
+            Self::SC0027ClassSetInvalid => Some("The internal set of class templates used in this create operation was invalid. THIS IS A BUG.".into()),
+            Self::SC0028CreatedUuidsInvalid => Some("The internal create query did not return the set of created UUIDs. THIS IS A BUG".into()),
+            Self::SC0029PaginationOutOfBounds => Some("The requested range for pagination was out of bounds of the result set".into()),
+            Self::SC0030Sha256SyntaxInvalid => Some("A SCIM SHA256 hex string was invalid.".into()),
+            Self::SC0031Int64SyntaxInvalid => Some("A SCIM Int64 contained invalid syntax".into()),
+            Self::SC0032Uint64SyntaxInvalid => Some("A SCIM Uint64 contained invalid syntax".into()),
+            Self::SC0033AssertionContainsDuplicateUuids => Some("SCIM assertion contains duplicate entry ids, unable to proceed.".into()),
             Self::UI0001ChallengeSerialisation => Some("The WebAuthn challenge was unable to be serialised.".into()),
             Self::UI0002InvalidState => Some("The credential update process returned an invalid state transition.".into()),
-            Self::UI0003InvalidOauth2Resume => Some("The server attemped to resume OAuth2, but no OAuth2 session is in progress.".into()),
+            Self::UI0003InvalidOauth2Resume => Some("The server attempted to resume OAuth2, but no OAuth2 session is in progress.".into()),
+            Self::UI0004MemberAlreadyExists => Some("The target is already a member.".into()),
             Self::VL0001ValueSshPublicKeyString => None,
             Self::VS0001IncomingReplSshPublicKey => None,
             Self::VS0002CertificatePublicKeyDigest |
             Self::VS0003CertificateDerDecode => Some("Decoding the stored certificate from DER failed.".into()),
             Self::VS0004CertificatePublicKeyDigest |
-            Self::VS0005CertificatePublicKeyDigest => Some("The certificates public key is unabled to be digested.".into()),
+            Self::VS0005CertificatePublicKeyDigest => Some("The certificates public key is unable to be digested.".into()),
+
         }
     }
 }

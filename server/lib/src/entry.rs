@@ -24,11 +24,6 @@
 //! [`filter`]: ../filter/index.html
 //! [`schema`]: ../schema/index.html
 
-use std::cmp::Ordering;
-pub use std::collections::BTreeSet as Set;
-use std::collections::{BTreeMap as Map, BTreeMap, BTreeSet};
-use std::sync::Arc;
-
 use crate::be::dbentry::{DbEntry, DbEntryVers};
 use crate::be::dbvalue::DbValueSetV2;
 use crate::be::{IdxKey, IdxSlope};
@@ -41,8 +36,15 @@ use crate::prelude::*;
 use crate::repl::cid::Cid;
 use crate::repl::entry::EntryChangeState;
 use crate::repl::proto::{ReplEntryV1, ReplIncrementalEntryV1};
+use crate::schema::{SchemaAttribute, SchemaClass, SchemaTransaction};
 use crate::server::access::AccessEffectivePermission;
+use crate::value::{
+    ApiToken, CredentialType, IndexType, IntentTokenState, Oauth2Session, PartialValue, Session,
+    SyntaxType, Value,
+};
+use crate::valueset::{self, ScimResolveStatus, ValueSet, ValueSetSpn};
 use compact_jwt::JwsEs256Signer;
+use crypto_glue::s256::Sha256Output;
 use hashbrown::{HashMap, HashSet};
 use kanidm_proto::internal::ImageValue;
 use kanidm_proto::internal::{
@@ -53,19 +55,16 @@ use kanidm_proto::v1::Entry as ProtoEntry;
 use ldap3_proto::simple::{LdapPartialAttribute, LdapSearchResultEntry};
 use openssl::ec::EcKey;
 use openssl::pkey::{Private, Public};
+use std::cmp::Ordering;
+pub use std::collections::BTreeSet as Set;
+use std::collections::{BTreeMap as Map, BTreeMap, BTreeSet};
+use std::sync::Arc;
 use time::OffsetDateTime;
 use tracing::trace;
 use uuid::Uuid;
 use webauthn_rs::prelude::{
     AttestationCaList, AttestedPasskey as AttestedPasskeyV4, Passkey as PasskeyV4,
 };
-
-use crate::schema::{SchemaAttribute, SchemaClass, SchemaTransaction};
-use crate::value::{
-    ApiToken, CredentialType, IndexType, IntentTokenState, Oauth2Session, PartialValue, Session,
-    SyntaxType, Value,
-};
-use crate::valueset::{self, ScimResolveStatus, ValueSet};
 
 pub type EntryInitNew = Entry<EntryInit, EntryNew>;
 pub type EntryInvalidNew = Entry<EntryInvalid, EntryNew>;
@@ -285,6 +284,18 @@ impl Default for Entry<EntryInit, EntryNew> {
     }
 }
 
+impl FromIterator<(Attribute, ValueSet)> for EntryInitNew {
+    fn from_iter<I: IntoIterator<Item = (Attribute, ValueSet)>>(iter: I) -> Self {
+        let attrs = Eattrs::from_iter(iter);
+
+        Entry {
+            valid: EntryInit,
+            state: EntryNew,
+            attrs,
+        }
+    }
+}
+
 impl Entry<EntryInit, EntryNew> {
     pub fn new() -> Self {
         Entry {
@@ -292,7 +303,6 @@ impl Entry<EntryInit, EntryNew> {
             valid: EntryInit,
             state: EntryNew,
             attrs: Map::new(),
-            // attrs: Map::with_capacity(32),
         }
     }
 
@@ -475,8 +485,17 @@ impl Entry<EntryInit, EntryNew> {
         self.add_ava_int(attr, value);
     }
 
-    pub fn remove_ava(&mut self, attr: &Attribute) {
-        self.attrs.remove(attr);
+    pub fn pop_ava<A: AsRef<Attribute>>(&mut self, attr: A) -> Option<ValueSet> {
+        self.attrs.remove(attr.as_ref())
+    }
+
+    pub fn remove_ava<A: AsRef<Attribute>>(&mut self, attr: A) {
+        self.pop_ava(attr);
+    }
+
+    /// Set the content of this ava with this valueset, ignoring the previous data.
+    pub fn set_ava_set(&mut self, attr: &Attribute, vs: ValueSet) {
+        self.attrs.insert(attr.clone(), vs);
     }
 
     /// Replace the existing content of an attribute set of this Entry, with a new set of Values.
@@ -489,6 +508,97 @@ impl Entry<EntryInit, EntryNew> {
 
     pub fn get_ava_mut<A: AsRef<Attribute>>(&mut self, attr: A) -> Option<&mut ValueSet> {
         self.attrs.get_mut(attr.as_ref())
+    }
+}
+
+impl From<SchemaAttribute> for EntryInitNew {
+    fn from(value: SchemaAttribute) -> Self {
+        EntryInitNew::from(&value)
+    }
+}
+
+impl From<&SchemaAttribute> for EntryInitNew {
+    fn from(s: &SchemaAttribute) -> Self {
+        // Build the Map of the attributes
+        let mut attrs = Eattrs::new();
+        attrs.insert(Attribute::AttributeName, vs_iutf8![s.name.as_str()]);
+        attrs.insert(Attribute::Description, vs_utf8![s.description.to_owned()]);
+        attrs.insert(Attribute::Uuid, vs_uuid![s.uuid]);
+        attrs.insert(Attribute::MultiValue, vs_bool![s.multivalue]);
+        attrs.insert(Attribute::Phantom, vs_bool![s.phantom]);
+        attrs.insert(Attribute::SyncAllowed, vs_bool![s.sync_allowed]);
+        attrs.insert(Attribute::Replicated, vs_bool![s.replicated.into()]);
+        attrs.insert(Attribute::Unique, vs_bool![s.unique]);
+        attrs.insert(Attribute::Indexed, vs_bool![s.indexed]);
+        attrs.insert(Attribute::Syntax, vs_syntax![s.syntax]);
+        attrs.insert(
+            Attribute::Class,
+            vs_iutf8![
+                EntryClass::Object.into(),
+                EntryClass::System.into(),
+                EntryClass::AttributeType.into()
+            ],
+        );
+
+        // Insert stuff.
+
+        Entry {
+            valid: EntryInit,
+            state: EntryNew,
+            attrs,
+        }
+    }
+}
+
+impl From<SchemaClass> for EntryInitNew {
+    fn from(value: SchemaClass) -> Self {
+        EntryInitNew::from(&value)
+    }
+}
+
+impl From<&SchemaClass> for EntryInitNew {
+    fn from(s: &SchemaClass) -> Self {
+        let mut attrs = Eattrs::new();
+        attrs.insert(Attribute::ClassName, vs_iutf8![s.name.as_str()]);
+        attrs.insert(Attribute::Description, vs_utf8![s.description.to_owned()]);
+        attrs.insert(Attribute::SyncAllowed, vs_bool![s.sync_allowed]);
+        attrs.insert(Attribute::Uuid, vs_uuid![s.uuid]);
+        attrs.insert(
+            Attribute::Class,
+            vs_iutf8![
+                EntryClass::Object.into(),
+                EntryClass::System.into(),
+                EntryClass::ClassType.into()
+            ],
+        );
+
+        let vs_systemmay = ValueSetIutf8::from_iter(s.systemmay.iter().map(|sm| sm.as_str()));
+        if let Some(vs) = vs_systemmay {
+            attrs.insert(Attribute::SystemMay, vs);
+        }
+
+        let vs_systemmust = ValueSetIutf8::from_iter(s.systemmust.iter().map(|sm| sm.as_str()));
+        if let Some(vs) = vs_systemmust {
+            attrs.insert(Attribute::SystemMust, vs);
+        }
+
+        let vs_systemexcludes =
+            ValueSetIutf8::from_iter(s.systemexcludes.iter().map(|sm| sm.as_str()));
+        if let Some(vs) = vs_systemexcludes {
+            attrs.insert(Attribute::SystemExcludes, vs);
+        }
+
+        let vs_systemsupplements =
+            ValueSetIutf8::from_iter(s.systemsupplements.iter().map(|sm| sm.as_str()));
+        if let Some(vs) = vs_systemsupplements {
+            attrs.insert(Attribute::SystemSupplements, vs);
+        }
+
+        Entry {
+            valid: EntryInit,
+            state: EntryNew,
+            attrs,
+        }
     }
 }
 
@@ -725,7 +835,9 @@ impl Entry<EntryIncremental, EntryNew> {
                     )
                 }
             }
-            // Can never get here due to is_add_conflict above.
+            // Can never get here due to is_add_conflict above. This is because
+            // a tombstone state on either branch will trigger is_add_conflict
+            // causing this to be impossible to reach.
             _ => unreachable!(),
         }
     }
@@ -1033,9 +1145,13 @@ impl<STATE> Entry<EntryInvalid, STATE> {
         &mut self,
         attr: A,
     ) -> Option<&mut BTreeSet<Uuid>> {
-        self.attrs
-            .get_mut(attr.as_ref())
-            .and_then(|vs| vs.as_refer_set_mut())
+        self.get_ava_mut(attr).and_then(|vs| vs.as_refer_set_mut())
+    }
+
+    pub(crate) fn get_ava_mut<A: AsRef<Attribute>>(&mut self, attr: A) -> Option<&mut ValueSet> {
+        let attr_ref = attr.as_ref();
+        self.valid.ecstate.change_ava(&self.valid.cid, attr_ref);
+        self.attrs.get_mut(attr.as_ref())
     }
 }
 
@@ -1104,6 +1220,8 @@ impl Entry<EntryInvalid, EntryCommitted> {
         // This will put the modify ahead of the revive transition.
         self.remove_ava(Attribute::Class, &EntryClass::Recycled.into());
         self.remove_ava(Attribute::Class, &EntryClass::Conflict.into());
+
+        self.purge_ava(Attribute::CascadeDeleted);
         self.purge_ava(Attribute::SourceUuid);
         self.purge_ava(Attribute::RecycledDirectMemberOf);
 
@@ -1541,6 +1659,11 @@ impl Entry<EntrySealed, EntryCommitted> {
                                         .into_iter()
                                         .map(|idx_key| Err((&ikey.attr, ikey.itype, idx_key)))
                                         .collect(),
+                                    IndexType::Ordering => vs
+                                        .generate_idx_ord_keys()
+                                        .into_iter()
+                                        .map(|idx_key| Err((&ikey.attr, ikey.itype, idx_key)))
+                                        .collect(),
                                 };
                                 changes
                             }
@@ -1567,6 +1690,11 @@ impl Entry<EntrySealed, EntryCommitted> {
                                     }
                                     IndexType::SubString => vs
                                         .generate_idx_sub_keys()
+                                        .into_iter()
+                                        .map(|idx_key| Ok((&ikey.attr, ikey.itype, idx_key)))
+                                        .collect(),
+                                    IndexType::Ordering => vs
+                                        .generate_idx_ord_keys()
                                         .into_iter()
                                         .map(|idx_key| Ok((&ikey.attr, ikey.itype, idx_key)))
                                         .collect(),
@@ -1612,6 +1740,11 @@ impl Entry<EntrySealed, EntryCommitted> {
                                         .into_iter()
                                         .map(|idx_key| Err((&ikey.attr, ikey.itype, idx_key)))
                                         .collect(),
+                                    IndexType::Ordering => pre_vs
+                                        .generate_idx_ord_keys()
+                                        .into_iter()
+                                        .map(|idx_key| Err((&ikey.attr, ikey.itype, idx_key)))
+                                        .collect(),
                                 };
                                 changes
                             }
@@ -1635,6 +1768,11 @@ impl Entry<EntrySealed, EntryCommitted> {
                                         .into_iter()
                                         .map(|idx_key| Ok((&ikey.attr, ikey.itype, idx_key)))
                                         .collect(),
+                                    IndexType::Ordering => post_vs
+                                        .generate_idx_ord_keys()
+                                        .into_iter()
+                                        .map(|idx_key| Ok((&ikey.attr, ikey.itype, idx_key)))
+                                        .collect(),
                                 };
                                 changes
                             }
@@ -1652,6 +1790,10 @@ impl Entry<EntrySealed, EntryCommitted> {
                                     IndexType::SubString => (
                                         pre_vs.generate_idx_sub_keys(),
                                         post_vs.generate_idx_sub_keys(),
+                                    ),
+                                    IndexType::Ordering => (
+                                        pre_vs.generate_idx_ord_keys(),
+                                        post_vs.generate_idx_ord_keys(),
                                     ),
                                 };
 
@@ -1712,7 +1854,9 @@ impl Entry<EntrySealed, EntryCommitted> {
                                     Vec::with_capacity(removed_vs.len() + added_vs.len());
 
                                 match ikey.itype {
-                                    IndexType::SubString | IndexType::Equality => {
+                                    IndexType::SubString
+                                    | IndexType::Ordering
+                                    | IndexType::Equality => {
                                         removed_vs
                                             .into_iter()
                                             .map(|idx_key| Err((&ikey.attr, ikey.itype, idx_key)))
@@ -1949,7 +2093,7 @@ impl<STATE> Entry<EntryValid, STATE> {
         };
 
         if !valid_supplements {
-            admin_warn!(
+            warn!(
                 "Validation error, the following possible supplement classes are missing - {:?}",
                 supplements_classes
             );
@@ -2418,6 +2562,10 @@ impl Entry<EntryReduced, EntryCommitted> {
                                 .unwrap_or_default(),
                         })
                     }
+                    ATTR_HOME_DIRECTORY => Some(LdapPartialAttribute {
+                        atype: ATTR_HOME_DIRECTORY.to_string(),
+                        vals: vec![format!("/home/{}", self.get_uuid()).into_bytes()],
+                    }),
                     _ => attr_map.get(kani_a).map(|pvs| LdapPartialAttribute {
                         atype: ldap_a.to_string(),
                         vals: pvs.clone(),
@@ -2430,7 +2578,6 @@ impl Entry<EntryReduced, EntryCommitted> {
     }
 }
 
-// impl<STATE> Entry<EntryValid, STATE> {
 impl<VALID, STATE> Entry<VALID, STATE> {
     /// This internally adds an AVA to the entry. If the entry was newly added, then true is returned.
     /// If the value already existed, or was unable to be added, false is returned. Alternately,
@@ -2497,6 +2644,20 @@ impl<VALID, STATE> Entry<VALID, STATE> {
             })
             .map(|value| value.to_proto_string_clone())
             .unwrap_or_else(|| "no entry id available".to_string())
+    }
+
+    pub fn has_class(&self, class: &EntryClass) -> bool {
+        self.get_ava_set(Attribute::Class)
+            .and_then(|vs| vs.as_iutf8_set())
+            .map(|set| {
+                let class_name: &str = class.into();
+                set.contains(class_name)
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn attr_keys(&self) -> impl Iterator<Item = &Attribute> {
+        self.attrs.keys()
     }
 
     /// Get an iterator over the current set of attribute names that this entry contains.
@@ -2596,6 +2757,13 @@ impl<VALID, STATE> Entry<VALID, STATE> {
             .and_then(|vs| vs.as_oauth2session_map())
     }
 
+    pub fn get_ava_as_s256_set<A: AsRef<Attribute>>(
+        &self,
+        attr: A,
+    ) -> Option<&std::collections::BTreeSet<Sha256Output>> {
+        self.get_ava_set(attr).and_then(|vs| vs.as_s256_set())
+    }
+
     /// If possible, return an iterator over the set of values transformed into a `&str`.
     pub fn get_ava_iter_iname<A: AsRef<Attribute>>(
         &self,
@@ -2632,21 +2800,6 @@ impl<VALID, STATE> Entry<VALID, STATE> {
 
     // These are special types to allow returning typed values from
     // an entry, if we "know" what we expect to receive.
-
-    /// This returns an array of IndexTypes, when the type is an Optional
-    /// multivalue in schema - IE this will *not* fail if the attribute is
-    /// empty, yielding and empty array instead.
-    ///
-    /// However, the conversion to IndexType is fallible, so in case of a failure
-    /// to convert, an empty vec is returned
-    pub(crate) fn get_ava_opt_index<A: AsRef<Attribute>>(&self, attr: A) -> Option<Vec<IndexType>> {
-        if let Some(vs) = self.get_ava_set(attr) {
-            vs.as_indextype_iter().map(|i| i.collect())
-        } else {
-            // Empty, but consider as valid.
-            Some(vec![])
-        }
-    }
 
     /// Return a single value of this attributes name, or `None` if it is NOT present, or
     /// there are multiple values present (ambiguous).
@@ -2806,9 +2959,25 @@ impl<VALID, STATE> Entry<VALID, STATE> {
     }
 
     /// Return a single security principle name, if valid to transform this value.
-    pub(crate) fn generate_spn(&self, domain_name: &str) -> Option<Value> {
-        self.get_ava_single_iname(Attribute::Name)
-            .map(|name| Value::new_spn_str(name, domain_name))
+    pub(crate) fn generate_spn(&self, domain_name: &str) -> Option<ValueSet> {
+        if let Some(name) = self.get_ava_single_iname(Attribute::Name) {
+            // There is a name attribute, lets return it.
+            return Some(ValueSetSpn::new((name.into(), domain_name.into())));
+        }
+
+        // Some entries may not have a name. There are now three paths.
+        let spn_set = self.get_ava_set(Attribute::Spn)?;
+
+        if spn_set.syntax() == SyntaxType::SecurityPrincipalName {
+            // - we already have a valid spn
+            Some(spn_set.clone())
+        } else if let Some(name) = spn_set.to_iname_single() {
+            // - we have an iname stashed into the spn attr for generation.
+            Some(ValueSetSpn::new((name.into(), domain_name.into())))
+        } else {
+            // - We have no way to proceed
+            None
+        }
     }
 
     /// Assert if an attribute of this name is present on this entry.
@@ -3260,95 +3429,14 @@ impl<VALID, STATE> PartialEq for Entry<VALID, STATE> {
     }
 }
 
-impl From<&SchemaAttribute> for Entry<EntryInit, EntryNew> {
-    fn from(s: &SchemaAttribute) -> Self {
-        // Convert an Attribute to an entry ... make it good!
-        let uuid_v = vs_uuid![s.uuid];
-        let name_v = vs_iutf8![s.name.as_str()];
-        let desc_v = vs_utf8![s.description.to_owned()];
-
-        let multivalue_v = vs_bool![s.multivalue];
-        let sync_allowed_v = vs_bool![s.sync_allowed];
-        let replicated_v = vs_bool![s.replicated];
-        let phantom_v = vs_bool![s.phantom];
-        let unique_v = vs_bool![s.unique];
-
-        let index_v = ValueSetIndex::from_iter(s.index.iter().copied());
-
-        let syntax_v = vs_syntax![s.syntax];
-
-        // Build the Map of the attributes relevant
-        // let mut attrs: Map<AttrString, Set<Value>> = Map::with_capacity(8);
-        let mut attrs: Map<Attribute, ValueSet> = Map::new();
-        attrs.insert(Attribute::AttributeName, name_v);
-        attrs.insert(Attribute::Description, desc_v);
-        attrs.insert(Attribute::Uuid, uuid_v);
-        attrs.insert(Attribute::MultiValue, multivalue_v);
-        attrs.insert(Attribute::Phantom, phantom_v);
-        attrs.insert(Attribute::SyncAllowed, sync_allowed_v);
-        attrs.insert(Attribute::Replicated, replicated_v);
-        attrs.insert(Attribute::Unique, unique_v);
-        if let Some(vs) = index_v {
-            attrs.insert(Attribute::Index, vs);
-        }
-        attrs.insert(Attribute::Syntax, syntax_v);
-        attrs.insert(
-            Attribute::Class,
-            vs_iutf8![
-                EntryClass::Object.into(),
-                EntryClass::System.into(),
-                EntryClass::AttributeType.into()
-            ],
-        );
-
-        // Insert stuff.
-
-        Entry {
-            valid: EntryInit,
-            state: EntryNew,
-            attrs,
-        }
-    }
-}
-
-impl From<&SchemaClass> for Entry<EntryInit, EntryNew> {
-    fn from(s: &SchemaClass) -> Self {
-        let uuid_v = vs_uuid![s.uuid];
-        let name_v = vs_iutf8![s.name.as_str()];
-        let desc_v = vs_utf8![s.description.to_owned()];
-        let sync_allowed_v = vs_bool![s.sync_allowed];
-
-        let mut attrs: Map<Attribute, ValueSet> = Map::new();
-        attrs.insert(Attribute::ClassName, name_v);
-        attrs.insert(Attribute::Description, desc_v);
-        attrs.insert(Attribute::SyncAllowed, sync_allowed_v);
-        attrs.insert(Attribute::Uuid, uuid_v);
-        attrs.insert(
-            Attribute::Class,
-            vs_iutf8![
-                EntryClass::Object.into(),
-                EntryClass::System.into(),
-                EntryClass::ClassType.into()
-            ],
-        );
-
-        let vs_systemmay = ValueSetIutf8::from_iter(s.systemmay.iter().map(|sm| sm.as_str()));
-        if let Some(vs) = vs_systemmay {
-            attrs.insert(Attribute::SystemMay, vs);
-        }
-
-        let vs_systemmust = ValueSetIutf8::from_iter(s.systemmust.iter().map(|sm| sm.as_str()));
-
-        if let Some(vs) = vs_systemmust {
-            attrs.insert(Attribute::SystemMust, vs);
-        }
-
-        Entry {
-            valid: EntryInit,
-            state: EntryNew,
-            attrs,
-        }
-    }
+/// This is a helper function to create an entry from an iterator of attribute-value pairs. This is a replacement for the old `entry_init!`` macro
+pub(crate) fn entry_init_fn<T>(args: T) -> EntryInitNew
+where
+    T: IntoIterator<Item = (Attribute, Value)>,
+{
+    let mut entry: EntryInitNew = Entry::new();
+    args.into_iter().for_each(|(k, v)| entry.add_ava(k, v));
+    entry
 }
 
 #[cfg(test)]

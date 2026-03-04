@@ -60,9 +60,12 @@ pub enum AuthCredential {
     Anonymous,
     Password(String),
     Totp(u32),
+
+    #[schema(value_type = HashMap<String, Value>)]
     SecurityKey(Box<PublicKeyCredential>),
     BackupCode(String),
     // Should this just be discoverable?
+    #[schema(value_type = String)]
     Passkey(Box<PublicKeyCredential>),
 }
 
@@ -91,6 +94,7 @@ pub enum AuthMech {
     PasswordTotp,
     PasswordSecurityKey,
     Passkey,
+    OAuth2Trust,
 }
 
 impl AuthMech {
@@ -102,6 +106,7 @@ impl AuthMech {
             AuthMech::PasswordBackupCode => "passwordbackupcode",
             AuthMech::PasswordSecurityKey => "passwordsecuritykey",
             AuthMech::Passkey => "passkey",
+            AuthMech::OAuth2Trust => "oauth2trust",
         }
     }
 }
@@ -121,6 +126,7 @@ impl fmt::Display for AuthMech {
             AuthMech::PasswordBackupCode => write!(f, "Backup Code and Password"),
             AuthMech::PasswordSecurityKey => write!(f, "Security Key and Password"),
             AuthMech::Passkey => write!(f, "Passkey"),
+            AuthMech::OAuth2Trust => write!(f, "OAuth2 Trust"),
         }
     }
 }
@@ -151,7 +157,10 @@ pub enum AuthAllowed {
     BackupCode,
     Password,
     Totp,
+
+    #[schema(value_type = HashMap<String, Value>)]
     SecurityKey(RequestChallengeResponse),
+    #[schema(value_type = HashMap<String, Value>)]
     Passkey(RequestChallengeResponse),
 }
 

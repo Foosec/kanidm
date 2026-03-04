@@ -4,6 +4,7 @@ use crate::server::Plugins;
 use std::collections::BTreeMap;
 
 pub type ModSetValid = BTreeMap<Uuid, ModifyList<ModifyValid>>;
+pub type ModSetInvalid = BTreeMap<Uuid, ModifyList<ModifyInvalid>>;
 
 pub struct BatchModifyEvent {
     pub ident: Identity,
@@ -224,6 +225,24 @@ impl QueryServerWriteTransaction<'_> {
                 })
         {
             self.changed_flags.insert(ChangeFlag::OAUTH2)
+        }
+
+        if !self.changed_flags.contains(ChangeFlag::OAUTH2_CLIENT)
+            && norm_cand
+                .iter()
+                .chain(pre_candidates.iter().map(|e| e.as_ref()))
+                .any(|e| e.attribute_equality(Attribute::Class, &EntryClass::OAuth2Client.into()))
+        {
+            self.changed_flags.insert(ChangeFlag::OAUTH2_CLIENT)
+        }
+
+        if !self.changed_flags.contains(ChangeFlag::FEATURE)
+            && norm_cand
+                .iter()
+                .chain(pre_candidates.iter().map(|e| e.as_ref()))
+                .any(|e| e.attribute_equality(Attribute::Class, &EntryClass::Feature.into()))
+        {
+            self.changed_flags.insert(ChangeFlag::FEATURE)
         }
 
         if !self.changed_flags.contains(ChangeFlag::DOMAIN)

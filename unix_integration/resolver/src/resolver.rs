@@ -1,18 +1,4 @@
 // use async_trait::async_trait;
-use hashbrown::HashMap;
-use std::fmt::Display;
-use std::num::NonZeroUsize;
-use std::ops::DerefMut;
-use std::path::{Path, PathBuf};
-use std::string::ToString;
-use std::sync::Arc;
-use std::time::{Duration, SystemTime};
-
-use lru::LruCache;
-use time::OffsetDateTime;
-use tokio::sync::Mutex;
-use uuid::Uuid;
-
 use crate::db::{Cache, Db};
 use crate::idprovider::interface::{
     AuthCredHandler,
@@ -30,26 +16,42 @@ use crate::idprovider::interface::{
 use crate::idprovider::system::{
     Shadow, SystemAuthResult, SystemProvider, SystemProviderAuthInit, SystemProviderSession,
 };
-use crate::unix_config::{HomeAttr, UidAttr};
-use kanidm_unix_common::constants::DEFAULT_SHELL_SEARCH_PATHS;
+use hashbrown::HashMap;
+use kanidm_hsm_crypto::provider::BoxedDynTpm;
+use kanidm_unix_common::constants::{
+    DEFAULT_CACHE_TIMEOUT_JITTER_MS, DEFAULT_CACHE_TIMEOUT_MAXIMUM, DEFAULT_CACHE_TIMEOUT_MINIMUM,
+    DEFAULT_SHELL_SEARCH_PATHS, SYSTEM_SHADOW_PATH,
+};
+use kanidm_unix_common::unix_config::{HomeAttr, UidAttr};
 use kanidm_unix_common::unix_passwd::{EtcGroup, EtcShadow, EtcUser};
 use kanidm_unix_common::unix_proto::{
     HomeDirectoryInfo, NssGroup, NssUser, PamAuthRequest, PamAuthResponse, PamServiceInfo,
     ProviderStatus,
 };
-
-use kanidm_hsm_crypto::BoxedDynTpm;
-
+use lru::LruCache;
+use std::fmt::Display;
+use std::num::NonZeroUsize;
+use std::ops::DerefMut;
+use std::path::{Path, PathBuf};
+use std::string::ToString;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+use time::OffsetDateTime;
 use tokio::sync::broadcast;
+use tokio::sync::mpsc;
+use tokio::sync::Mutex;
+use uuid::Uuid;
 
-const NXCACHE_SIZE: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(128) };
+const NXCACHE_SIZE: NonZeroUsize =
+    NonZeroUsize::new(256).expect("Invalid NXCACHE constant at compile time");
+// Can sometimes have duplicates, so it can be a bit longer.
+const ASYNC_REFRESH_QUEUE: usize = 128;
 
 pub enum AuthSession {
     Online {
         client: Arc<dyn IdProvider + Sync + Send>,
         account_id: String,
         id: Id,
-        token: Option<Box<UserToken>>,
         cred_handler: AuthCredHandler,
         /// Some authentication operations may need to spawn background tasks. These tasks need
         /// to know when to stop as the caller has disconnected. This receiver allows that, so
@@ -61,7 +63,7 @@ pub enum AuthSession {
         account_id: String,
         id: Id,
         client: Arc<dyn IdProvider + Sync + Send>,
-        token: Box<UserToken>,
+        session_token: Box<UserToken>,
         cred_handler: AuthCredHandler,
     },
     System {
@@ -72,6 +74,27 @@ pub enum AuthSession {
     },
     Success,
     Denied,
+}
+
+impl AuthSession {
+    pub fn is_complete(&self) -> bool {
+        match &self {
+            Self::Success | Self::Denied => true,
+            Self::Online { .. } | Self::Offline { .. } | Self::System { .. } => false,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+/// The expiration state of a cache item
+enum ExpiryState {
+    /// The item is valid
+    Valid,
+    /// The item is valid, but approaching it's expiry so a background/async refresh should be
+    /// performed.
+    ValidRefresh,
+    /// The item is expired and needs refresh before we can proceed
+    Expired,
 }
 
 pub struct Resolver {
@@ -92,6 +115,7 @@ pub struct Resolver {
     primary_origin: ProviderOrigin,
 
     timeout_seconds: u64,
+    async_refresh_seconds: u64,
     default_shell: String,
     home_prefix: PathBuf,
     home_attr: HomeAttr,
@@ -99,6 +123,7 @@ pub struct Resolver {
     uid_attr_map: UidAttr,
     gid_attr_map: UidAttr,
     nxcache: Mutex<LruCache<Id, SystemTime>>,
+    async_refresh_tx: mpsc::Sender<Id>,
 }
 
 impl Display for Id {
@@ -124,7 +149,7 @@ impl Resolver {
         home_alias: Option<HomeAttr>,
         uid_attr_map: UidAttr,
         gid_attr_map: UidAttr,
-    ) -> Result<Self, ()> {
+    ) -> Result<(Self, mpsc::Receiver<Id>), ()> {
         let hsm = Mutex::new(hsm);
 
         let primary_origin = clients.first().map(|c| c.origin()).unwrap_or_default();
@@ -134,24 +159,40 @@ impl Resolver {
             .map(|provider| (provider.origin(), provider.clone()))
             .collect();
 
+        let (async_refresh_tx, async_refresh_rx) = mpsc::channel(ASYNC_REFRESH_QUEUE);
+
+        // How many seconds before expiry should we be refreshing an entry.
+        // We want to balance this - we don't want too many refreshes, but we
+        // also need to account for long cache times and ensuring that we are checking
+        // account validity in the background.
+
+        let timeout_seconds =
+            timeout_seconds.clamp(DEFAULT_CACHE_TIMEOUT_MINIMUM, DEFAULT_CACHE_TIMEOUT_MAXIMUM);
+        let async_refresh_seconds = (timeout_seconds / 3) * 2;
+
         // We assume we are offline at start up, and we mark the next "online check" as
         // being valid from "now".
-        Ok(Resolver {
-            db,
-            hsm,
-            system_provider,
-            clients,
-            primary_origin,
-            client_ids,
-            timeout_seconds,
-            default_shell,
-            home_prefix,
-            home_attr,
-            home_alias,
-            uid_attr_map,
-            gid_attr_map,
-            nxcache: Mutex::new(LruCache::new(NXCACHE_SIZE)),
-        })
+        Ok((
+            Resolver {
+                db,
+                hsm,
+                system_provider,
+                clients,
+                primary_origin,
+                client_ids,
+                timeout_seconds,
+                async_refresh_seconds,
+                default_shell,
+                home_prefix,
+                home_attr,
+                home_alias,
+                uid_attr_map,
+                gid_attr_map,
+                nxcache: Mutex::new(LruCache::new(NXCACHE_SIZE)),
+                async_refresh_tx,
+            },
+            async_refresh_rx,
+        ))
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -187,22 +228,30 @@ impl Resolver {
             .map_err(|_| ())
     }
 
+    #[instrument(level = "debug", skip_all)]
     async fn get_cached_usertokens(&self) -> Result<Vec<UserToken>, ()> {
         let mut dbtxn = self.db.write().await;
         dbtxn.get_accounts().map_err(|_| ())
     }
 
+    #[instrument(level = "debug", skip_all)]
     async fn get_cached_grouptokens(&self) -> Result<Vec<GroupToken>, ()> {
         let mut dbtxn = self.db.write().await;
         dbtxn.get_groups().map_err(|_| ())
     }
 
+    #[instrument(level = "debug", skip_all)]
     async fn set_nxcache(&self, id: &Id) {
         let mut nxcache_txn = self.nxcache.lock().await;
-        let ex_time = SystemTime::now() + Duration::from_secs(self.timeout_seconds);
+        // To try and prevent too many requests occuring all at the same time, we subtract a small
+        // amount of "jitter" from expiry values so that we space out refreshes.
+        let jitter = rand::random_range(0..DEFAULT_CACHE_TIMEOUT_JITTER_MS);
+        let ex_time = SystemTime::now() + Duration::from_secs(self.timeout_seconds)
+            - Duration::from_millis(jitter);
         nxcache_txn.put(id.clone(), ex_time);
     }
 
+    #[instrument(level = "debug", skip_all)]
     pub async fn check_nxcache(&self, id: &Id) -> Option<SystemTime> {
         let mut nxcache_txn = self.nxcache.lock().await;
         nxcache_txn.get(id).copied()
@@ -218,7 +267,25 @@ impl Resolver {
         self.system_provider.reload(users, shadow, groups).await
     }
 
-    async fn get_cached_usertoken(&self, account_id: &Id) -> Result<(bool, Option<UserToken>), ()> {
+    #[instrument(level = "debug", skip_all)]
+    async fn get_cached_usertoken(
+        &self,
+        account_id: &Id,
+        current_time: SystemTime,
+    ) -> Result<(ExpiryState, Option<UserToken>), ()> {
+        // Is it in the nxcache?
+        if let Some(ex_time) = self.check_nxcache(account_id).await {
+            if current_time >= ex_time {
+                // It's in the LRU, but we are past the expiry so
+                // lets attempt a refresh.
+                return Ok((ExpiryState::ValidRefresh, None));
+            } else {
+                // It's in the LRU and still valid, so return that
+                // no check is needed.
+                return Ok((ExpiryState::Valid, None));
+            }
+        }
+
         // Account_id could be:
         //  * gidnumber
         //  * name
@@ -227,7 +294,62 @@ impl Resolver {
         //  Attempt to search these in the db.
         let mut dbtxn = self.db.write().await;
         let r = dbtxn.get_account(account_id).map_err(|err| {
-            debug!("get_cached_usertoken {:?}", err);
+            debug!(?err, "get_cached_usertoken");
+        })?;
+
+        drop(dbtxn);
+
+        match r {
+            Some((ut, ex)) => {
+                // Are we expired?
+                let ex_time = SystemTime::UNIX_EPOCH + Duration::from_secs(ex);
+
+                // Should we async refresh?
+                let async_ref_time = if ex > self.async_refresh_seconds {
+                    SystemTime::UNIX_EPOCH + Duration::from_secs(ex - self.async_refresh_seconds)
+                } else {
+                    ex_time
+                };
+
+                if current_time >= ex_time {
+                    Ok((ExpiryState::Expired, Some(ut)))
+                } else if current_time >= async_ref_time {
+                    Ok((ExpiryState::ValidRefresh, Some(ut)))
+                } else {
+                    Ok((ExpiryState::Valid, Some(ut)))
+                }
+            }
+            None => {
+                // it wasn't in the DB, and it wasn't in the nxcache.
+                Ok((ExpiryState::Expired, None))
+            }
+        } // end match r
+    }
+
+    #[instrument(level = "debug", skip_all)]
+    async fn get_cached_grouptoken(&self, grp_id: &Id) -> Result<(bool, Option<GroupToken>), ()> {
+        let current_time = SystemTime::now();
+        // Is it in the nxcache?
+        if let Some(ex_time) = self.check_nxcache(grp_id).await {
+            if current_time >= ex_time {
+                // It's in the LRU, but we are past the expiry so
+                // lets attempt a refresh.
+                return Ok((true, None));
+            } else {
+                // It's in the LRU and still valid, so return that
+                // no check is needed.
+                return Ok((false, None));
+            }
+        }
+        // grp_id could be:
+        //  * gidnumber
+        //  * name
+        //  * spn
+        //  * uuid
+        //  Attempt to search these in the db.
+        let mut dbtxn = self.db.write().await;
+        let r = dbtxn.get_group(grp_id).map_err(|err| {
+            debug!(?err, "get_cached_grouptoken");
         })?;
 
         drop(dbtxn);
@@ -237,92 +359,33 @@ impl Resolver {
                 // Are we expired?
                 let offset = Duration::from_secs(ex);
                 let ex_time = SystemTime::UNIX_EPOCH + offset;
-                let now = SystemTime::now();
 
-                if now >= ex_time {
+                if current_time >= ex_time {
                     Ok((true, Some(ut)))
                 } else {
                     Ok((false, Some(ut)))
                 }
             }
             None => {
-                // it wasn't in the DB - lets see if it's in the nxcache.
-                match self.check_nxcache(account_id).await {
-                    Some(ex_time) => {
-                        let now = SystemTime::now();
-                        if now >= ex_time {
-                            // It's in the LRU, but we are past the expiry so
-                            // lets attempt a refresh.
-                            Ok((true, None))
-                        } else {
-                            // It's in the LRU and still valid, so return that
-                            // no check is needed.
-                            Ok((false, None))
-                        }
-                    }
-                    None => {
-                        // Not in the LRU. Return that this IS expired
-                        // and we have no data.
-                        Ok((true, None))
-                    }
-                }
-            }
-        } // end match r
-    }
-
-    async fn get_cached_grouptoken(&self, grp_id: &Id) -> Result<(bool, Option<GroupToken>), ()> {
-        // grp_id could be:
-        //  * gidnumber
-        //  * name
-        //  * spn
-        //  * uuid
-        //  Attempt to search these in the db.
-        let mut dbtxn = self.db.write().await;
-        let r = dbtxn.get_group(grp_id).map_err(|_| ())?;
-
-        drop(dbtxn);
-
-        match r {
-            Some((ut, ex)) => {
-                // Are we expired?
-                let offset = Duration::from_secs(ex);
-                let ex_time = SystemTime::UNIX_EPOCH + offset;
-                let now = SystemTime::now();
-
-                if now >= ex_time {
-                    Ok((true, Some(ut)))
-                } else {
-                    Ok((false, Some(ut)))
-                }
-            }
-            None => {
-                // it wasn't in the DB - lets see if it's in the nxcache.
-                match self.check_nxcache(grp_id).await {
-                    Some(ex_time) => {
-                        let now = SystemTime::now();
-                        if now >= ex_time {
-                            // It's in the LRU, but we are past the expiry so
-                            // lets attempt a refresh.
-                            Ok((true, None))
-                        } else {
-                            // It's in the LRU and still valid, so return that
-                            // no check is needed.
-                            Ok((false, None))
-                        }
-                    }
-                    None => {
-                        // Not in the LRU. Return that this IS expired
-                        // and we have no data.
-                        Ok((true, None))
-                    }
-                }
+                // it wasn't in the DB, and it wasn't in the nxcache.
+                Ok((true, None))
             }
         }
     }
 
-    async fn set_cache_usertoken(&self, token: &mut UserToken) -> Result<(), ()> {
+    #[instrument(level = "debug", skip_all)]
+    async fn set_cache_usertoken(
+        &self,
+        token: &mut UserToken,
+        // This is just for proof that only one write can occur at a time.
+        _tpm: &mut BoxedDynTpm,
+    ) -> Result<(), ()> {
         // Set an expiry
-        let ex_time = SystemTime::now() + Duration::from_secs(self.timeout_seconds);
+        // To try and prevent too many requests occuring all at the same time, we subtract a small
+        // amount of "jitter" from expiry values so that we space out refreshes.
+        let jitter = rand::random_range(0..DEFAULT_CACHE_TIMEOUT_JITTER_MS);
+        let ex_time = SystemTime::now() + Duration::from_secs(self.timeout_seconds)
+            - Duration::from_millis(jitter);
         let offset = ex_time
             .duration_since(SystemTime::UNIX_EPOCH)
             .map_err(|e| {
@@ -411,6 +474,7 @@ impl Resolver {
             .map_err(|_| ())
     }
 
+    #[instrument(level = "debug", skip_all)]
     async fn set_cache_grouptoken(&self, token: &GroupToken) -> Result<(), ()> {
         // Set an expiry
         let ex_time = SystemTime::now() + Duration::from_secs(self.timeout_seconds);
@@ -427,6 +491,7 @@ impl Resolver {
             .map_err(|_| ())
     }
 
+    #[instrument(level = "debug", skip_all)]
     async fn delete_cache_usertoken(&self, a_uuid: Uuid) -> Result<(), ()> {
         let mut dbtxn = self.db.write().await;
         dbtxn
@@ -435,6 +500,7 @@ impl Resolver {
             .map_err(|_| ())
     }
 
+    #[instrument(level = "debug", skip_all)]
     async fn delete_cache_grouptoken(&self, g_uuid: Uuid) -> Result<(), ()> {
         let mut dbtxn = self.db.write().await;
         dbtxn
@@ -443,22 +509,37 @@ impl Resolver {
             .map_err(|_| ())
     }
 
-    async fn refresh_usertoken(
+    #[instrument(level = "debug", skip_all)]
+    pub async fn refresh_usertoken(
         &self,
         account_id: &Id,
-        token: Option<UserToken>,
+        current_time: SystemTime,
     ) -> Result<Option<UserToken>, ()> {
-        // TODO: Move this to the caller.
-        let now = SystemTime::now();
-
         let mut hsm_lock = self.hsm.lock().await;
+
+        // We need to re-acquire the token now behind the hsmlock - this is so that
+        // we know that as we write the updated token, we know that no one else has
+        // written to this token, since we are now the only task that is allowed
+        // to be in a write phase.
+        let token = self
+            .get_cached_usertoken(account_id, current_time)
+            .await
+            .map(|(_expired, option_token)| option_token)
+            .map_err(|err| {
+                debug!(?err, "get_usertoken error");
+            })?;
 
         let user_get_result = if let Some(tok) = token.as_ref() {
             // Re-use the provider that the token is from.
             match self.client_ids.get(&tok.provider) {
                 Some(client) => {
                     client
-                        .unix_user_get(account_id, token.as_ref(), hsm_lock.deref_mut(), now)
+                        .unix_user_get(
+                            account_id,
+                            token.as_ref(),
+                            hsm_lock.deref_mut(),
+                            current_time,
+                        )
                         .await
                 }
                 None => {
@@ -476,7 +557,12 @@ impl Resolver {
             'search: {
                 for client in self.clients.iter() {
                     match client
-                        .unix_user_get(account_id, token.as_ref(), hsm_lock.deref_mut(), now)
+                        .unix_user_get(
+                            account_id,
+                            token.as_ref(),
+                            hsm_lock.deref_mut(),
+                            current_time,
+                        )
                         .await
                     {
                         // Ignore this one.
@@ -488,12 +574,11 @@ impl Resolver {
             }
         };
 
-        drop(hsm_lock);
-
         match user_get_result {
             Ok(UserTokenState::Update(mut n_tok)) => {
                 // We have the token!
-                self.set_cache_usertoken(&mut n_tok).await?;
+                self.set_cache_usertoken(&mut n_tok, hsm_lock.deref_mut())
+                    .await?;
                 Ok(Some(n_tok))
             }
             Ok(UserTokenState::NotFound) => {
@@ -515,14 +600,13 @@ impl Resolver {
         }
     }
 
+    #[instrument(level = "debug", skip_all)]
     async fn refresh_grouptoken(
         &self,
         grp_id: &Id,
         token: Option<GroupToken>,
+        current_time: SystemTime,
     ) -> Result<Option<GroupToken>, ()> {
-        // TODO: Move this to the caller.
-        let now = SystemTime::now();
-
         let mut hsm_lock = self.hsm.lock().await;
 
         let group_get_result = if let Some(tok) = token.as_ref() {
@@ -530,7 +614,7 @@ impl Resolver {
             match self.client_ids.get(&tok.provider) {
                 Some(client) => {
                     client
-                        .unix_group_get(grp_id, hsm_lock.deref_mut(), now)
+                        .unix_group_get(grp_id, hsm_lock.deref_mut(), current_time)
                         .await
                 }
                 None => {
@@ -547,7 +631,7 @@ impl Resolver {
             'search: {
                 for client in self.clients.iter() {
                     match client
-                        .unix_group_get(grp_id, hsm_lock.deref_mut(), now)
+                        .unix_group_get(grp_id, hsm_lock.deref_mut(), current_time)
                         .await
                     {
                         // Ignore this one.
@@ -583,40 +667,57 @@ impl Resolver {
         }
     }
 
-    #[instrument(level = "debug", skip(self))]
-    async fn get_usertoken(&self, account_id: &Id) -> Result<Option<UserToken>, ()> {
+    #[instrument(level = "trace", skip_all)]
+    async fn get_usertoken(
+        &self,
+        account_id: &Id,
+        current_time: SystemTime,
+    ) -> Result<Option<UserToken>, ()> {
         // get the item from the cache
-        let (expired, item) = self.get_cached_usertoken(account_id).await.map_err(|e| {
-            debug!("get_usertoken error -> {:?}", e);
-        })?;
+        let (expiry_state, item) = self
+            .get_cached_usertoken(account_id, current_time)
+            .await
+            .map_err(|e| {
+                debug!("get_usertoken error -> {:?}", e);
+            })?;
 
         // If the token isn't found, get_cached will set expired = true.
-        if expired {
-            self.refresh_usertoken(account_id, item).await
+        if expiry_state == ExpiryState::Expired {
+            self.refresh_usertoken(account_id, current_time).await
         } else {
+            if expiry_state == ExpiryState::ValidRefresh {
+                // We don't mind if the buffer is full.
+                if self.async_refresh_tx.try_send(account_id.clone()).is_err() {
+                    debug!(?account_id, "unable to queue async refresh");
+                }
+            }
             // Still valid, return the cached entry.
             Ok(item)
         }
         .map(|t| {
-            debug!("token -> {:?}", t);
+            trace!("token -> {:?}", t);
             t
         })
     }
 
-    #[instrument(level = "debug", skip(self))]
-    async fn get_grouptoken(&self, grp_id: Id) -> Result<Option<GroupToken>, ()> {
+    #[instrument(level = "trace", skip(self))]
+    async fn get_grouptoken(
+        &self,
+        grp_id: Id,
+        current_time: SystemTime,
+    ) -> Result<Option<GroupToken>, ()> {
         let (expired, item) = self.get_cached_grouptoken(&grp_id).await.map_err(|e| {
             debug!("get_grouptoken error -> {:?}", e);
         })?;
 
         if expired {
-            self.refresh_grouptoken(&grp_id, item).await
+            self.refresh_grouptoken(&grp_id, item, current_time).await
         } else {
             // Still valid, return the cached entry.
             Ok(item)
         }
         .map(|t| {
-            debug!("token -> {:?}", t);
+            trace!("token -> {:?}", t);
             t
         })
     }
@@ -635,8 +736,9 @@ impl Resolver {
     // Get ssh keys for an account id
     #[instrument(level = "debug", skip(self))]
     pub async fn get_sshkeys(&self, account_id: &str) -> Result<Vec<String>, ()> {
+        let current_time = SystemTime::now();
         let token = self
-            .get_usertoken(&Id::Name(account_id.to_string()))
+            .get_usertoken(&Id::Name(account_id.to_string()), current_time)
             .await?;
         Ok(token
             .map(|t| {
@@ -711,14 +813,18 @@ impl Resolver {
             .collect())
     }
 
-    #[instrument(level = "debug", skip_all)]
-    async fn get_nssaccount(&self, account_id: Id) -> Result<Option<NssUser>, ()> {
+    #[instrument(level = "trace", skip_all)]
+    async fn get_nssaccount(
+        &self,
+        account_id: Id,
+        current_time: SystemTime,
+    ) -> Result<Option<NssUser>, ()> {
         if let Some(nss_user) = self.system_provider.get_nssaccount(&account_id).await {
             debug!("system provider satisfied request");
             return Ok(Some(nss_user));
         }
 
-        let token = self.get_usertoken(&account_id).await?;
+        let token = self.get_usertoken(&account_id, current_time).await?;
         Ok(token.map(|tok| NssUser {
             homedir: self.token_abs_homedirectory(&tok),
             name: self.token_uidattr(&tok),
@@ -730,13 +836,26 @@ impl Resolver {
     }
 
     #[instrument(level = "debug", skip(self))]
+    pub async fn get_nssaccount_name_time(
+        &self,
+        account_id: &str,
+        current_time: SystemTime,
+    ) -> Result<Option<NssUser>, ()> {
+        self.get_nssaccount(Id::Name(account_id.to_string()), current_time)
+            .await
+    }
+
+    #[instrument(level = "debug", skip(self))]
     pub async fn get_nssaccount_name(&self, account_id: &str) -> Result<Option<NssUser>, ()> {
-        self.get_nssaccount(Id::Name(account_id.to_string())).await
+        let current_time = SystemTime::now();
+        self.get_nssaccount(Id::Name(account_id.to_string()), current_time)
+            .await
     }
 
     #[instrument(level = "debug", skip(self))]
     pub async fn get_nssaccount_gid(&self, gid: u32) -> Result<Option<NssUser>, ()> {
-        self.get_nssaccount(Id::Gid(gid)).await
+        let current_time = SystemTime::now();
+        self.get_nssaccount(Id::Gid(gid), current_time).await
     }
 
     fn token_gidattr(&self, token: &GroupToken) -> String {
@@ -781,13 +900,16 @@ impl Resolver {
         Ok(r)
     }
 
+    #[instrument(level = "trace", skip_all)]
     async fn get_nssgroup(&self, grp_id: Id) -> Result<Option<NssGroup>, ()> {
         if let Some(mut nss_group) = self.system_provider.get_nssgroup(&grp_id).await {
             debug!("system provider satisfied request");
 
             for client in self.clients.iter() {
                 if let Some(extend_group_id) = client.has_map_group(&nss_group.name) {
-                    let token = self.get_grouptoken(extend_group_id.clone()).await?;
+                    let token = self
+                        .get_grouptoken(extend_group_id.clone(), SystemTime::now())
+                        .await?;
                     if let Some(token) = token {
                         let members = self.get_groupmembers(token.uuid).await;
                         nss_group.members.extend(members);
@@ -805,7 +927,7 @@ impl Resolver {
             return Ok(Some(nss_group));
         }
 
-        let token = self.get_grouptoken(grp_id).await?;
+        let token = self.get_grouptoken(grp_id, SystemTime::now()).await?;
         // Get members set.
         match token {
             Some(tok) => {
@@ -832,6 +954,7 @@ impl Resolver {
 
     #[instrument(level = "debug", skip(self))]
     pub async fn pam_account_allowed(&self, account_id: &str) -> Result<Option<bool>, ()> {
+        let current_time = SystemTime::now();
         let id = Id::Name(account_id.to_string());
 
         if let Some(answer) = self.system_provider.authorise(&id).await {
@@ -839,7 +962,7 @@ impl Resolver {
         };
 
         // Not a system account, handle with the provider.
-        let token = self.get_usertoken(&id).await?;
+        let token = self.get_usertoken(&id, current_time).await?;
 
         // If there is no token, return Ok(None) to trigger unknown-user path in pam.
         match token {
@@ -858,7 +981,7 @@ impl Resolver {
         }
     }
 
-    #[instrument(level = "debug", skip(self, shutdown_rx))]
+    #[instrument(level = "debug", skip(self, shutdown_rx, current_time))]
     pub async fn pam_account_authenticate_init(
         &self,
         account_id: &str,
@@ -886,7 +1009,7 @@ impl Resolver {
             SystemProviderAuthInit::ShadowMissing => {
                 warn!(
                     ?account_id,
-                    "Resolver unable to proceed, /etc/shadow was not accessible."
+                    "Resolver unable to proceed, {SYSTEM_SHADOW_PATH} was not accessible."
                 );
                 return Ok((AuthSession::Denied, PamAuthResponse::Unknown));
             }
@@ -923,7 +1046,7 @@ impl Resolver {
             }
         }
 
-        let token = self.get_usertoken(&id).await?;
+        let token = self.get_usertoken(&id, now).await?;
 
         // Get the provider associated to this token.
 
@@ -940,10 +1063,26 @@ impl Resolver {
                     error!(provider = ?token.provider, "Token was resolved by a provider that no longer appears to be present.");
                 })?;
 
-            let online_at_init = client.attempt_online(hsm_lock.deref_mut(), now).await;
-            // if we are online, we try and start an online auth.
-            debug!(?online_at_init);
+            // Can the auth proceed offline? This is important for us to make choices about
+            // if we attempt to force an online state check.
+            let can_proceed_offline = client.unix_user_can_offline_auth(&token).await;
 
+            // We can use is_online here because the earlier get_usertoken call leading up to this
+            // will have taken the provider online if possible. This way if we are already in an
+            // offline state, we don't needlessly delay the authentication operation.
+            // In addition as we now have background prefetching of accounts, this will also
+            // be checking frequently enough if we are online and will assist us to be online as
+            // much as possible.
+            let online_at_init = if can_proceed_offline {
+                // This is only for accounts we have previously resolved and authenticated.
+                client.is_online().await
+            } else {
+                // We know who the user is, but don't have cached credentials, so we need to try and
+                // force online if possible.
+                client.attempt_online(hsm_lock.deref_mut(), now).await
+            };
+
+            // We're online, go for it.
             if online_at_init {
                 let init_result = client
                     .unix_user_online_auth_init(
@@ -960,7 +1099,6 @@ impl Resolver {
                             client,
                             account_id: account_id.to_string(),
                             id,
-                            token: Some(Box::new(token)),
                             cred_handler,
                             shutdown_rx,
                         };
@@ -972,16 +1110,14 @@ impl Resolver {
                     }
                 }
             } else {
-                // Can the auth proceed offline?
                 let init_result = client.unix_user_offline_auth_init(&token).await;
-
                 match init_result {
                     Ok((next_req, cred_handler)) => {
                         let auth_session = AuthSession::Offline {
                             account_id: account_id.to_string(),
                             id,
                             client,
-                            token: Box::new(token),
+                            session_token: Box::new(token),
                             cred_handler,
                         };
                         Ok((auth_session, next_req.into()))
@@ -1024,7 +1160,6 @@ impl Resolver {
                             client: client.clone(),
                             account_id: account_id.to_string(),
                             id,
-                            token: None,
                             cred_handler,
                             shutdown_rx,
                         };
@@ -1052,19 +1187,33 @@ impl Resolver {
         auth_session: &mut AuthSession,
         pam_next_req: PamAuthRequest,
     ) -> Result<PamAuthResponse, ()> {
+        let current_time = SystemTime::now();
+        let mut hsm_lock = self.hsm.lock().await;
+
         let maybe_err = match &mut *auth_session {
             &mut AuthSession::Online {
                 ref client,
                 ref account_id,
-                id: _,
-                token: _,
+                ref id,
                 ref mut cred_handler,
                 ref shutdown_rx,
             } => {
-                let mut hsm_lock = self.hsm.lock().await;
+                // This is not used in the authentication, but is so that any new
+                // extra keys or data on the token are updated correctly if the authentication
+                // requests an update. Since we hold the hsm_lock, no other task can
+                // update this token between now and completion of the fn.
+                let current_token = self
+                    .get_cached_usertoken(id, current_time)
+                    .await
+                    .map(|(_expired, option_token)| option_token)
+                    .map_err(|err| {
+                        debug!(?err, "get_usertoken error");
+                    })?;
+
                 let result = client
                     .unix_user_online_auth_step(
                         account_id,
+                        current_token.as_ref(),
                         cred_handler,
                         pam_next_req,
                         hsm_lock.deref_mut(),
@@ -1073,7 +1222,7 @@ impl Resolver {
                     .await;
 
                 match result {
-                    Ok(AuthResult::Success { .. }) => {
+                    Ok(AuthResult::SuccessUpdate { .. } | AuthResult::Success) => {
                         info!(?account_id, "Authentication Success");
                     }
                     Ok(AuthResult::Denied) => {
@@ -1089,17 +1238,29 @@ impl Resolver {
             }
             &mut AuthSession::Offline {
                 ref account_id,
-                id: _,
+                ref id,
                 ref client,
-                ref token,
+                ref session_token,
                 ref mut cred_handler,
             } => {
+                // This is not used in the authentication, but is so that any new
+                // extra keys or data on the token are updated correctly if the authentication
+                // requests an update. Since we hold the hsm_lock, no other task can
+                // update this token between now and completion of the fn.
+                let current_token = self
+                    .get_cached_usertoken(id, current_time)
+                    .await
+                    .map(|(_expired, option_token)| option_token)
+                    .map_err(|err| {
+                        debug!(?err, "get_usertoken error");
+                    })?;
+
                 // We are offline, continue. Remember, authsession should have
                 // *everything you need* to proceed here!
-                let mut hsm_lock = self.hsm.lock().await;
                 let result = client
                     .unix_user_offline_auth_step(
-                        token,
+                        current_token.as_ref(),
+                        session_token,
                         cred_handler,
                         pam_next_req,
                         hsm_lock.deref_mut(),
@@ -1107,7 +1268,7 @@ impl Resolver {
                     .await;
 
                 match result {
-                    Ok(AuthResult::Success { .. }) => {
+                    Ok(AuthResult::SuccessUpdate { .. } | AuthResult::Success) => {
                         info!(?account_id, "Authentication Success");
                     }
                     Ok(AuthResult::Denied) => {
@@ -1158,8 +1319,13 @@ impl Resolver {
 
         match maybe_err {
             // What did the provider direct us to do next?
-            Ok(AuthResult::Success { mut token }) => {
-                self.set_cache_usertoken(&mut token).await?;
+            Ok(AuthResult::Success) => {
+                *auth_session = AuthSession::Success;
+                Ok(PamAuthResponse::Success)
+            }
+            Ok(AuthResult::SuccessUpdate { mut new_token }) => {
+                self.set_cache_usertoken(&mut new_token, hsm_lock.deref_mut())
+                    .await?;
                 *auth_session = AuthSession::Success;
 
                 Ok(PamAuthResponse::Success)
@@ -1185,7 +1351,7 @@ impl Resolver {
     }
 
     // Can this be cfg debug/test?
-    #[instrument(level = "debug", skip(self, password))]
+    #[instrument(level = "debug", skip(self, password, current_time))]
     pub async fn pam_account_authenticate(
         &self,
         account_id: &str,
@@ -1265,6 +1431,7 @@ impl Resolver {
         &self,
         account_id: &str,
     ) -> Result<Option<HomeDirectoryInfo>, ()> {
+        let current_time = SystemTime::now();
         let id = Id::Name(account_id.to_string());
 
         match self.system_provider.begin_session(&id).await {
@@ -1282,18 +1449,16 @@ impl Resolver {
         };
 
         // Not a system account, check based on the token and resolve.
-        let token = self.get_usertoken(&id).await?;
+        let token = self.get_usertoken(&id, current_time).await?;
         Ok(token.as_ref().map(|tok| HomeDirectoryInfo {
             uid: tok.gidnumber,
             gid: tok.gidnumber,
             name: self.token_homedirectory_attr(tok),
-            aliases: self
-                .token_homedirectory_alias(tok)
-                .map(|s| vec![s])
-                .unwrap_or_default(),
+            alias: self.token_homedirectory_alias(tok),
         }))
     }
 
+    #[instrument(level = "debug", skip_all)]
     pub async fn provider_status(&self) -> Vec<ProviderStatus> {
         let now = SystemTime::now();
         let mut hsm_lock = self.hsm.lock().await;

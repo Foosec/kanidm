@@ -1,4 +1,5 @@
 <!-- markdownlint-disable MD025 MD042 -->
+
 # Kanidm
 
 - [Introduction to Kanidm](introduction_to_kanidm.md)
@@ -25,6 +26,7 @@
   - [Monitoring the platform](monitoring_the_platform.md)
   - [Recycle Bin](recycle_bin.md)
   - [Customising](customising.md)
+  - [Entry Management](entry_management.md)
 
 - [Accounts and Groups](accounts/intro.md)
   - [People Accounts](accounts/people_accounts.md)
@@ -44,6 +46,7 @@
     - [Custom Claims](integrations/oauth2/custom_claims.md)
     - [Example Configurations](integrations/oauth2/examples.md)
   - [PAM and nsswitch](integrations/pam_and_nsswitch.md)
+    - [FreeBSD](integrations/pam_and_nsswitch/freebsd.md)
     - [SUSE / OpenSUSE](integrations/pam_and_nsswitch/suse.md)
     - [Fedora](integrations/pam_and_nsswitch/fedora.md)
     - [Troubleshooting](integrations/pam_and_nsswitch/troubleshooting.md)
@@ -53,7 +56,6 @@
 
 - [Service Integration Examples](examples/readme.md)
   - [Kubernetes Ingress](examples/kubernetes_ingress.md)
-  - [OAuth2 Examples](integrations/oauth2/examples.md)
   - [Traefik](examples/traefik.md)
 
 - [Replication](repl/readme.md)
@@ -94,7 +96,6 @@
 - [Python Module](developers/python_module.md)
 - [RADIUS Module Development](developers/radius.md)
 - [Release Checklist](developers/release_checklist.md)
-- [Packaging](packaging/packaging.md)
+- [Packages](packaging/packaging.md)
   - [Debian/Ubuntu Packaging](packaging/debian_ubuntu_packaging.md)
   - [PPA Packages](packaging/ppa_packages.md)
-  - [Community Packages](packaging/community_packages.md)

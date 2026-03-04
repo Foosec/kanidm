@@ -106,7 +106,7 @@ fn apply_gidnumber<T: Clone>(e: &mut Entry<EntryInvalid, T>) -> Result<(), Opera
             // Note that here we don't advertise that we allow the nspawn range to be set, even
             // though we do allow it.
             error!(
-                "Requested GID ({}) overlaps a system range. Allowed ranges are {} to {}, {} to {} and {} to {}",
+                "Requested UID/GID ({}) overlaps a system range. Allowed ranges are {} to {}, {} to {} and {} to {}",
                 gid,
                 GID_REGULAR_USER_MIN, GID_REGULAR_USER_MAX,
                 GID_UNUSED_C_MIN, GID_UNUSED_C_MAX,
@@ -172,7 +172,7 @@ mod tests {
             let op_result = server_txn.internal_create(vec![entry_init!(
                 (Attribute::Class, EntryClass::Account.to_value()),
                 (Attribute::Class, EntryClass::PosixAccount.to_value()),
-                (Attribute::Name, Value::new_iname("testperson_1")),
+                (Attribute::Spn, Value::new_iname("testperson_1")),
                 (Attribute::Uuid, Value::Uuid(user_a_uuid)),
                 (Attribute::Description, Value::new_utf8s("testperson")),
                 (Attribute::DisplayName, Value::new_utf8s("testperson"))
@@ -197,7 +197,7 @@ mod tests {
             let op_result = server_txn.internal_create(vec![entry_init!(
                 (Attribute::Class, EntryClass::Account.to_value()),
                 (Attribute::Class, EntryClass::PosixAccount.to_value()),
-                (Attribute::Name, Value::new_iname("testperson_2")),
+                (Attribute::Spn, Value::new_iname("testperson_2")),
                 (Attribute::Uuid, Value::Uuid(user_b_uuid)),
                 (Attribute::GidNumber, Value::Uint32(10001)),
                 (Attribute::Description, Value::new_utf8s("testperson")),

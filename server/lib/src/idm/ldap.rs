@@ -758,9 +758,10 @@ impl LdapServer {
         }
 
         error!(
-            "Failed to parse bind DN, no captures. Bind DN was {:?})",
-            dn
+            binddn = ?dn,
+            "Failed to parse bind DN - check the basedn and app attribute if present are correct. Examples: name=tobias,app=lounge,{} OR name=ellie,{} OR name=claire,app=table OR name=william ", self.basedn, self.basedn
         );
+
         Err(OperationError::NoMatchingEntries)
     }
 }
@@ -812,6 +813,7 @@ pub(crate) fn ldap_all_vattrs() -> Vec<String> {
         ATTR_UIDNUMBER.to_string(),
         ATTR_UID.to_string(),
         ATTR_GECOS.to_string(),
+        ATTR_HOME_DIRECTORY.to_string(),
     ]
 }
 
@@ -842,6 +844,7 @@ pub(crate) fn ldap_vattr_map(input: &str) -> Option<&str> {
         ATTR_OBJECTCLASS => Some(ATTR_CLASS),
         ATTR_LDAP_SSHPUBLICKEY => Some(ATTR_SSH_PUBLICKEY), // no-underscore -> underscore
         ATTR_UIDNUMBER => Some(ATTR_GIDNUMBER),             // yes this is intentional
+        ATTR_HOME_DIRECTORY => Some(ATTR_UUID),
         _ => None,
     }
 }
@@ -1119,8 +1122,10 @@ mod tests {
 
             let e3 = entry_init!(
                 (Attribute::Class, EntryClass::Object.to_value()),
+                (Attribute::Class, EntryClass::Account.to_value()),
                 (Attribute::Class, EntryClass::ServiceAccount.to_value()),
                 (Attribute::Class, EntryClass::Application.to_value()),
+                (Attribute::DisplayName, Value::new_utf8s("Application")),
                 (Attribute::Name, Value::new_iname(app_name)),
                 (Attribute::Uuid, Value::Uuid(app_uuid)),
                 (Attribute::LinkedGroup, Value::Refer(grp_uuid))
@@ -1184,6 +1189,7 @@ mod tests {
             let e1: Entry<EntryInit, EntryNew> = entry_init!(
                 (Attribute::Class, EntryClass::Object.to_value()),
                 (Attribute::Class, EntryClass::Account.to_value()),
+                (Attribute::Class, EntryClass::PosixAccount.to_value()),
                 (Attribute::Class, EntryClass::Person.to_value()),
                 (Attribute::Name, Value::new_iname(usr_name)),
                 (Attribute::Uuid, Value::Uuid(usr_uuid)),
@@ -1192,6 +1198,16 @@ mod tests {
 
             let ct = duration_from_epoch_now();
             let mut server_txn = idms.proxy_write(ct).await.unwrap();
+
+            // Add anonymous to the needed permission groups.
+            server_txn
+                .qs_write
+                .internal_modify_uuid(
+                    UUID_IDM_UNIX_AUTHENTICATION_READ,
+                    &ModifyList::new_append(Attribute::Member, Value::Refer(UUID_ANONYMOUS)),
+                )
+                .expect("Unable to modify UNIX_AUTHENTICATION_READ group");
+
             assert!(server_txn
                 .qs_write
                 .internal_create(vec![e1])
@@ -1209,7 +1225,7 @@ mod tests {
         // Searching a malformed spn shouldn't cause the query to fail
         let sr = SearchRequest {
             msgid: 1,
-            base: format!("dc=example,dc=com"),
+            base: "dc=example,dc=com".to_string(),
             scope: LdapSearchScope::Subtree,
             filter: LdapFilter::Or(vec![
                 LdapFilter::Equality(Attribute::Name.to_string(), usr_name.to_string()),
@@ -1232,7 +1248,7 @@ mod tests {
 
         let sr = SearchRequest {
             msgid: 1,
-            base: format!("dc=example,dc=com"),
+            base: "dc=example,dc=com".to_string(),
             scope: LdapSearchScope::Subtree,
             filter: LdapFilter::And(vec![
                 LdapFilter::Equality(Attribute::Name.to_string(), usr_name.to_string()),
@@ -1283,8 +1299,10 @@ mod tests {
 
             let e3 = entry_init!(
                 (Attribute::Class, EntryClass::Object.to_value()),
+                (Attribute::Class, EntryClass::Account.to_value()),
                 (Attribute::Class, EntryClass::ServiceAccount.to_value()),
                 (Attribute::Class, EntryClass::Application.to_value()),
+                (Attribute::DisplayName, Value::new_utf8s("Application")),
                 (Attribute::Name, Value::new_iname("testapp1")),
                 (Attribute::Uuid, Value::Uuid(app_uuid)),
                 (Attribute::LinkedGroup, Value::Refer(grp_uuid))
@@ -1334,7 +1352,7 @@ mod tests {
                 app_uuid,
                 "apppwd1".to_string(),
             );
-            pass1 = idms_prox_write
+            (pass1, _) = idms_prox_write
                 .generate_application_password(&ev)
                 .expect("Failed to generate application password");
 
@@ -1343,7 +1361,7 @@ mod tests {
                 app_uuid,
                 "apppwd2".to_string(),
             );
-            pass2 = idms_prox_write
+            (pass2, _) = idms_prox_write
                 .generate_application_password(&ev)
                 .expect("Failed to generate application password");
 
@@ -1356,7 +1374,7 @@ mod tests {
                 app_uuid,
                 "apppwd2".to_string(),
             );
-            pass3 = idms_prox_write
+            (pass3, _) = idms_prox_write
                 .generate_application_password(&ev)
                 .expect("Failed to generate application password");
             assert!(idms_prox_write.commit().is_ok());
@@ -1456,8 +1474,10 @@ mod tests {
 
             let e4 = entry_init!(
                 (Attribute::Class, EntryClass::Object.to_value()),
+                (Attribute::Class, EntryClass::Account.to_value()),
                 (Attribute::Class, EntryClass::ServiceAccount.to_value()),
                 (Attribute::Class, EntryClass::Application.to_value()),
+                (Attribute::DisplayName, Value::new_utf8s("Application")),
                 (Attribute::Name, Value::new_iname(app1_name)),
                 (Attribute::Uuid, Value::Uuid(app1_uuid)),
                 (Attribute::LinkedGroup, Value::Refer(grp1_uuid))
@@ -1465,8 +1485,10 @@ mod tests {
 
             let e5 = entry_init!(
                 (Attribute::Class, EntryClass::Object.to_value()),
+                (Attribute::Class, EntryClass::Account.to_value()),
                 (Attribute::Class, EntryClass::ServiceAccount.to_value()),
                 (Attribute::Class, EntryClass::Application.to_value()),
+                (Attribute::DisplayName, Value::new_utf8s("Application")),
                 (Attribute::Name, Value::new_iname(app2_name)),
                 (Attribute::Uuid, Value::Uuid(app2_uuid)),
                 (Attribute::LinkedGroup, Value::Refer(grp2_uuid))
@@ -1491,7 +1513,7 @@ mod tests {
                 app1_uuid,
                 "label".to_string(),
             );
-            pass_app1 = idms_prox_write
+            (pass_app1, _) = idms_prox_write
                 .generate_application_password(&ev)
                 .expect("Failed to generate application password");
 
@@ -1502,7 +1524,7 @@ mod tests {
                 app2_uuid,
                 "label".to_string(),
             );
-            pass_app2 = idms_prox_write
+            (pass_app2, _) = idms_prox_write
                 .generate_application_password(&ev)
                 .expect("Failed to generate application password");
 
@@ -1651,8 +1673,10 @@ mod tests {
 
             let e3 = entry_init!(
                 (Attribute::Class, EntryClass::Object.to_value()),
+                (Attribute::Class, EntryClass::Account.to_value()),
                 (Attribute::Class, EntryClass::ServiceAccount.to_value()),
                 (Attribute::Class, EntryClass::Application.to_value()),
+                (Attribute::DisplayName, Value::new_utf8s("Application")),
                 (Attribute::Name, Value::new_iname(app1_name)),
                 (Attribute::Uuid, Value::Uuid(app1_uuid)),
                 (Attribute::LinkedGroup, Value::Refer(grp1_uuid))
@@ -1673,7 +1697,7 @@ mod tests {
                 app1_uuid,
                 "label".to_string(),
             );
-            pass_app1 = idms_prox_write
+            (pass_app1, _) = idms_prox_write
                 .generate_application_password(&ev)
                 .expect("Failed to generate application password");
 
@@ -1780,6 +1804,16 @@ mod tests {
             );
 
             let mut server_txn = idms.proxy_write(duration_from_epoch_now()).await.unwrap();
+
+            // Add anonymous to the needed permission groups.
+            server_txn
+                .qs_write
+                .internal_modify_uuid(
+                    UUID_IDM_UNIX_AUTHENTICATION_READ,
+                    &ModifyList::new_append(Attribute::Member, Value::Refer(UUID_ANONYMOUS)),
+                )
+                .expect("Unable to modify UNIX_AUTHENTICATION_READ group");
+
             let ce = CreateEvent::new_internal(vec![e1]);
             assert!(server_txn
                 .qs_write
@@ -1860,6 +1894,10 @@ mod tests {
                     (Attribute::LoginShell, "/bin/zsh"),
                     (Attribute::SshPublicKey, ssh_ed25519),
                     (Attribute::EntryUuid, "cc8e95b4-c24f-4d68-ba54-8bed76f63930"),
+                    (
+                        Attribute::HomeDirectory,
+                        "/home/cc8e95b4-c24f-4d68-ba54-8bed76f63930"
+                    ),
                     (
                         Attribute::EntryDn,
                         "spn=testperson1@example.com,dc=example,dc=com"
@@ -1977,26 +2015,30 @@ mod tests {
                 (Attribute::LoginShell, Value::new_iutf8("/bin/zsh"))
             );
 
-            // Setup an access control for the service account to view mail attrs.
-
             let ct = duration_from_epoch_now();
 
             let mut server_txn = idms.proxy_write(ct).await.unwrap();
+
             let ce = CreateEvent::new_internal(vec![e1, e2]);
             assert!(server_txn.qs_write.create(&ce).is_ok());
 
-            // idm_people_read_priv
-            let me = ModifyEvent::new_internal_invalid(
-                filter!(f_eq(
-                    Attribute::Name,
-                    PartialValue::new_iname("idm_people_pii_read")
-                )),
-                ModifyList::new_list(vec![Modify::Present(
-                    Attribute::Member,
-                    Value::Refer(sa_uuid),
-                )]),
-            );
-            assert!(server_txn.qs_write.modify(&me).is_ok());
+            // Setup an access control for the service account to view mail attrs.
+            server_txn
+                .qs_write
+                .internal_modify_uuid(
+                    UUID_IDM_ACCOUNT_MAIL_READ,
+                    &ModifyList::new_append(Attribute::Member, Value::Refer(sa_uuid)),
+                )
+                .expect("Unable to modify UNIX_AUTHENTICATION_READ group");
+
+            // Allow anonymous to read basic posix attrs.
+            server_txn
+                .qs_write
+                .internal_modify_uuid(
+                    UUID_IDM_UNIX_AUTHENTICATION_READ,
+                    &ModifyList::new_append(Attribute::Member, Value::Refer(UUID_ANONYMOUS)),
+                )
+                .expect("Unable to modify UNIX_AUTHENTICATION_READ group");
 
             // Issue a token
             // make it purpose = ldap <- currently purpose isn't supported,
@@ -2165,6 +2207,7 @@ mod tests {
             let e1 = entry_init!(
                 (Attribute::Class, EntryClass::Person.to_value()),
                 (Attribute::Class, EntryClass::Account.to_value()),
+                (Attribute::Class, EntryClass::PosixAccount.to_value()),
                 (Attribute::Name, Value::new_iname("testperson1")),
                 (Attribute::Uuid, Value::Uuid(acct_uuid)),
                 (Attribute::Description, Value::new_utf8s("testperson1")),
@@ -2172,6 +2215,16 @@ mod tests {
             );
 
             let mut server_txn = idms.proxy_write(duration_from_epoch_now()).await.unwrap();
+
+            // Add anonymous to the needed permission groups.
+            server_txn
+                .qs_write
+                .internal_modify_uuid(
+                    UUID_IDM_UNIX_AUTHENTICATION_READ,
+                    &ModifyList::new_append(Attribute::Member, Value::Refer(UUID_ANONYMOUS)),
+                )
+                .expect("Unable to modify UNIX_AUTHENTICATION_READ group");
+
             assert!(server_txn
                 .qs_write
                 .internal_create(vec![e1])
@@ -2234,6 +2287,7 @@ mod tests {
             let e1 = entry_init!(
                 (Attribute::Class, EntryClass::Person.to_value()),
                 (Attribute::Class, EntryClass::Account.to_value()),
+                (Attribute::Class, EntryClass::PosixAccount.to_value()),
                 (Attribute::Name, Value::new_iname("testperson1")),
                 (Attribute::Uuid, Value::Uuid(acct_uuid)),
                 (Attribute::Description, Value::new_utf8s("testperson1")),
@@ -2241,6 +2295,16 @@ mod tests {
             );
 
             let mut server_txn = idms.proxy_write(duration_from_epoch_now()).await.unwrap();
+
+            // Add anonymous to the needed permission groups.
+            server_txn
+                .qs_write
+                .internal_modify_uuid(
+                    UUID_IDM_UNIX_AUTHENTICATION_READ,
+                    &ModifyList::new_append(Attribute::Member, Value::Refer(UUID_ANONYMOUS)),
+                )
+                .expect("Unable to modify UNIX_AUTHENTICATION_READ group");
+
             assert!(server_txn
                 .qs_write
                 .internal_create(vec![e1])
@@ -2429,6 +2493,16 @@ mod tests {
             );
 
             let mut server_txn = idms.proxy_write(duration_from_epoch_now()).await.unwrap();
+
+            // Add anonymous to the needed permission groups.
+            server_txn
+                .qs_write
+                .internal_modify_uuid(
+                    UUID_IDM_UNIX_AUTHENTICATION_READ,
+                    &ModifyList::new_append(Attribute::Member, Value::Refer(UUID_ANONYMOUS)),
+                )
+                .expect("Unable to modify UNIX_AUTHENTICATION_READ group");
+
             assert!(server_txn
                 .qs_write
                 .internal_create(vec![e1])
@@ -2537,6 +2611,16 @@ mod tests {
             );
 
             let mut server_txn = idms.proxy_write(duration_from_epoch_now()).await.unwrap();
+
+            // Add anonymous to the needed permission groups.
+            server_txn
+                .qs_write
+                .internal_modify_uuid(
+                    UUID_IDM_UNIX_AUTHENTICATION_READ,
+                    &ModifyList::new_append(Attribute::Member, Value::Refer(UUID_ANONYMOUS)),
+                )
+                .expect("Unable to modify UNIX_AUTHENTICATION_READ group");
+
             assert!(server_txn
                 .qs_write
                 .internal_create(vec![e1])
@@ -2693,8 +2777,10 @@ mod tests {
 
             let e3 = entry_init!(
                 (Attribute::Class, EntryClass::Object.to_value()),
+                (Attribute::Class, EntryClass::Account.to_value()),
                 (Attribute::Class, EntryClass::ServiceAccount.to_value()),
                 (Attribute::Class, EntryClass::Application.to_value()),
+                (Attribute::DisplayName, Value::new_utf8s("Application")),
                 (Attribute::Name, Value::new_iname(app_name)),
                 (Attribute::Uuid, Value::Uuid(app_uuid)),
                 (Attribute::LinkedGroup, Value::Refer(grp_uuid))

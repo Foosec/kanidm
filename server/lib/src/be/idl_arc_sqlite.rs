@@ -162,17 +162,6 @@ macro_rules! get_identry_raw {
     }};
 }
 
-// macro_rules! exists_idx {
-//     (
-//         $self:expr,
-//         $attr:expr,
-//         $itype:expr
-//     ) => {{
-//         // As a cache we have no concept of this, so we just bypass to the db.
-//         $self.db.exists_idx($attr, $itype)
-//     }};
-// }
-
 macro_rules! get_idl {
     (
         $self:expr,
@@ -1065,6 +1054,8 @@ impl IdlArcSqliteWriteTransaction<'_> {
             let sd_1 = mean + sd;
             (c, sd_1)
         } else if data.len() == 1 {
+            #[allow(clippy::indexing_slicing)]
+            // Bounds checked
             (1.0, data[0])
         } else {
             // Can't resolve.
@@ -1177,6 +1168,9 @@ impl IdlArcSqliteWriteTransaction<'_> {
     }
 
     pub fn create_idx(&mut self, attr: &Attribute, itype: IndexType) -> Result<(), OperationError> {
+        // TODO: Distinguish between in memory and db indexes
+        // and if there is an in memory one, create it here.
+
         self.db.create_idx(attr, itype)?;
 
         // Cache that this exists since we just made it.
@@ -1366,7 +1360,7 @@ impl IdlArcSqlite {
         self.name_cache.try_quiesce();
     }
 
-    pub fn read(&self) -> Result<IdlArcSqliteReadTransaction, OperationError> {
+    pub fn read(&self) -> Result<IdlArcSqliteReadTransaction<'_>, OperationError> {
         // IMPORTANT! Always take entrycache FIRST
         let entry_cache_read = self.entry_cache.read();
         let db_read = self.db.read()?;
@@ -1385,7 +1379,7 @@ impl IdlArcSqlite {
         })
     }
 
-    pub fn write(&self) -> Result<IdlArcSqliteWriteTransaction, OperationError> {
+    pub fn write(&self) -> Result<IdlArcSqliteWriteTransaction<'_>, OperationError> {
         // IMPORTANT! Always take entrycache FIRST
         let entry_cache_write = self.entry_cache.write();
         let db_write = self.db.write()?;

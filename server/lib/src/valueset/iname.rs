@@ -4,6 +4,7 @@ use crate::utils::trigraph_iter;
 use crate::valueset::ScimResolveStatus;
 use crate::valueset::{DbValueSetV2, ValueSet, ValueSetResolveStatus, ValueSetScimPut};
 use kanidm_proto::scim_v1::JsonValue;
+use std::cmp::Ordering;
 
 use std::collections::BTreeSet;
 
@@ -188,6 +189,15 @@ impl ValueSetT for ValueSetIname {
         }
     }
 
+    fn cmp(&self, other: &ValueSet) -> Ordering {
+        if let Some(other) = other.as_iname_set() {
+            self.set.cmp(other)
+        } else {
+            debug_assert!(false);
+            Ordering::Equal
+        }
+    }
+
     fn merge(&mut self, other: &ValueSet) -> Result<(), OperationError> {
         if let Some(b) = other.as_iname_set() {
             mergesets!(self.set, b)
@@ -226,9 +236,9 @@ mod tests {
     #[test]
     fn test_scim_iname() {
         let vs: ValueSet = ValueSetIname::new("stevo");
-        crate::valueset::scim_json_reflexive(vs.clone(), r#""stevo""#);
+        crate::valueset::scim_json_reflexive(&vs, r#""stevo""#);
 
         // Test that we can parse json values into a valueset.
-        crate::valueset::scim_json_put_reflexive::<ValueSetIname>(vs, &[])
+        crate::valueset::scim_json_put_reflexive::<ValueSetIname>(&vs, &[])
     }
 }

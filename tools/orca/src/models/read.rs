@@ -6,7 +6,7 @@ use crate::state::*;
 use kanidm_client::KanidmClient;
 
 use async_trait::async_trait;
-use rand::Rng;
+use rand::RngExt;
 use rand_chacha::ChaCha8Rng;
 
 use std::time::Duration;
@@ -25,7 +25,7 @@ impl ActorReader {
     pub fn new(mut cha_rng: ChaCha8Rng, warmup_time_ms: u64) -> Self {
         let max_backoff_time_in_ms = warmup_time_ms - 1000;
         let randomised_backoff_time =
-            Duration::from_millis(cha_rng.gen_range(0..max_backoff_time_in_ms));
+            Duration::from_millis(cha_rng.random_range(0..max_backoff_time_in_ms));
         ActorReader {
             state: State::Unauthenticated,
             randomised_backoff_time,
@@ -83,7 +83,7 @@ impl ActorReader {
         // Is this a design flaw? We probably need to know what the state was that we
         // requested to move to?
         match (&self.state, action, result) {
-            (State::Unauthenticated { .. }, TransitionAction::Login, TransitionResult::Ok) => {
+            (State::Unauthenticated, TransitionAction::Login, TransitionResult::Ok) => {
                 self.state = State::Authenticated;
             }
             (State::Authenticated, TransitionAction::ReadSelfMemberOf, TransitionResult::Ok) => {

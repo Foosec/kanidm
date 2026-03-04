@@ -1,3 +1,5 @@
+use std::io::Cursor;
+
 use image::codecs::jpeg::JpegDecoder;
 use image::ImageDecoder;
 use sketching::*;
@@ -26,10 +28,16 @@ pub fn has_trailer(contents: &Vec<u8>) -> Result<bool, ImageValidationError> {
 
     let mut pos = JPEG_MAGIC.len();
 
-    while pos < buf.len() {
+    while pos < buf.len() && pos + 4 < buf.len() {
+        // We assert pos and pos+4 are both in bounds during
+        // while iteration.
+        #[allow(clippy::indexing_slicing)]
         let marker = &buf[pos..pos + 2];
         pos += 2;
 
+        // pos was shifted by 2, so this is relative to +4 from
+        // where the loop started.
+        #[allow(clippy::indexing_slicing)]
         let segment_size_bytes: &[u8] = &buf[pos..pos + 2];
         let segment_size = u16::from_be_bytes(segment_size_bytes.try_into().map_err(|_| {
             ImageValidationError::InvalidImage("JPEG segment size bytes were invalid!".to_string())
@@ -42,19 +50,23 @@ pub fn has_trailer(contents: &Vec<u8>) -> Result<bool, ImageValidationError> {
         }
     }
 
-    // setting this to a big value so we can see if we don't find the EOI marker
-    let mut eoi_index = buf.len() * 2;
+    let mut eoi_index = 0;
+    let mut eoi_index_found = false;
     trace!("buffer length: {}", buf.len());
 
     // iterate through the file looking for the EOI_MAGIC bytes
-    for i in pos..=(buf.len() - EOI_MAGIC.len()) {
-        if buf[i..(i + EOI_MAGIC.len())] == EOI_MAGIC {
+
+    let buf_limit = buf.len() - EOI_MAGIC.len();
+
+    for i in pos..=buf_limit {
+        if buf.get(i..(i + EOI_MAGIC.len())) == Some(&EOI_MAGIC) {
+            eoi_index_found = true;
             eoi_index = i;
             break;
         }
     }
 
-    if eoi_index > buf.len() {
+    if !eoi_index_found {
         Err(ImageValidationError::InvalidImage(
             "End of image magic bytes not found in JPEG".to_string(),
         ))
@@ -79,14 +91,13 @@ pub fn has_trailer(contents: &Vec<u8>) -> Result<bool, ImageValidationError> {
 pub fn validate_decoding(
     filename: &str,
     contents: &[u8],
-    limits: image::io::Limits,
+    limits: image::Limits,
 ) -> Result<(), ImageValidationError> {
-    let mut decoder = match JpegDecoder::new(contents) {
+    let mut decoder = match JpegDecoder::new(Cursor::new(contents)) {
         Ok(val) => val,
         Err(err) => {
             return Err(ImageValidationError::InvalidImage(format!(
-                "Failed to parse {} as JPG: {:?}",
-                filename, err
+                "Failed to parse {filename} as JPG: {err:?}"
             )))
         }
     };

@@ -7,21 +7,26 @@ use crate::https::{
     ServerState,
 };
 use askama::Template;
+use askama_web::WebTemplate;
+
+use axum::http::HeaderMap;
 use axum::{
-    extract::State,
+    extract::{Query, State},
     response::{IntoResponse, Redirect, Response},
     Extension, Form, Json,
 };
 use axum_extra::extract::cookie::{CookieJar, SameSite};
+use hyper::Uri;
 use kanidm_proto::internal::{
-    COOKIE_AUTH_SESSION_ID, COOKIE_BEARER_TOKEN, COOKIE_CU_SESSION_TOKEN, COOKIE_OAUTH2_REQ,
-    COOKIE_USERNAME,
+    UserAuthToken, COOKIE_AUTH_SESSION_ID, COOKIE_BEARER_TOKEN, COOKIE_CU_SESSION_TOKEN,
+    COOKIE_OAUTH2_REQ, COOKIE_USERNAME,
 };
-use kanidm_proto::v1::{
-    AuthAllowed, AuthCredential, AuthIssueSession, AuthMech, AuthRequest, AuthStep,
+use kanidm_proto::{
+    oauth2::{AccessTokenRequest, AccessTokenResponse},
+    v1::{AuthAllowed, AuthIssueSession, AuthMech},
 };
+use kanidmd_lib::idm::authentication::{AuthCredential, AuthExternal, AuthState, AuthStep};
 use kanidmd_lib::idm::event::AuthResult;
-use kanidmd_lib::idm::AuthState;
 use kanidmd_lib::prelude::OperationError;
 use kanidmd_lib::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -91,7 +96,7 @@ pub struct LoginDisplayCtx {
     pub error: Option<LoginError>,
 }
 
-#[derive(Template)]
+#[derive(Template, WebTemplate)]
 #[template(path = "login.html")]
 struct LoginView {
     display_ctx: LoginDisplayCtx,
@@ -105,7 +110,7 @@ pub struct Mech<'a> {
     autofocus: bool,
 }
 
-#[derive(Template)]
+#[derive(Template, WebTemplate)]
 #[template(path = "login_mech_choose.html")]
 struct LoginMechView<'a> {
     display_ctx: LoginDisplayCtx,
@@ -119,7 +124,7 @@ enum LoginTotpError {
     Syntax,
 }
 
-#[derive(Template)]
+#[derive(Template, WebTemplate)]
 #[template(path = "login_totp.html")]
 struct LoginTotpView {
     display_ctx: LoginDisplayCtx,
@@ -127,20 +132,20 @@ struct LoginTotpView {
     errors: LoginTotpError,
 }
 
-#[derive(Template)]
+#[derive(Template, WebTemplate)]
 #[template(path = "login_password.html")]
 struct LoginPasswordView {
     display_ctx: LoginDisplayCtx,
     password: String,
 }
 
-#[derive(Template)]
+#[derive(Template, WebTemplate)]
 #[template(path = "login_backupcode.html")]
 struct LoginBackupCodeView {
     display_ctx: LoginDisplayCtx,
 }
 
-#[derive(Template)]
+#[derive(Template, WebTemplate)]
 #[template(path = "login_webauthn.html")]
 struct LoginWebauthnView {
     display_ctx: LoginDisplayCtx,
@@ -150,7 +155,7 @@ struct LoginWebauthnView {
     chal: String,
 }
 
-#[derive(Template)]
+#[derive(Template, WebTemplate)]
 #[template(path = "login_denied.html")]
 struct LoginDeniedView {
     display_ctx: LoginDisplayCtx,
@@ -187,6 +192,39 @@ pub async fn view_logout_get(
     jar = cookies::destroy(jar, COOKIE_CU_SESSION_TOKEN, &state);
 
     (jar, response).into_response()
+}
+
+pub async fn view_reauth_to_referer_get(
+    State(state): State<ServerState>,
+    VerifiedClientInformation(client_auth_info): VerifiedClientInformation,
+    DomainInfo(domain_info): DomainInfo,
+    Extension(kopid): Extension<KOpId>,
+    headers: HeaderMap,
+    jar: CookieJar,
+) -> Result<Response, HtmxError> {
+    let uat: &UserAuthToken = client_auth_info
+        .pre_validated_uat()
+        .map_err(|op_err| HtmxError::new(&kopid, op_err, domain_info.clone()))?;
+
+    let referer = headers.get("Referer").and_then(|hv| hv.to_str().ok());
+
+    let redirect = referer.and_then(|some_referer| Uri::from_str(some_referer).ok());
+    let redirect = redirect
+        .as_ref()
+        .map(|uri| uri.path())
+        .unwrap_or(Urls::Apps.as_ref());
+
+    let display_ctx = LoginDisplayCtx {
+        domain_info,
+        oauth2: None,
+        reauth: Some(Reauth {
+            username: uat.spn.clone(),
+            purpose: ReauthPurpose::ProfileSettings,
+        }),
+        error: None,
+    };
+
+    Ok(view_reauth_get(state, client_auth_info, kopid, jar, redirect, display_ctx).await)
 }
 
 pub async fn view_reauth_get(
@@ -404,12 +442,10 @@ pub async fn view_login_begin_post(
         .qe_r_ref
         .handle_auth(
             None,
-            AuthRequest {
-                step: AuthStep::Init2 {
-                    username: username.clone(),
-                    issue: AuthIssueSession::Cookie,
-                    privileged: false,
-                },
+            AuthStep::Init2 {
+                username: username.clone(),
+                issue: AuthIssueSession::Cookie,
+                privileged: false,
             },
             kopid.eventid,
             client_auth_info.clone(),
@@ -504,9 +540,7 @@ pub async fn view_login_mech_choose_post(
         .qe_r_ref
         .handle_auth(
             session_context.id,
-            AuthRequest {
-                step: AuthStep::Begin(mech),
-            },
+            AuthStep::Begin(mech),
             kopid.eventid,
             client_auth_info.clone(),
         )
@@ -691,6 +725,32 @@ pub async fn view_login_seckey_post(
     credential_step(state, kopid, jar, client_auth_info, auth_cred, domain_info).await
 }
 
+#[derive(Deserialize)]
+pub struct Oauth2AuthorisationResponse {
+    code: String,
+    state: Option<String>,
+}
+
+pub async fn view_login_oauth2_landing(
+    State(app_state): State<ServerState>,
+    Extension(kopid): Extension<KOpId>,
+    VerifiedClientInformation(client_auth_info): VerifiedClientInformation,
+    DomainInfo(domain_info): DomainInfo,
+    jar: CookieJar,
+    Query(Oauth2AuthorisationResponse { code, state }): Query<Oauth2AuthorisationResponse>,
+) -> Response {
+    let auth_cred = AuthCredential::OAuth2AuthorisationResponse { code, state };
+    credential_step(
+        app_state,
+        kopid,
+        jar,
+        client_auth_info,
+        auth_cred,
+        domain_info,
+    )
+    .await
+}
+
 async fn credential_step(
     state: ServerState,
     kopid: KOpId,
@@ -714,9 +774,7 @@ async fn credential_step(
         .qe_r_ref
         .handle_auth(
             session_context.id,
-            AuthRequest {
-                step: AuthStep::Cred(auth_cred),
-            },
+            AuthStep::Cred(auth_cred),
             kopid.eventid,
             client_auth_info.clone(),
         )
@@ -773,7 +831,7 @@ async fn view_login_step(
     } = auth_result;
     session_context.id = Some(sessionid);
 
-    // This lets us break out the loop incase of a fault. Take that halting problem!
+    // This lets us break out the loop in case of a fault. Take that halting problem!
     let mut safety = 3;
 
     // Unlike the api version, only set the cookie.
@@ -804,15 +862,15 @@ async fn view_login_step(
                         .into_response()
                     }
                     1 => {
+                        #[allow(clippy::indexing_slicing)]
+                        // Length checked correctly.
                         let mech = allowed[0].clone();
                         // submit the choice and then loop updating our auth_state.
                         let inter = state // This may change in the future ...
                             .qe_r_ref
                             .handle_auth(
                                 Some(sessionid),
-                                AuthRequest {
-                                    step: AuthStep::Begin(mech),
-                                },
+                                AuthStep::Begin(mech),
                                 kopid.eventid,
                                 client_auth_info.clone(),
                             )
@@ -865,6 +923,8 @@ async fn view_login_step(
                         .into_response()
                     }
                     1 => {
+                        #[allow(clippy::indexing_slicing)]
+                        // Length checked correctly.
                         let auth_allowed = allowed[0].clone();
 
                         match auth_allowed {
@@ -915,6 +975,58 @@ async fn view_login_step(
                 // break acts as return in a loop.
                 break res;
             }
+            AuthState::External(external) => {
+                debug!("🧩 -> AuthState::External");
+                match external {
+                    AuthExternal::OAuth2AuthorisationRequest {
+                        mut authorisation_url,
+                        request,
+                    } => {
+                        // Encode the request
+                        let Ok(encoded) = serde_urlencoded::to_string(&request) else {
+                            error!("Unable to encode request, THIS IS A BUG!!!");
+                            debug!(?request);
+                            return Err(OperationError::InvalidState);
+                        };
+
+                        authorisation_url.set_query(Some(&encoded));
+
+                        let res = Redirect::to(authorisation_url.as_str()).into_response();
+                        break res;
+                    }
+                    AuthExternal::OAuth2AccessTokenRequest {
+                        token_url,
+                        client_id,
+                        client_secret,
+                        request,
+                    } => {
+                        let response = submit_access_token_request(
+                            token_url,
+                            client_id,
+                            client_secret,
+                            request,
+                        )
+                        .await?;
+
+                        let auth_cred = AuthCredential::OAuth2AccessTokenResponse { response };
+
+                        // submit the choice and then loop updating our auth_state.
+                        let inter = state // This may change in the future ...
+                            .qe_r_ref
+                            .handle_auth(
+                                Some(sessionid),
+                                AuthStep::Cred(auth_cred),
+                                kopid.eventid,
+                                client_auth_info.clone(),
+                            )
+                            .await?;
+
+                        // Set the state now for the next loop.
+                        auth_state = inter.state;
+                        continue;
+                    }
+                }
+            }
             AuthState::Success(token, issue) => {
                 debug!("🧩 -> AuthState::Success");
 
@@ -947,7 +1059,7 @@ async fn view_login_step(
                             username_cookie.make_permanent();
                             jar.add(username_cookie)
                         } else {
-                            jar
+                            cookies::destroy(jar, COOKIE_USERNAME, &state)
                         };
 
                         jar = jar.add(bearer_cookie);
@@ -984,6 +1096,51 @@ async fn view_login_step(
     Ok((jar, response).into_response())
 }
 
+async fn submit_access_token_request(
+    token_url: Url,
+    client_id: String,
+    client_secret: String,
+    request: AccessTokenRequest,
+) -> Result<AccessTokenResponse, OperationError> {
+    // Setup a client and post the req.
+    // TODO: Lots of settings we need to be able to configure here,
+    // but for a proof of concept defaults are okay.
+    //
+    // We would probably move the client into the auth server state
+    // if anything.
+    let client = reqwest::ClientBuilder::new().build().map_err(|err| {
+        error!(?err, "Invalid oauth2 http client builder parameters");
+        OperationError::InvalidState
+    })?;
+
+    let res = client
+        .post(token_url.as_str())
+        .basic_auth(&client_id, Some(client_secret))
+        .form(&request)
+        .send()
+        .await
+        .map_err(|err| {
+            error!(
+                ?err,
+                ?token_url,
+                ?client_id,
+                "Unable to submit access token request"
+            );
+            OperationError::InvalidState
+        })?;
+
+    // Now depending on the result we have to choose how to proceed.
+    if res.status() == reqwest::StatusCode::OK {
+        res.json::<AccessTokenResponse>().await.map_err(|err| {
+            error!(?err, "response was not a valid JSON access token response");
+            OperationError::InvalidState
+        })
+    } else {
+        error!(status = ?res.status(), "access token request failed");
+        Err(OperationError::InvalidState)
+    }
+}
+
 fn add_session_cookie(
     state: &ServerState,
     jar: CookieJar,
@@ -991,8 +1148,8 @@ fn add_session_cookie(
 ) -> Result<CookieJar, OperationError> {
     cookies::make_signed(state, COOKIE_AUTH_SESSION_ID, session_context)
         .map(|mut cookie| {
-            // Not needed when redirecting into this site
-            cookie.set_same_site(SameSite::Strict);
+            // Needs to be lax now for when we come back from an oauth2 trust
+            cookie.set_same_site(SameSite::Lax);
             jar.add(cookie)
         })
         .ok_or(OperationError::InvalidSessionState)

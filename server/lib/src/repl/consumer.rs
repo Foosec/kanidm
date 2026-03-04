@@ -1,7 +1,7 @@
 use super::proto::*;
 use crate::plugins::Plugins;
 use crate::prelude::*;
-use crate::server::ChangeFlag;
+use crate::server::{ChangeFlag, ServerPhase};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -34,9 +34,8 @@ impl QueryServerWriteTransaction<'_> {
             EntryIncrementalNew::rehydrate
         )
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| {
-            error!(err = ?e, "Unable to process replication incremental entries to valid entry states for replication");
-            e
+        .inspect_err(|err| {
+            error!(?err, "Unable to process replication incremental entries to valid entry states for replication");
         })?;
 
         trace!(?ctx_entries);
@@ -54,7 +53,8 @@ impl QueryServerWriteTransaction<'_> {
         // need to be pushed to a separate list where they are then "created"
         // as a conflict.
 
-        // First find if entries are in a conflict state.
+        // First find if entries are in a conflict state. Remember, these conflicts are purely
+        // UUID creation conflicts at this phase in the process.
 
         let (conflicts, proceed): (Vec<_>, Vec<_>) = ctx_entries
             .iter()
@@ -262,6 +262,24 @@ impl QueryServerWriteTransaction<'_> {
             self.changed_flags.insert(ChangeFlag::OAUTH2)
         }
 
+        if !self.changed_flags.contains(ChangeFlag::OAUTH2_CLIENT)
+            && cand
+                .iter()
+                .chain(pre_cand.iter().map(|e| e.as_ref()))
+                .any(|e| e.attribute_equality(Attribute::Class, &EntryClass::OAuth2Client.into()))
+        {
+            self.changed_flags.insert(ChangeFlag::OAUTH2_CLIENT)
+        }
+
+        if !self.changed_flags.contains(ChangeFlag::FEATURE)
+            && cand
+                .iter()
+                .chain(pre_cand.iter().map(|e| e.as_ref()))
+                .any(|e| e.attribute_equality(Attribute::Class, &EntryClass::Feature.into()))
+        {
+            self.changed_flags.insert(ChangeFlag::FEATURE)
+        }
+
         if !self.changed_flags.contains(ChangeFlag::APPLICATION)
             && cand
                 .iter()
@@ -310,7 +328,7 @@ impl QueryServerWriteTransaction<'_> {
                 Ok(ConsumerState::RefreshRequired)
             }
             ReplIncrementalContext::NoChangesAvailable => {
-                info!("no changes are available");
+                debug!("no changes are available");
                 Ok(ConsumerState::Ok)
             }
             ReplIncrementalContext::RefreshRequired => {
@@ -335,7 +353,7 @@ impl QueryServerWriteTransaction<'_> {
                 domain_version,
                 domain_patch_level,
                 domain_uuid,
-                ranges,
+                &ranges,
                 schema_entries,
                 meta_entries,
                 entries,
@@ -349,16 +367,16 @@ impl QueryServerWriteTransaction<'_> {
         ctx_domain_version: DomainVersion,
         ctx_domain_patch_level: u32,
         ctx_domain_uuid: Uuid,
-        ctx_ranges: BTreeMap<Uuid, ReplAnchoredCidRange>,
+        ctx_ranges: &BTreeMap<Uuid, ReplAnchoredCidRange>,
         ctx_schema_entries: Vec<ReplIncrementalEntryV1>,
         ctx_meta_entries: Vec<ReplIncrementalEntryV1>,
         ctx_entries: Vec<ReplIncrementalEntryV1>,
     ) -> Result<ConsumerState, OperationError> {
-        if ctx_domain_version < DOMAIN_MIN_LEVEL {
-            error!("Unable to proceed with consumer incremental - incoming domain level is lower than our minimum supported level. {} < {}", ctx_domain_version, DOMAIN_MIN_LEVEL);
+        if ctx_domain_version < DOMAIN_MINIMUM_REPLICATION_LEVEL {
+            error!("Unable to proceed with consumer incremental - incoming domain level is lower than our minimum supported level. {} < {}", ctx_domain_version, DOMAIN_MINIMUM_REPLICATION_LEVEL);
             return Err(OperationError::ReplDomainLevelUnsatisfiable);
-        } else if ctx_domain_version > DOMAIN_MAX_LEVEL {
-            error!("Unable to proceed with consumer incremental - incoming domain level is greater than our maximum supported level. {} > {}", ctx_domain_version, DOMAIN_MAX_LEVEL);
+        } else if ctx_domain_version > DOMAIN_MAXIMUM_REPLICATION_LEVEL {
+            error!("Unable to proceed with consumer incremental - incoming domain level is greater than our maximum supported level. {} > {}", ctx_domain_version, DOMAIN_MAXIMUM_REPLICATION_LEVEL);
             return Err(OperationError::ReplDomainLevelUnsatisfiable);
         };
 
@@ -385,7 +403,9 @@ impl QueryServerWriteTransaction<'_> {
         let txn_cid = self.get_cid().clone();
         let ruv = self.be_txn.get_ruv_write();
 
-        ruv.incremental_preflight_validate_ruv(&ctx_ranges, &txn_cid)
+        let change_count = ctx_schema_entries.len() + ctx_meta_entries.len() + ctx_entries.len();
+
+        ruv.incremental_preflight_validate_ruv(ctx_ranges, &txn_cid)
             .inspect_err(|err| {
                 error!(
                     ?err,
@@ -394,14 +414,13 @@ impl QueryServerWriteTransaction<'_> {
             })?;
 
         // == ⚠️  Below this point we begin to make changes! ==
-        info!(
-            "Proceeding to apply incremental from domain {:?} at level {}",
-            ctx_domain_uuid, ctx_domain_version
+        debug!(
+            "Proceeding to apply incremental with {change_count} changes from domain {ctx_domain_uuid:?} at level {ctx_domain_version}"
         );
 
         debug!(?ctx_ranges);
 
-        debug!("Applying schema entries");
+        debug!("Applying {} schema entries", ctx_schema_entries.len());
         // Apply the schema entries first.
         let schema_changed = self
             .consumer_incremental_apply_entries(ctx_schema_entries)
@@ -416,7 +435,7 @@ impl QueryServerWriteTransaction<'_> {
             })?;
         }
 
-        debug!("Applying meta entries");
+        debug!("Applying {} meta entries", ctx_meta_entries.len());
         // Apply meta entries now.
         let meta_changed = self
             .consumer_incremental_apply_entries(ctx_meta_entries)
@@ -434,7 +453,7 @@ impl QueryServerWriteTransaction<'_> {
             })?;
         }
 
-        debug!("Applying all context entries");
+        debug!("Applying {} context entries", ctx_entries.len());
         // Update all other entries now.
         self.consumer_incremental_apply_entries(ctx_entries)
             .inspect_err(|err| {
@@ -457,11 +476,11 @@ impl QueryServerWriteTransaction<'_> {
         // context. Note that we get this in a writeable form!
         let ruv = self.be_txn.get_ruv_write();
 
-        ruv.refresh_validate_ruv(&ctx_ranges).inspect_err(|err| {
+        ruv.refresh_validate_ruv(ctx_ranges).inspect_err(|err| {
             error!(?err, "RUV ranges were not rebuilt correctly.");
         })?;
 
-        ruv.refresh_update_ruv(&ctx_ranges).inspect_err(|err| {
+        ruv.refresh_update_ruv(ctx_ranges).inspect_err(|err| {
             error!(?err, "Unable to update RUV with supplier ranges.");
         })?;
 
@@ -485,7 +504,7 @@ impl QueryServerWriteTransaction<'_> {
                 domain_version,
                 domain_devel,
                 domain_uuid,
-                ranges,
+                &ranges,
                 schema_entries,
                 meta_entries,
                 entries,
@@ -548,13 +567,13 @@ impl QueryServerWriteTransaction<'_> {
         Ok(())
     }
 
-    #[instrument(level = "debug", skip_all)]
+    #[instrument(level = "info", skip_all)]
     fn consumer_apply_refresh_v1(
         &mut self,
         ctx_domain_version: DomainVersion,
         ctx_domain_devel: bool,
         ctx_domain_uuid: Uuid,
-        ctx_ranges: BTreeMap<Uuid, ReplAnchoredCidRange>,
+        ctx_ranges: &BTreeMap<Uuid, ReplAnchoredCidRange>,
         ctx_schema_entries: Vec<ReplEntryV1>,
         ctx_meta_entries: Vec<ReplEntryV1>,
         ctx_entries: Vec<ReplEntryV1>,
@@ -563,11 +582,11 @@ impl QueryServerWriteTransaction<'_> {
         // if domain_version >= min_support ...
         let current_devel_flag = option_env!("KANIDM_PRE_RELEASE").is_some();
 
-        if ctx_domain_version < DOMAIN_MIN_LEVEL {
-            error!("Unable to proceed with consumer refresh - incoming domain level is lower than our minimum supported level. {} < {}", ctx_domain_version, DOMAIN_MIN_LEVEL);
+        if ctx_domain_version < DOMAIN_MINIMUM_REPLICATION_LEVEL {
+            error!("Unable to proceed with consumer refresh - incoming domain level is lower than our minimum supported level. {} < {}", ctx_domain_version, DOMAIN_MINIMUM_REPLICATION_LEVEL);
             return Err(OperationError::ReplDomainLevelUnsatisfiable);
-        } else if ctx_domain_version > DOMAIN_MAX_LEVEL {
-            error!("Unable to proceed with consumer refresh - incoming domain level is greater than our maximum supported level. {} > {}", ctx_domain_version, DOMAIN_MAX_LEVEL);
+        } else if ctx_domain_version > DOMAIN_MAXIMUM_REPLICATION_LEVEL {
+            error!("Unable to proceed with consumer refresh - incoming domain level is greater than our maximum supported level. {} > {}", ctx_domain_version, DOMAIN_MAXIMUM_REPLICATION_LEVEL);
             return Err(OperationError::ReplDomainLevelUnsatisfiable);
         } else if ctx_domain_devel && !current_devel_flag {
             error!("Unable to proceed with consumer refresh - incoming domain is from a development version while this server is a stable release.");
@@ -583,6 +602,7 @@ impl QueryServerWriteTransaction<'_> {
         };
 
         // == ⚠️  Below this point we begin to make changes! ==
+        self.set_phase_bootstrap();
 
         // Update the d_uuid. This is what defines us as being part of this repl topology!
         self.be_txn
@@ -597,7 +617,6 @@ impl QueryServerWriteTransaction<'_> {
         self.reset_server_uuid()?;
 
         // Delete all entries - *proper delete, not just tombstone!*
-
         self.be_txn
             .danger_delete_all_db_content()
             .inspect_err(|err| {
@@ -607,6 +626,12 @@ impl QueryServerWriteTransaction<'_> {
         // Reset this transactions schema to a completely clean slate.
         self.schema.generate_in_memory().inspect_err(|err| {
             error!(?err, "Failed to reset in memory schema to clean state");
+        })?;
+
+        // Reindex now to force some basic indexes to exist as we consume the schema
+        // from our replica.
+        self.reindex(false).inspect_err(|err| {
+            error!(?err, "Failed to reload schema");
         })?;
 
         // Apply the schema entries first. This is the foundation that everything
@@ -620,6 +645,9 @@ impl QueryServerWriteTransaction<'_> {
         self.reload_schema().inspect_err(|err| {
             error!(?err, "Failed to reload schema");
         })?;
+
+        // Schema is now ready
+        self.set_phase(ServerPhase::SchemaReady);
 
         // We have to reindex to force all the existing indexes to be dumped
         // and recreated before we start to import.
@@ -645,6 +673,8 @@ impl QueryServerWriteTransaction<'_> {
             ChangeFlag::SCHEMA
                 | ChangeFlag::ACP
                 | ChangeFlag::OAUTH2
+                | ChangeFlag::OAUTH2_CLIENT
+                | ChangeFlag::FEATURE
                 | ChangeFlag::DOMAIN
                 | ChangeFlag::APPLICATION
                 | ChangeFlag::SYSTEM_CONFIG
@@ -652,7 +682,10 @@ impl QueryServerWriteTransaction<'_> {
                 | ChangeFlag::KEY_MATERIAL,
         );
 
-        // That's it! We are GOOD to go!
+        // Domain info is now ready.
+        self.set_phase(ServerPhase::DomainInfoReady);
+
+        // ==== That's it! We are GOOD to go! ====
 
         // Create all the entries. Note we don't hit plugins here beside post repl plugs.
         self.consumer_refresh_create_entries(ctx_entries)
@@ -664,13 +697,16 @@ impl QueryServerWriteTransaction<'_> {
         // context. Note that we get this in a writeable form!
         let ruv = self.be_txn.get_ruv_write();
 
-        ruv.refresh_validate_ruv(&ctx_ranges).inspect_err(|err| {
+        ruv.refresh_validate_ruv(ctx_ranges).inspect_err(|err| {
             error!(?err, "RUV ranges were not rebuilt correctly.");
         })?;
 
-        ruv.refresh_update_ruv(&ctx_ranges).inspect_err(|err| {
+        ruv.refresh_update_ruv(ctx_ranges).inspect_err(|err| {
             error!(?err, "Unable to update RUV with supplier ranges.");
         })?;
+
+        // Refresh complete
+        self.set_phase(ServerPhase::Running);
 
         Ok(())
     }

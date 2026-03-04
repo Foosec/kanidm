@@ -7,6 +7,7 @@ use crate::valueset::{ValueSet, ValueSetIutf8};
 pub use kanidm_proto::attribute::Attribute;
 use kanidm_proto::constants::*;
 use kanidm_proto::scim_v1::JsonValue;
+use kanidm_proto::scim_v1::ScimFilter;
 
 //TODO: This would do well in the proto lib
 // together with all the other definitions.
@@ -26,6 +27,7 @@ pub enum EntryClass {
     Account,
     AccountPolicy,
     Application,
+    AssertionNonce,
     AttributeType,
     Builtin,
     Class,
@@ -35,20 +37,28 @@ pub enum EntryClass {
     DomainInfo,
     DynGroup,
     ExtensibleObject,
+    Feature,
     Group,
     KeyProvider,
     KeyProviderInternal,
     KeyObject,
+    KeyObjectHkdfS256,
     KeyObjectJwtEs256,
+    KeyObjectJwtHs256,
+    KeyObjectJwtRs256,
     KeyObjectJweA128GCM,
     KeyObjectInternal,
     MemberOf,
+    Memorial,
+    OAuth2Account,
+    OAuth2DeviceCodeSession,
     OAuth2ResourceServer,
     OAuth2ResourceServerBasic,
     OAuth2ResourceServerPublic,
-    OAuth2DeviceCodeSession,
+    OAuth2Client,
     Object,
     OrgPerson,
+    OutboundMessage,
     Person,
     PosixAccount,
     PosixGroup,
@@ -66,6 +76,12 @@ pub enum EntryClass {
     TestClass,
 }
 
+impl From<EntryClass> for ScimFilter {
+    fn from(ec: EntryClass) -> Self {
+        ScimFilter::Equal(Attribute::Class.into(), ec.into())
+    }
+}
+
 impl From<EntryClass> for &'static str {
     fn from(val: EntryClass) -> Self {
         match val {
@@ -80,6 +96,7 @@ impl From<EntryClass> for &'static str {
             EntryClass::Account => ENTRYCLASS_ACCOUNT,
             EntryClass::AccountPolicy => ENTRYCLASS_ACCOUNT_POLICY,
             EntryClass::Application => ENTRYCLASS_APPLICATION,
+            EntryClass::AssertionNonce => ENTRYCLASS_ASSERTION_NONCE,
             EntryClass::AttributeType => ENTRYCLASS_ATTRIBUTE_TYPE,
             EntryClass::Builtin => ENTRYCLASS_BUILTIN,
             EntryClass::Class => ENTRYCLASS_CLASS,
@@ -89,20 +106,28 @@ impl From<EntryClass> for &'static str {
             EntryClass::DomainInfo => ENTRYCLASS_DOMAIN_INFO,
             EntryClass::DynGroup => ENTRYCLASS_DYN_GROUP,
             EntryClass::ExtensibleObject => ENTRYCLASS_EXTENSIBLE_OBJECT,
+            EntryClass::Feature => ENTRYCLASS_FEATURE,
             EntryClass::Group => ENTRYCLASS_GROUP,
             EntryClass::KeyProvider => ENTRYCLASS_KEY_PROVIDER,
             EntryClass::KeyProviderInternal => ENTRYCLASS_KEY_PROVIDER_INTERNAL,
             EntryClass::KeyObject => ENTRYCLASS_KEY_OBJECT,
+            EntryClass::KeyObjectHkdfS256 => ENTRYCLASS_KEY_OBJECT_HKDF_S256,
             EntryClass::KeyObjectJwtEs256 => ENTRYCLASS_KEY_OBJECT_JWT_ES256,
+            EntryClass::KeyObjectJwtHs256 => ENTRYCLASS_KEY_OBJECT_JWT_HS256,
+            EntryClass::KeyObjectJwtRs256 => ENTRYCLASS_KEY_OBJECT_JWT_RS256,
             EntryClass::KeyObjectJweA128GCM => ENTRYCLASS_KEY_OBJECT_JWE_A128GCM,
             EntryClass::KeyObjectInternal => ENTRYCLASS_KEY_OBJECT_INTERNAL,
             EntryClass::MemberOf => ENTRYCLASS_MEMBER_OF,
+            EntryClass::Memorial => ENTRYCLASS_MEMORIAL,
+            EntryClass::OAuth2Account => ENTRYCLASS_OAUTH2_ACCOUNT,
+            EntryClass::OAuth2Client => ENTRYCLASS_OAUTH2_CLIENT,
             EntryClass::OAuth2DeviceCodeSession => OAUTH2_DEVICE_CODE_SESSION,
             EntryClass::OAuth2ResourceServer => OAUTH2_RESOURCE_SERVER,
             EntryClass::OAuth2ResourceServerBasic => OAUTH2_RESOURCE_SERVER_BASIC,
             EntryClass::OAuth2ResourceServerPublic => OAUTH2_RESOURCE_SERVER_PUBLIC,
             EntryClass::Object => ENTRYCLASS_OBJECT,
             EntryClass::OrgPerson => ENTRYCLASS_ORG_PERSON,
+            EntryClass::OutboundMessage => ENTRYCLASS_OUTBOUND_MESSAGE,
             EntryClass::Person => ENTRYCLASS_PERSON,
             EntryClass::PosixAccount => ENTRYCLASS_POSIX_ACCOUNT,
             EntryClass::PosixGroup => ENTRYCLASS_POSIX_GROUP,
@@ -168,7 +193,7 @@ impl From<EntryClass> for crate::prelude::AttrString {
 impl Display for EntryClass {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> std::fmt::Result {
         let s: String = (*self).into();
-        write!(f, "{}", s)
+        write!(f, "{s}")
     }
 }
 
@@ -196,11 +221,13 @@ impl EntryClass {
 
 // ============ TEST DATA ============
 #[cfg(test)]
-use crate::entry::{Entry, EntryInit, EntryInitNew, EntryNew};
+use crate::entry::{entry_init_fn, EntryInitNew};
+#[cfg(test)]
+use std::sync::LazyLock;
 
 #[cfg(test)]
-lazy_static! {
-    pub static ref E_TESTPERSON_1: EntryInitNew = entry_init!(
+pub static E_TESTPERSON_1: LazyLock<EntryInitNew> = LazyLock::new(|| {
+    entry_init_fn([
         (Attribute::Class, EntryClass::Object.to_value()),
         (Attribute::Class, EntryClass::Account.to_value()),
         (Attribute::Class, EntryClass::Person.to_value()),
@@ -208,10 +235,13 @@ lazy_static! {
         (Attribute::DisplayName, Value::new_utf8s("Test Person 1")),
         (
             Attribute::Uuid,
-            Value::Uuid(super::uuids::UUID_TESTPERSON_1)
-        )
-    );
-    pub static ref E_TESTPERSON_2: EntryInitNew = entry_init!(
+            Value::Uuid(super::uuids::UUID_TESTPERSON_1),
+        ),
+    ])
+});
+#[cfg(test)]
+pub static E_TESTPERSON_2: LazyLock<EntryInitNew> = LazyLock::new(|| {
+    entry_init_fn([
         (Attribute::Class, EntryClass::Object.to_value()),
         (Attribute::Class, EntryClass::Account.to_value()),
         (Attribute::Class, EntryClass::Person.to_value()),
@@ -219,7 +249,7 @@ lazy_static! {
         (Attribute::DisplayName, Value::new_utf8s("Test Person 2")),
         (
             Attribute::Uuid,
-            Value::Uuid(super::uuids::UUID_TESTPERSON_2)
-        )
-    );
-}
+            Value::Uuid(super::uuids::UUID_TESTPERSON_2),
+        ),
+    ])
+});

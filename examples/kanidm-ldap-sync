@@ -10,6 +10,8 @@ sync_token = "eyJhb..."
 
 # If you want to monitor the status of the scheduled sync tool (you should)
 # then you can set a bind address here.
+# Example: If set to e.g. "[::1]:12345", status can be retrieved with netcat "nc ::1 12345".
+# Returns "Ok" or "Err".
 #
 # If not set, defaults to no status listener.
 # status_bind = ""
@@ -20,6 +22,11 @@ sync_token = "eyJhb..."
 ldap_uri = "ldaps://specific-server.ldap.kanidm.com"
 # Path to the LDAP CA certificate in PEM format.
 ldap_ca = "/path/to/kanidm-ldap-ca.pem"
+
+# In some cases you may need to disable TLS certificate validation. This is not secure
+# and you should always opt to have certificate validation if possible.
+# ldap_verify_ca = true
+
 # The DN of an account with content sync rights. On 389-ds, by default cn=Directory Manager has
 # this access. On OpenLDAP you must grant this access.
 ldap_sync_dn = "cn=Directory Manager"
@@ -51,7 +58,7 @@ ldap_filter = "(|(objectclass=person)(objectclass=posixgroup))"
 #
 # person_attr_user_name = "uid"
 # person_attr_display_name = "cn"
-# person_attr_gidnumber = = "uidnumber"
+# person_attr_gidnumber = "uidnumber"
 # person_attr_login_shell = "loginshell"
 # person_attr_password = "userpassword"
 
@@ -76,7 +83,7 @@ ldap_filter = "(|(objectclass=person)(objectclass=posixgroup))"
 
 # The sync tool can alter or exclude entries. These are mapped by their syncuuid
 # The syncuuid is derived from nsUniqueId in 389-ds. It is the entryUUID for OpenLDAP
-# This is chosen oven DN because DN's can change with modrdn where nsUniqueId/entryUUID is
+# This is chosen over DN because DN's can change with modrdn where nsUniqueId/entryUUID is
 # immutable and requires an entry to be deleted and recreated.
 
 [ac60034b-3498-11ed-a50d-919b4b1a5ec0]

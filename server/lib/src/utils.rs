@@ -2,8 +2,8 @@
 
 use crate::prelude::*;
 use hashbrown::HashSet;
-use rand::distributions::{Distribution, Uniform};
-use rand::{thread_rng, Rng};
+use rand::distr::{Distribution, Uniform};
+use rand::{rng, Rng, RngExt};
 use std::ops::Range;
 
 #[derive(Debug)]
@@ -35,7 +35,7 @@ pub fn uuid_from_duration(d: Duration, sid: Sid) -> Uuid {
 }
 
 pub(crate) fn password_from_random_len(len: u32) -> String {
-    thread_rng()
+    rng()
         .sample_iter(&DistinctAlpha)
         .take(len as usize)
         .collect::<String>()
@@ -52,7 +52,7 @@ pub fn backup_code_from_random() -> HashSet<String> {
 pub fn readable_password_from_random() -> String {
     // 2^112 bits, means we need at least 55^20 to have as many bits of entropy.
     // this leads us to 4 groups of 5 to create 55^20
-    let mut trng = thread_rng();
+    let mut trng = rng();
     format!(
         "{}-{}-{}-{}",
         (&mut trng)
@@ -76,18 +76,27 @@ pub fn readable_password_from_random() -> String {
 
 impl Distribution<char> for DistinctAlpha {
     fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> char {
-        const RANGE: u32 = 55;
-        const GEN_ASCII_STR_CHARSET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ\
-                abcdefghjkpqrstuvwxyz\
-                0123456789";
+        static GEN_ASCII_STR_CHARSET: &[u8; 31] = b"abcdefghjkpqrstuvwxyz0123456789";
 
-        let range = Uniform::new(0, RANGE);
+        // this needs to handle the error, maybe?
+        // - This represents a failure of the RNG at a critical level, meaning we can not
+        //   continue.
+        #[allow(clippy::expect_used)]
+        let range = Uniform::new(0, GEN_ASCII_STR_CHARSET.len())
+            .expect("CRITICAL: Failed to build a uniform random number generator during character generation.");
 
         let n = range.sample(rng);
-        GEN_ASCII_STR_CHARSET[n as usize] as char
+        debug_assert!(n < GEN_ASCII_STR_CHARSET.len());
+        // n must lay within range due to the promises of the rand crate.
+        #[allow(clippy::indexing_slicing)]
+        let c = GEN_ASCII_STR_CHARSET[n] as char;
+        c
     }
 }
 
+/// This iterates over groups of graphemes. Each `window` size is how many
+/// graphemes to return at a time. For example, a window of `1` on the string
+/// "abc" will return "a", "b", "c". A window of `2' will return "ab", "bc".
 pub(crate) struct GraphemeClusterIter<'a> {
     value: &'a str,
     char_bounds: Vec<usize>,
@@ -126,8 +135,16 @@ impl<'a> Iterator for GraphemeClusterIter<'a> {
     type Item = &'a str;
 
     fn next(&mut self) -> Option<&'a str> {
+        // range is calculated as 0 to window_max, where
+        // window_max == char_bounds.len() - window. This
+        // means that provided an item is yielded, then it
+        // will always be inbounds.
         self.range.next().map(|idx| {
+            debug_assert!(idx < self.char_bounds.len());
+            debug_assert!(idx + self.window < self.char_bounds.len());
+            #[allow(clippy::indexing_slicing)]
             let min = self.char_bounds[idx];
+            #[allow(clippy::indexing_slicing)]
             let max = self.char_bounds[idx + self.window];
             &self.value[min..max]
         })

@@ -1,3 +1,51 @@
+use self::extractors::ClientConnInfo;
+use self::javascript::*;
+use crate::actors::{QueryServerReadV1, QueryServerWriteV1};
+use crate::config::{AddressSet, Configuration, TcpAddressInfo};
+use crate::tcp::process_client_addr;
+use crate::CoreAction;
+use axum::{
+    body::Body,
+    extract::connect_info::IntoMakeServiceWithConnectInfo,
+    http::{HeaderMap, HeaderValue, Request, StatusCode},
+    middleware::{from_fn, from_fn_with_state},
+    response::{IntoResponse, Redirect, Response},
+    routing::*,
+    Router,
+};
+use axum_extra::extract::cookie::CookieJar;
+use compact_jwt::{error::JwtError, JwsCompact, JwsHs256Signer, JwsVerifier};
+use futures::pin_mut;
+use hyper::body::Incoming;
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use kanidm_lib_crypto::x509_cert::{der::Decode, x509_public_key_s256, Certificate};
+use kanidm_proto::{config::ServerRole, constants::KSESSIONID, internal::COOKIE_AUTH_SESSION_ID};
+use kanidmd_lib::{idm::authentication::ClientCertInfo, status::StatusActor};
+use serde::de::DeserializeOwned;
+use sketching::*;
+use std::fmt::Write;
+use std::io::ErrorKind;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+use std::{net::SocketAddr, str::FromStr};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite},
+    net::{TcpListener, TcpStream},
+    sync::broadcast,
+    task,
+    time::timeout,
+};
+use tokio_rustls::TlsAcceptor;
+use tower::Service;
+use tower_http::{services::ServeDir, timeout::TimeoutLayer, trace::TraceLayer};
+use url::Url;
+use uuid::Uuid;
+
+const HTTPS_CLIENT_CONN_TIMEOUT: Duration = Duration::from_secs(30);
+const HTTPS_CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(60);
+const HTTPS_CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+
 mod apidocs;
 pub(crate) mod cache_buster;
 pub(crate) mod errors;
@@ -14,52 +62,21 @@ mod v1_oauth2;
 mod v1_scim;
 mod views;
 
-use self::extractors::ClientConnInfo;
-use self::javascript::*;
-use crate::actors::{QueryServerReadV1, QueryServerWriteV1};
-use crate::config::{Configuration, ServerRole};
-use crate::CoreAction;
+#[derive(Clone, Copy, Eq, PartialEq, Debug)]
+pub(crate) enum LoggerType {
+    TracingForest,
+    OpenTelemetry,
+}
 
-use axum::{
-    body::Body,
-    extract::connect_info::IntoMakeServiceWithConnectInfo,
-    http::{HeaderMap, HeaderValue, Request},
-    middleware::{from_fn, from_fn_with_state},
-    response::Redirect,
-    routing::*,
-    Router,
-};
-
-use axum_extra::extract::cookie::CookieJar;
-use compact_jwt::{error::JwtError, JwsCompact, JwsHs256Signer, JwsVerifier};
-use futures::pin_mut;
-use hyper::body::Incoming;
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use kanidm_proto::{constants::KSESSIONID, internal::COOKIE_AUTH_SESSION_ID};
-use kanidmd_lib::{idm::ClientCertInfo, status::StatusActor};
-use openssl::ssl::{Ssl, SslAcceptor};
-
-use kanidm_lib_crypto::x509_cert::{der::Decode, x509_public_key_s256, Certificate};
-
-use serde::de::DeserializeOwned;
-use sketching::*;
-use std::fmt::Write;
-use tokio::{
-    net::{TcpListener, TcpStream},
-    sync::broadcast,
-    sync::mpsc,
-    task,
-};
-use tokio_openssl::SslStream;
-use tower::Service;
-use tower_http::{services::ServeDir, trace::TraceLayer};
-use url::Url;
-use uuid::Uuid;
-
-use std::io::ErrorKind;
-use std::path::PathBuf;
-use std::pin::Pin;
-use std::{net::SocketAddr, str::FromStr};
+impl LoggerType {
+    #[inline]
+    pub(crate) fn status_code_field(self) -> &'static str {
+        match self {
+            LoggerType::TracingForest => "status_code",
+            LoggerType::OpenTelemetry => "http.response.status_code",
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct ServerState {
@@ -68,12 +85,15 @@ pub struct ServerState {
     pub(crate) qe_r_ref: &'static QueryServerReadV1,
     // Store the token management parts.
     pub(crate) jws_signer: JwsHs256Signer,
-    pub(crate) trust_x_forward_for: bool,
+    pub(crate) trust_x_forward_for_ips: Option<Arc<AddressSet>>,
     pub(crate) csp_header: HeaderValue,
+    pub(crate) csp_header_no_form_action: HeaderValue,
     pub(crate) origin: Url,
     pub(crate) domain: String,
     // This is set to true by default, and is only false on integration tests.
     pub(crate) secure_cookies: bool,
+    /// So that we can work out which ID to use for spans
+    pub(crate) logging_pipeline: LoggerType,
 }
 
 impl ServerState {
@@ -89,7 +109,7 @@ impl ServerState {
                     if matches!(err, JwtError::InvalidSignature) {
                         // The server has an ephemeral in memory HMAC signer. This is important as
                         // auth (login) sessions on one node shouldn't validate on another. Sessions
-                        // that are shared beween nodes use the internal ECDSA signer.
+                        // that are shared between nodes use the internal ECDSA signer.
                         //
                         // But because of this if the server restarts it rolls the key. Additionally
                         // it can occur if the load balancer isn't sticking sessions to the correct
@@ -144,7 +164,7 @@ pub(crate) fn get_js_files(role: ServerRole) -> Result<Vec<JavaScriptFile>, ()> 
         ];
 
         for filepath in filelist {
-            match generate_integrity_hash(format!("{}/{}", pkg_path, filepath,)) {
+            match generate_integrity_hash(format!("{pkg_path}/{filepath}",)) {
                 Ok(hash) => {
                     debug!("Integrity hash for {}: {}", filepath, hash);
                     let js = JavaScriptFile { hash };
@@ -164,6 +184,10 @@ pub(crate) fn get_js_files(role: ServerRole) -> Result<Vec<JavaScriptFile>, ()> 
     Ok(all_pages)
 }
 
+async fn handler_404() -> Response {
+    (StatusCode::NOT_FOUND, "Route not found").into_response()
+}
+
 pub async fn create_https_server(
     config: Configuration,
     jws_signer: JwsHs256Signer,
@@ -171,11 +195,9 @@ pub async fn create_https_server(
     qe_w_ref: &'static QueryServerWriteV1,
     qe_r_ref: &'static QueryServerReadV1,
     server_message_tx: broadcast::Sender<CoreAction>,
-    maybe_tls_acceptor: Option<SslAcceptor>,
-    tls_acceptor_reload_rx: mpsc::Receiver<SslAcceptor>,
-) -> Result<task::JoinHandle<()>, ()> {
-    let rx = server_message_tx.subscribe();
-
+    maybe_tls_acceptor: Option<TlsAcceptor>,
+    tls_acceptor_reload_tx: &broadcast::Sender<TlsAcceptor>,
+) -> Result<Vec<task::JoinHandle<()>>, ()> {
     let all_js_files = get_js_files(config.role)?;
     // set up the CSP headers
     // script-src 'self'
@@ -190,7 +212,7 @@ pub async fn create_https_server(
     let js_checksums: String = js_directives
         .iter()
         .fold(String::new(), |mut output, value| {
-            let _ = write!(output, " 'sha384-{}'", value);
+            let _ = write!(output, " 'sha384-{value}'");
             output
         });
 
@@ -198,7 +220,7 @@ pub async fn create_https_server(
         concat!(
             "default-src 'self'; ",
             "base-uri 'self' https:; ",
-            "form-action 'self' https:;",
+            "form-action 'self'; ",
             "frame-ancestors 'none'; ",
             "img-src 'self' data:; ",
             "worker-src 'none'; ",
@@ -211,30 +233,64 @@ pub async fn create_https_server(
         error!(?err, "Unable to generate content security policy");
     })?;
 
-    let trust_x_forward_for = config.trust_x_forward_for;
+    // Omit form action - form action is interpreted by chrome to also control valid
+    // redirect targets on submit. This breaks oauth2 in many cases.
+    //
+    // Normally this would be considered BAD to remove a CSP control to make Oauth2 work
+    // but we need to consider the primary attack form-action protects from - open redirectors
+    // in the form submission. Since the paths that use this header do NOT have open
+    // redirectors, we are safe to remove the form-action directive.
+    let csp_header_no_form_action = format!(
+        concat!(
+            "default-src 'self'; ",
+            "base-uri 'self' https:; ",
+            "frame-ancestors 'none'; ",
+            "img-src 'self' data:; ",
+            "worker-src 'none'; ",
+            "script-src 'self' 'unsafe-eval'{};",
+        ),
+        js_checksums
+    );
 
-    let origin = Url::parse(&config.origin)
-        // Should be impossible!
-        .map_err(|err| {
-            error!(?err, "Unable to parse origin URL - refusing to start. You must correct the value for origin. {:?}", config.origin);
+    let csp_header_no_form_action =
+        HeaderValue::from_str(&csp_header_no_form_action).map_err(|err| {
+            error!(
+                ?err,
+                "Unable to generate content security policy with no form action"
+            );
         })?;
+
+    let trust_x_forward_for_ips = config
+        .http_client_address_info
+        .trusted_x_forward_for()
+        .map(Arc::new);
+
+    let trusted_tcp_info_ips = config.http_client_address_info.trusted_tcp_info();
+
+    let logging_pipeline = if config.otel_grpc_url.is_some() {
+        LoggerType::OpenTelemetry
+    } else {
+        LoggerType::TracingForest
+    };
 
     let state = ServerState {
         status_ref,
         qe_w_ref,
         qe_r_ref,
         jws_signer,
-        trust_x_forward_for,
+        trust_x_forward_for_ips,
         csp_header,
-        origin,
+        csp_header_no_form_action,
+        origin: config.origin,
         domain: config.domain.clone(),
         secure_cookies: config.integration_test_config.is_none(),
+        logging_pipeline,
     };
 
     let static_routes = match config.role {
         ServerRole::WriteReplica | ServerRole::ReadOnlyReplica => {
             Router::new()
-                .route("/ui/images/oauth2/:rs_name", get(oauth2::oauth2_image_get))
+                .route("/ui/images/oauth2/{rs_name}", get(oauth2::oauth2_image_get))
                 .route("/ui/images/domain", get(v1_domain::image_get))
                 .route("/manifest.webmanifest", get(manifest::manifest)) // skip_route_check
                 // Layers only apply to routes that are *already* added, not the ones
@@ -242,7 +298,7 @@ pub async fn create_https_server(
                 .layer(middleware::compression::new())
                 .layer(from_fn(middleware::caching::cache_me_short))
                 .route("/", get(|| async { Redirect::to("/ui") }))
-                .nest("/ui", views::view_router())
+                .nest("/ui", views::view_router(state.clone()))
             // Can't compress on anything that changes
         }
         ServerRole::WriteReplicaNoUI => Router::new(),
@@ -278,10 +334,14 @@ pub async fn create_https_server(
     };
 
     // this sets up the default span which logs the URL etc.
+    let span_creator = trace::SpanCreator {
+        log_engine: state.logging_pipeline,
+    };
+
     let trace_layer = TraceLayer::new_for_http()
-        .make_span_with(trace::DefaultMakeSpanKanidmd::new())
-        // setting these to trace because all they do is print "started processing request", and we are already doing that enough!
-        .on_response(trace::DefaultOnResponseKanidmd::new());
+        .make_span_with(span_creator)
+        .on_request(span_creator)
+        .on_response(span_creator);
 
     let app = app
         .merge(static_routes)
@@ -300,56 +360,100 @@ pub async fn create_https_server(
 
     let app = app
         .route("/status", get(generic::status))
+        // 404 handler
+        .fallback(handler_404)
         // This must be the LAST middleware.
         // This is because the last middleware here is the first to be entered and the last
         // to be exited, and this middleware sets up ids' and other bits for for logging
         // coherence to be maintained.
-        .layer(from_fn(middleware::kopid_middleware))
+        .route_layer(from_fn_with_state(
+            state.clone(),
+            middleware::kopid_middleware,
+        ))
         .merge(apidocs::router())
-        // this MUST be the last layer before with_state else the span never starts and everything breaks.
+        // Apply Request Timeouts
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            HTTPS_CLIENT_REQUEST_TIMEOUT,
+        ))
+        // this MUST be the last functional layer before with_state else the span never starts and everything breaks.
         .layer(trace_layer)
+        // OK except for the ip_address_middleware.
+        .layer(from_fn_with_state(
+            state.clone(),
+            middleware::ip_address_middleware,
+        ))
         .with_state(state)
         // the connect_info bit here lets us pick up the remote address of the client
         .into_make_service_with_connect_info::<ClientConnInfo>();
 
-    let addr = SocketAddr::from_str(&config.address).map_err(|err| {
-        error!(
-            "Failed to parse address ({:?}) from config: {:?}",
-            config.address, err
-        );
-    })?;
+    let addrs: Vec<SocketAddr> = config
+        .address
+        .iter()
+        .map(|addr_str| {
+            SocketAddr::from_str(addr_str).map_err(|err| {
+                error!(
+                    "Failed to parse address ({:?}) from config: {:?}",
+                    addr_str, err
+                );
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     info!("Starting the web server...");
 
-    match maybe_tls_acceptor {
-        Some(tls_acceptor) => {
-            let listener = match TcpListener::bind(addr).await {
-                Ok(l) => l,
-                Err(err) => {
-                    error!(?err, "Failed to bind tcp listener");
-                    return Err(());
-                }
-            };
-            Ok(task::spawn(server_loop(
-                tls_acceptor,
+    let mut listener_handles = Vec::with_capacity(addrs.len());
+    for addr in addrs {
+        let listener = match TcpListener::bind(addr).await {
+            Ok(l) => l,
+            Err(err) => {
+                error!(?err, "Failed to bind tcp listener");
+                return Err(());
+            }
+        };
+
+        let app = app.clone();
+        let rx = server_message_tx.subscribe();
+        let trusted_tcp_info_ips = trusted_tcp_info_ips.clone();
+
+        let handle = match &maybe_tls_acceptor {
+            Some(tls_acceptor) => {
+                let tls_acceptor = tls_acceptor.clone();
+                let server_message_tx = server_message_tx.clone();
+                let tls_acceptor_reload_rx = tls_acceptor_reload_tx.subscribe();
+
+                task::spawn(server_tls_loop(
+                    tls_acceptor,
+                    listener,
+                    app,
+                    rx,
+                    server_message_tx,
+                    tls_acceptor_reload_rx,
+                    trusted_tcp_info_ips,
+                ))
+            }
+            None => task::spawn(server_plaintext_loop(
                 listener,
                 app,
                 rx,
-                server_message_tx,
-                tls_acceptor_reload_rx,
-            )))
-        }
-        None => Ok(task::spawn(server_loop_plaintext(addr, app, rx))),
+                trusted_tcp_info_ips,
+            )),
+        };
+
+        listener_handles.push(handle);
     }
+
+    Ok(listener_handles)
 }
 
-async fn server_loop(
-    mut tls_acceptor: SslAcceptor,
+async fn server_tls_loop(
+    mut tls_acceptor: TlsAcceptor,
     listener: TcpListener,
     app: IntoMakeServiceWithConnectInfo<Router, ClientConnInfo>,
     mut rx: broadcast::Receiver<CoreAction>,
     server_message_tx: broadcast::Sender<CoreAction>,
-    mut tls_acceptor_reload_rx: mpsc::Receiver<SslAcceptor>,
+    mut tls_acceptor_reload_rx: broadcast::Receiver<TlsAcceptor>,
+    trusted_tcp_info_ips: Arc<TcpAddressInfo>,
 ) {
     pin_mut!(listener);
 
@@ -358,6 +462,7 @@ async fn server_loop(
             Ok(action) = rx.recv() => {
                 match action {
                     CoreAction::Shutdown => break,
+                    CoreAction::Reload => {},
                 }
             }
             accept = listener.accept() => {
@@ -365,7 +470,7 @@ async fn server_loop(
                     Ok((stream, addr)) => {
                         let tls_acceptor = tls_acceptor.clone();
                         let app = app.clone();
-                        task::spawn(handle_conn(tls_acceptor, stream, app, addr));
+                        task::spawn(handle_tls_conn(tls_acceptor, stream, app, addr, trusted_tcp_info_ips.clone()));
                     }
                     Err(err) => {
                         error!("Web server exited with {:?}", err);
@@ -376,7 +481,7 @@ async fn server_loop(
                     }
                 }
             }
-            Some(mut new_tls_acceptor) = tls_acceptor_reload_rx.recv() => {
+            Ok(mut new_tls_acceptor) = tls_acceptor_reload_rx.recv() => {
                 std::mem::swap(&mut tls_acceptor, &mut new_tls_acceptor);
                 info!("Reloaded http tls acceptor");
             }
@@ -386,24 +491,34 @@ async fn server_loop(
     info!("Stopped {}", super::TaskName::HttpsServer);
 }
 
-async fn server_loop_plaintext(
-    addr: SocketAddr,
+async fn server_plaintext_loop(
+    listener: TcpListener,
     app: IntoMakeServiceWithConnectInfo<Router, ClientConnInfo>,
     mut rx: broadcast::Receiver<CoreAction>,
+    trusted_tcp_info_ips: Arc<TcpAddressInfo>,
 ) {
-    let listener = axum_server::bind(addr).serve(app);
-
     pin_mut!(listener);
 
     loop {
         tokio::select! {
             Ok(action) = rx.recv() => {
                 match action {
-                    CoreAction::Shutdown =>
-                        break,
+                    CoreAction::Shutdown => break,
+                    CoreAction::Reload => {}
                 }
             }
-            _ = &mut listener => {}
+            accept = listener.accept() => {
+                match accept {
+                    Ok((stream, addr)) => {
+                        let app = app.clone();
+                        task::spawn(handle_conn(stream, app, addr, trusted_tcp_info_ips.clone()));
+                    }
+                    Err(err) => {
+                        error!("Web server exited with {:?}", err);
+                        break;
+                    }
+                }
+            }
         }
     }
 
@@ -412,93 +527,194 @@ async fn server_loop_plaintext(
 
 /// This handles an individual connection.
 pub(crate) async fn handle_conn(
-    acceptor: SslAcceptor,
     stream: TcpStream,
-    mut app: IntoMakeServiceWithConnectInfo<Router, ClientConnInfo>,
-    addr: SocketAddr,
+    app: IntoMakeServiceWithConnectInfo<Router, ClientConnInfo>,
+    connection_addr: SocketAddr,
+    trusted_tcp_info_ips: Arc<TcpAddressInfo>,
 ) -> Result<(), std::io::Error> {
-    let ssl = Ssl::new(acceptor.context()).map_err(|e| {
-        error!("Failed to create TLS context: {:?}", e);
-        std::io::Error::from(ErrorKind::ConnectionAborted)
-    })?;
+    let (stream, client_addr) = process_client_addr(
+        stream,
+        connection_addr,
+        HTTPS_CLIENT_CONN_TIMEOUT,
+        trusted_tcp_info_ips,
+    )
+    .await?;
 
-    let mut tls_stream = SslStream::new(ssl, stream).map_err(|err| {
-        error!(?err, "Failed to create TLS stream");
-        std::io::Error::from(ErrorKind::ConnectionAborted)
-    })?;
+    let client_ip_addr = client_addr.ip();
 
-    match SslStream::accept(Pin::new(&mut tls_stream)).await {
-        Ok(_) => {
-            // Process the client cert (if any)
-            let client_cert = if let Some(peer_cert) = tls_stream.ssl().peer_certificate() {
-                // TODO: This is where we should be checking the CRL!!!
+    let client_conn_info = ClientConnInfo {
+        connection_addr,
+        client_ip_addr,
+        client_cert: None,
+    };
 
-                // Extract the cert from openssl to x509-cert which is a better
-                // parser to handle the various extensions.
+    // Hyper has its own `AsyncRead` and `AsyncWrite` traits and doesn't use tokio.
+    // `TokioIo` converts between them.
+    let stream = TokioIo::new(stream);
 
-                let cert_der = peer_cert.to_der().map_err(|ossl_err| {
-                    error!(?ossl_err, "unable to process x509 certificate as DER");
-                    std::io::Error::from(ErrorKind::ConnectionAborted)
-                })?;
+    process_client_hyper(stream, app, client_conn_info).await
+}
 
-                let certificate = Certificate::from_der(&cert_der).map_err(|ossl_err| {
-                    error!(?ossl_err, "unable to process DER certificate to x509");
-                    std::io::Error::from(ErrorKind::ConnectionAborted)
-                })?;
+/// This handles an individual connection.
+pub(crate) async fn handle_tls_conn(
+    acceptor: TlsAcceptor,
+    stream: TcpStream,
+    app: IntoMakeServiceWithConnectInfo<Router, ClientConnInfo>,
+    connection_addr: SocketAddr,
+    trusted_tcp_info_ips: Arc<TcpAddressInfo>,
+) -> Result<(), std::io::Error> {
+    let (stream, client_addr) = process_client_addr(
+        stream,
+        connection_addr,
+        HTTPS_CLIENT_CONN_TIMEOUT,
+        trusted_tcp_info_ips,
+    )
+    .await?;
 
-                let public_key_s256 = x509_public_key_s256(&certificate).ok_or_else(|| {
-                    error!("subject public key bitstring is not octet aligned");
-                    std::io::Error::from(ErrorKind::ConnectionAborted)
-                })?;
+    let client_ip_addr = client_addr.ip();
 
-                Some(ClientCertInfo {
-                    public_key_s256,
-                    certificate,
-                })
-            } else {
-                None
-            };
+    // Don't both starting to build anything until there is actually something to do.
+    // This is pretty common with "health checks" that open a connection and then just
+    // quit.
+    match timeout(HTTPS_CLIENT_CONN_TIMEOUT, stream.readable()).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(err)) => {
+            debug!(?err, "Connection closed before we recieved initial data");
+            return Err(std::io::Error::from(ErrorKind::ConnectionAborted));
+        }
+        Err(_) => {
+            debug!("Timeout waiting for initial data");
+            return Err(std::io::Error::from(ErrorKind::TimedOut));
+        }
+    };
 
-            let client_conn_info = ClientConnInfo { addr, client_cert };
+    let tls_stream = match timeout(HTTPS_CLIENT_CONN_TIMEOUT, acceptor.accept(stream)).await {
+        Ok(Ok(tls_stream)) => tls_stream,
+        Ok(Err(err)) => {
+            error!(?err, "Failed to create TLS stream");
+            return Err(std::io::Error::from(ErrorKind::ConnectionAborted));
+        }
+        Err(_) => {
+            error!("Timeout creating TLS stream");
+            return Err(std::io::Error::from(ErrorKind::TimedOut));
+        }
+    };
 
-            debug!(?client_conn_info);
+    let maybe_peer_cert = tls_stream
+        .get_ref()
+        .1
+        .peer_certificates()
+        // The first certificate relates to the peer.
+        .and_then(|peer_certs| peer_certs.first());
 
-            let svc = axum_server::service::MakeService::<ClientConnInfo, hyper::Request<Body>>::make_service(
-                &mut app,
-                client_conn_info,
+    // Process the client cert (if any)
+    let client_cert = if let Some(peer_cert) = maybe_peer_cert {
+        // We don't need to check the CRL here - it's already completed as part of the
+        // TLS connection establishment process.
+
+        // Extract the cert from rustls DER to x509-cert which is a better
+        // parser to handle the various extensions.
+        let certificate = Certificate::from_der(peer_cert).map_err(|ossl_err| {
+            error!(?ossl_err, "unable to process DER certificate to x509");
+            std::io::Error::from(ErrorKind::ConnectionAborted)
+        })?;
+
+        let public_key_s256 = x509_public_key_s256(&certificate).ok_or_else(|| {
+            error!("subject public key bitstring is not octet aligned");
+            std::io::Error::from(ErrorKind::ConnectionAborted)
+        })?;
+
+        Some(ClientCertInfo {
+            public_key_s256,
+            certificate,
+        })
+    } else {
+        None
+    };
+
+    let client_conn_info = ClientConnInfo {
+        connection_addr,
+        client_ip_addr,
+        client_cert,
+    };
+
+    // Hyper has its own `AsyncRead` and `AsyncWrite` traits and doesn't use tokio.
+    // `TokioIo` converts between them.
+    let stream = TokioIo::new(tls_stream);
+
+    process_client_hyper(stream, app, client_conn_info).await
+}
+
+async fn process_client_hyper<T>(
+    mut stream: TokioIo<T>,
+    mut app: IntoMakeServiceWithConnectInfo<Router, ClientConnInfo>,
+    client_conn_info: ClientConnInfo,
+) -> Result<(), std::io::Error>
+where
+    T: AsyncRead + AsyncWrite + std::marker::Unpin + std::marker::Send + 'static,
+{
+    debug!(?client_conn_info);
+    // Don't both starting to build anything until there is actually something to do.
+    let mut zero_buf: [u8; 0] = [];
+    match timeout(
+        HTTPS_CLIENT_CONN_TIMEOUT,
+        stream.inner_mut().read(&mut zero_buf),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(err)) => {
+            debug!(
+                ?err,
+                "connection was closed before initial data could be sent"
             );
-
-            let svc = svc.await.map_err(|e| {
-                error!("Failed to build HTTP response: {:?}", e);
-                std::io::Error::from(ErrorKind::Other)
-            })?;
-
-            // Hyper has its own `AsyncRead` and `AsyncWrite` traits and doesn't use tokio.
-            // `TokioIo` converts between them.
-            let stream = TokioIo::new(tls_stream);
-
-            // Hyper also has its own `Service` trait and doesn't use tower. We can use
-            // `hyper::service::service_fn` to create a hyper `Service` that calls our app through
-            // `tower::Service::call`.
-            let hyper_service = hyper::service::service_fn(move |request: Request<Incoming>| {
-                // We have to clone `tower_service` because hyper's `Service` uses `&self` whereas
-                // tower's `Service` requires `&mut self`.
-                //
-                // We don't need to call `poll_ready` since `Router` is always ready.
-                svc.clone().call(request)
-            });
-
-            hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
-                .serve_connection_with_upgrades(stream, hyper_service)
-                .await
-                .map_err(|e| {
-                    debug!("Failed to complete connection: {:?}", e);
-                    std::io::Error::from(ErrorKind::ConnectionAborted)
-                })
+            return Err(std::io::Error::from(ErrorKind::ConnectionAborted));
         }
-        Err(error) => {
-            trace!("Failed to handle connection: {:?}", error);
-            Ok(())
+        Err(_) => {
+            error!("connection timed out waiting for initial request data");
+            return Err(std::io::Error::from(ErrorKind::TimedOut));
         }
-    }
+    };
+
+    let svc = tower::MakeService::<ClientConnInfo, hyper::Request<Body>>::make_service(
+        &mut app,
+        client_conn_info,
+    );
+
+    let svc = svc.await.map_err(|e| {
+        error!("Failed to build HTTP response: {:?}", e);
+        std::io::Error::from(ErrorKind::Other)
+    })?;
+
+    // Hyper also has its own `Service` trait and doesn't use tower. We can use
+    // `hyper::service::service_fn` to create a hyper `Service` that calls our app through
+    // `tower::Service::call`.
+    let hyper_service = hyper::service::service_fn(move |request: Request<Incoming>| {
+        // We have to clone `tower_service` because hyper's `Service` uses `&self` whereas
+        // tower's `Service` requires `&mut self`.
+        //
+        // We don't need to call `poll_ready` since `Router` is always ready.
+        svc.clone().call(request)
+    });
+
+    let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+
+    builder
+        .http1()
+        .timer(TokioTimer::new())
+        .header_read_timeout(HTTPS_CLIENT_IO_TIMEOUT);
+
+    builder
+        .http2()
+        .timer(TokioTimer::new())
+        .keep_alive_timeout(HTTPS_CLIENT_IO_TIMEOUT)
+        .keep_alive_interval(HTTPS_CLIENT_IO_TIMEOUT);
+
+    builder
+        .serve_connection_with_upgrades(stream, hyper_service)
+        .await
+        .map_err(|e| {
+            debug!("Failed to complete connection: {:?}", e);
+            std::io::Error::from(ErrorKind::ConnectionAborted)
+        })
 }

@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::errors::WebError;
 use super::middleware::KOpId;
 use super::ServerState;
-use crate::https::extractors::VerifiedClientInformation;
+use crate::https::extractors::{AuthorisationHeaders, VerifiedClientInformation};
 use axum::{
     body::Body,
     extract::{Path, Query, State},
@@ -42,46 +42,6 @@ use serde_with::{serde_as, StringWithSeparator};
 #[cfg(feature = "dev-oauth2-device-flow")]
 use uri::OAUTH2_AUTHORISE_DEVICE;
 use uri::{OAUTH2_TOKEN_ENDPOINT, OAUTH2_TOKEN_INTROSPECT_ENDPOINT, OAUTH2_TOKEN_REVOKE_ENDPOINT};
-
-// TODO: merge this into a value in WebError later
-pub struct HTTPOauth2Error(Oauth2Error);
-
-impl IntoResponse for HTTPOauth2Error {
-    fn into_response(self) -> Response {
-        let HTTPOauth2Error(error) = self;
-
-        if let Oauth2Error::AuthenticationRequired = error {
-            (
-                StatusCode::UNAUTHORIZED,
-                [
-                    (WWW_AUTHENTICATE, "Bearer"),
-                    (ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
-                ],
-            )
-                .into_response()
-        } else {
-            let err = ErrorResponse {
-                error: error.to_string(),
-                ..Default::default()
-            };
-
-            let body = match serde_json::to_string(&err) {
-                Ok(val) => val,
-                Err(e) => {
-                    admin_warn!("Failed to serialize error response: original_error=\"{:?}\" serialization_error=\"{:?}\"", err, e);
-                    format!("{:?}", err)
-                }
-            };
-
-            (
-                StatusCode::BAD_REQUEST,
-                [(ACCESS_CONTROL_ALLOW_ORIGIN, "*")],
-                body,
-            )
-                .into_response()
-        }
-    }
-}
 
 // == Oauth2 Configuration Endpoints ==
 
@@ -198,7 +158,7 @@ pub(crate) async fn oauth2_image_get(
 pub async fn oauth2_authorise_post(
     State(state): State<ServerState>,
     Extension(kopid): Extension<KOpId>,
-    VerifiedClientInformation(client_auth_info): VerifiedClientInformation,
+    AuthorisationHeaders(client_auth_info): AuthorisationHeaders,
     Json(auth_req): Json<AuthorisationRequest>,
 ) -> impl IntoResponse {
     let mut res = oauth2_authorise(state, auth_req, kopid, client_auth_info)
@@ -215,7 +175,7 @@ pub async fn oauth2_authorise_post(
 pub async fn oauth2_authorise_get(
     State(state): State<ServerState>,
     Extension(kopid): Extension<KOpId>,
-    VerifiedClientInformation(client_auth_info): VerifiedClientInformation,
+    AuthorisationHeaders(client_auth_info): AuthorisationHeaders,
     Query(auth_req): Query<AuthorisationRequest>,
 ) -> impl IntoResponse {
     // Start the oauth2 authorisation flow to present to the user.
@@ -329,7 +289,7 @@ async fn oauth2_authorise(
 pub async fn oauth2_authorise_permit_post(
     State(state): State<ServerState>,
     Extension(kopid): Extension<KOpId>,
-    VerifiedClientInformation(client_auth_info): VerifiedClientInformation,
+    AuthorisationHeaders(client_auth_info): AuthorisationHeaders,
     Json(consent_req): Json<String>,
 ) -> impl IntoResponse {
     let mut res = oauth2_authorise_permit(state, consent_req, kopid, client_auth_info)
@@ -351,7 +311,7 @@ pub async fn oauth2_authorise_permit_get(
     State(state): State<ServerState>,
     Query(token): Query<ConsentRequestData>,
     Extension(kopid): Extension<KOpId>,
-    VerifiedClientInformation(client_auth_info): VerifiedClientInformation,
+    AuthorisationHeaders(client_auth_info): AuthorisationHeaders,
 ) -> impl IntoResponse {
     // When this is called, this indicates consent to proceed from the user.
     oauth2_authorise_permit(state, token.token, kopid, client_auth_info).await
@@ -415,7 +375,7 @@ async fn oauth2_authorise_permit(
 pub async fn oauth2_authorise_reject_post(
     State(state): State<ServerState>,
     Extension(kopid): Extension<KOpId>,
-    VerifiedClientInformation(client_auth_info): VerifiedClientInformation,
+    AuthorisationHeaders(client_auth_info): AuthorisationHeaders,
     Form(consent_req): Form<ConsentRequestData>,
 ) -> Response<Body> {
     oauth2_authorise_reject(state, consent_req.token, kopid, client_auth_info).await
@@ -424,7 +384,7 @@ pub async fn oauth2_authorise_reject_post(
 pub async fn oauth2_authorise_reject_get(
     State(state): State<ServerState>,
     Extension(kopid): Extension<KOpId>,
-    VerifiedClientInformation(client_auth_info): VerifiedClientInformation,
+    AuthorisationHeaders(client_auth_info): AuthorisationHeaders,
     Query(consent_req): Query<ConsentRequestData>,
 ) -> Response<Body> {
     oauth2_authorise_reject(state, consent_req.token, kopid, client_auth_info).await
@@ -489,7 +449,7 @@ async fn oauth2_authorise_reject(
 pub async fn oauth2_token_post(
     State(state): State<ServerState>,
     Extension(kopid): Extension<KOpId>,
-    VerifiedClientInformation(client_auth_info): VerifiedClientInformation,
+    AuthorisationHeaders(client_auth_info): AuthorisationHeaders,
     Form(tok_req): Form<AccessTokenRequest>,
 ) -> impl IntoResponse {
     // This is called directly by the resource server, where we then issue
@@ -509,7 +469,7 @@ pub async fn oauth2_token_post(
             Json(tok_res),
         )
             .into_response(),
-        Err(e) => HTTPOauth2Error(e).into_response(),
+        Err(e) => WebError::OAuth2(e).into_response(),
     }
 }
 
@@ -607,15 +567,12 @@ pub async fn oauth2_openid_userinfo_get(
     State(state): State<ServerState>,
     Path(client_id): Path<String>,
     Extension(kopid): Extension<KOpId>,
-    VerifiedClientInformation(client_auth_info): VerifiedClientInformation,
+    AuthorisationHeaders(client_auth_info): AuthorisationHeaders,
 ) -> Response {
     // The token we want to inspect is in the authorisation header.
-    let client_token = match client_auth_info.bearer_token {
-        Some(val) => val,
-        None => {
-            error!("Bearer Authentication Not Provided");
-            return HTTPOauth2Error(Oauth2Error::AuthenticationRequired).into_response();
-        }
+    let Some(client_token) = client_auth_info.bearer_token() else {
+        error!("Bearer Authentication Not Provided");
+        return WebError::OAuth2(Oauth2Error::AuthenticationRequired).into_response();
     };
 
     let res = state
@@ -630,7 +587,7 @@ pub async fn oauth2_openid_userinfo_get(
             Json(uir),
         )
             .into_response(),
-        Err(e) => HTTPOauth2Error(e).into_response(),
+        Err(e) => WebError::OAuth2(e).into_response(),
     }
 }
 
@@ -657,7 +614,7 @@ pub async fn oauth2_openid_publickey_get(
 pub async fn oauth2_token_introspect_post(
     State(state): State<ServerState>,
     Extension(kopid): Extension<KOpId>,
-    VerifiedClientInformation(client_auth_info): VerifiedClientInformation,
+    AuthorisationHeaders(client_auth_info): AuthorisationHeaders,
     Form(intr_req): Form<AccessTokenIntrospectRequest>,
 ) -> impl IntoResponse {
     request_trace!("Introspect Request - {:?}", intr_req);
@@ -672,7 +629,7 @@ pub async fn oauth2_token_introspect_post(
                 Ok(val) => val,
                 Err(e) => {
                     admin_warn!("Failed to serialize introspect response: original_data=\"{:?}\" serialization_error=\"{:?}\"", atr, e);
-                    format!("{:?}", atr)
+                    format!("{atr:?}")
                 }
             };
             #[allow(clippy::unwrap_used)]
@@ -701,7 +658,7 @@ pub async fn oauth2_token_introspect_post(
             let body = match serde_json::to_string(&err) {
                 Ok(val) => val,
                 Err(e) => {
-                    format!("{:?}", e)
+                    format!("{e:?}")
                 }
             };
             #[allow(clippy::expect_used)]
@@ -719,7 +676,7 @@ pub async fn oauth2_token_introspect_post(
 pub async fn oauth2_token_revoke_post(
     State(state): State<ServerState>,
     Extension(kopid): Extension<KOpId>,
-    VerifiedClientInformation(client_auth_info): VerifiedClientInformation,
+    AuthorisationHeaders(client_auth_info): AuthorisationHeaders,
     Form(intr_req): Form<TokenRevokeRequest>,
 ) -> impl IntoResponse {
     request_trace!("Revoke Request - {:?}", intr_req);
@@ -769,6 +726,8 @@ pub async fn oauth2_preflight_options() -> Response {
         .into_response()
 }
 
+// 1.90 incorrectly thinks this is dead code - it's literally used in the function below.
+#[allow(dead_code)]
 #[serde_as]
 #[derive(Deserialize, Debug, Serialize)]
 pub(crate) struct DeviceFlowForm {
@@ -785,9 +744,9 @@ pub(crate) struct DeviceFlowForm {
 pub(crate) async fn oauth2_authorise_device_post(
     State(state): State<ServerState>,
     Extension(kopid): Extension<KOpId>,
-    VerifiedClientInformation(client_auth_info): VerifiedClientInformation,
+    AuthorisationHeaders(client_auth_info): AuthorisationHeaders,
     Form(form): Form<DeviceFlowForm>,
-) -> Result<Json<DeviceAuthorizationResponse>, HTTPOauth2Error> {
+) -> Result<Json<DeviceAuthorizationResponse>, WebError> {
     state
         .qe_w_ref
         .handle_oauth2_device_flow_start(
@@ -798,7 +757,7 @@ pub(crate) async fn oauth2_authorise_device_post(
         )
         .await
         .map(Json::from)
-        .map_err(HTTPOauth2Error)
+        .map_err(WebError::OAuth2)
 }
 
 pub fn route_setup(state: ServerState) -> Router<ServerState> {
@@ -807,17 +766,17 @@ pub fn route_setup(state: ServerState) -> Router<ServerState> {
         // // ⚠️  ⚠️   WARNING  ⚠️  ⚠️
         // // IF YOU CHANGE THESE VALUES YOU MUST UPDATE OIDC DISCOVERY URLS
         .route(
-            "/oauth2/openid/:client_id/.well-known/openid-configuration",
+            "/oauth2/openid/{client_id}/.well-known/openid-configuration",
             get(oauth2_openid_discovery_get).options(oauth2_preflight_options),
         )
         .route(
-            "/oauth2/openid/:client_id/.well-known/webfinger",
+            "/oauth2/openid/{client_id}/.well-known/webfinger",
             get(oauth2_openid_webfinger_get).options(oauth2_preflight_options),
         )
         // // ⚠️  ⚠️   WARNING  ⚠️  ⚠️
         // // IF YOU CHANGE THESE VALUES YOU MUST UPDATE OIDC DISCOVERY URLS
         .route(
-            "/oauth2/openid/:client_id/userinfo",
+            "/oauth2/openid/{client_id}/userinfo",
             get(oauth2_openid_userinfo_get)
                 .post(oauth2_openid_userinfo_get)
                 .options(oauth2_preflight_options),
@@ -825,13 +784,13 @@ pub fn route_setup(state: ServerState) -> Router<ServerState> {
         // // ⚠️  ⚠️   WARNING  ⚠️  ⚠️
         // // IF YOU CHANGE THESE VALUES YOU MUST UPDATE OIDC DISCOVERY URLS
         .route(
-            "/oauth2/openid/:client_id/public_key.jwk",
+            "/oauth2/openid/{client_id}/public_key.jwk",
             get(oauth2_openid_publickey_get).options(oauth2_preflight_options),
         )
         // // ⚠️  ⚠️   WARNING  ⚠️  ⚠️
         // // IF YOU CHANGE THESE VALUES YOU MUST UPDATE OAUTH2 DISCOVERY URLS
         .route(
-            "/oauth2/openid/:client_id/.well-known/oauth-authorization-server",
+            "/oauth2/openid/{client_id}/.well-known/oauth-authorization-server",
             get(oauth2_rfc8414_metadata_get).options(oauth2_preflight_options),
         )
         .with_state(state.clone());

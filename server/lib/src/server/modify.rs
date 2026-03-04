@@ -245,6 +245,31 @@ impl QueryServerWriteTransaction<'_> {
             self.changed_flags.insert(ChangeFlag::OAUTH2)
         }
 
+        if !self.changed_flags.contains(ChangeFlag::OAUTH2_CLIENT)
+            && norm_cand
+                .iter()
+                .zip(pre_candidates.iter().map(|e| e.as_ref()))
+                .any(|(post, pre)| {
+                    post.attribute_equality(Attribute::Class, &EntryClass::OAuth2Client.into())
+                        || pre
+                            .attribute_equality(Attribute::Class, &EntryClass::OAuth2Client.into())
+                })
+        {
+            self.changed_flags.insert(ChangeFlag::OAUTH2_CLIENT)
+        }
+
+        if !self.changed_flags.contains(ChangeFlag::FEATURE)
+            && norm_cand
+                .iter()
+                .zip(pre_candidates.iter().map(|e| e.as_ref()))
+                .any(|(post, pre)| {
+                    post.attribute_equality(Attribute::Class, &EntryClass::Feature.into())
+                        || pre.attribute_equality(Attribute::Class, &EntryClass::Feature.into())
+                })
+        {
+            self.changed_flags.insert(ChangeFlag::FEATURE)
+        }
+
         if !self.changed_flags.contains(ChangeFlag::DOMAIN)
             && norm_cand
                 .iter()
@@ -440,6 +465,23 @@ impl QueryServerWriteTransaction<'_> {
         {
             self.changed_flags.insert(ChangeFlag::OAUTH2)
         }
+
+        if !self.changed_flags.contains(ChangeFlag::OAUTH2_CLIENT)
+            && norm_cand
+                .iter()
+                .any(|e| e.attribute_equality(Attribute::Class, &EntryClass::OAuth2Client.into()))
+        {
+            self.changed_flags.insert(ChangeFlag::OAUTH2_CLIENT)
+        }
+
+        if !self.changed_flags.contains(ChangeFlag::FEATURE)
+            && norm_cand
+                .iter()
+                .any(|e| e.attribute_equality(Attribute::Class, &EntryClass::Feature.into()))
+        {
+            self.changed_flags.insert(ChangeFlag::FEATURE)
+        }
+
         if !self.changed_flags.contains(ChangeFlag::DOMAIN)
             && norm_cand
                 .iter()

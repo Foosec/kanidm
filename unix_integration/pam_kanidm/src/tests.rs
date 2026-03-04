@@ -46,7 +46,7 @@ impl RequestOptions {
                     name: "tobias".to_string(),
                     // The very secure password, 'a'
                     password: CryptPw::from_str("$6$5.bXZTIXuVv.xI3.$sAubscCJPwnBWwaLt2JR33lo539UyiDku.aH5WVSX0Tct9nGL2ePMEmrqT3POEdBlgNQ12HJBwskewGu2dpF//").unwrap(),
-                    epoch_expire_date: Some(10),
+                    epoch_expire_seconds: Some(time::OffsetDateTime::UNIX_EPOCH + time::Duration::days(10)),
                     ..Default::default()
                 },
             ],
@@ -89,7 +89,7 @@ impl PamHandler for TestHandler {
         match q.pop_front() {
             Some(Event::Account(name)) => Ok(name.to_string()),
             e => {
-                eprintln!("{:?}", e);
+                eprintln!("{e:?}");
                 panic!("Invalid event transition");
             }
         }
@@ -100,7 +100,7 @@ impl PamHandler for TestHandler {
         match q.pop_front() {
             Some(Event::ServiceInfo(info)) => Ok(info),
             e => {
-                eprintln!("{:?}", e);
+                eprintln!("{e:?}");
                 panic!("Invalid event transition");
             }
         }
@@ -112,7 +112,7 @@ impl PamHandler for TestHandler {
             Some(Event::StackedAuthtok(Some(v))) => Ok(Some(v.to_string())),
             Some(Event::StackedAuthtok(None)) => Ok(None),
             e => {
-                eprintln!("{:?}", e);
+                eprintln!("{e:?}");
                 panic!("Invalid event transition");
             }
         }
@@ -121,23 +121,17 @@ impl PamHandler for TestHandler {
     /// Display a message to the user.
     fn message(&self, _prompt: &str) -> PamResult<()> {
         let mut q = self.response_queue.lock().unwrap();
-        match q.pop_front() {
-            e => {
-                eprintln!("{:?}", e);
-                panic!("Invalid event transition");
-            }
-        }
+        let e = q.pop_front();
+        eprintln!("{e:?}");
+        panic!("Invalid event transition message");
     }
 
     /// Display a device grant request to the user.
     fn message_device_grant(&self, _data: &DeviceAuthorizationResponse) -> PamResult<()> {
         let mut q = self.response_queue.lock().unwrap();
-        match q.pop_front() {
-            e => {
-                eprintln!("{:?}", e);
-                panic!("Invalid event transition");
-            }
-        }
+        let e = q.pop_front();
+        eprintln!("{e:?}");
+        panic!("Invalid event transition message_device_grant");
     }
 
     /// Request a password from the user.
@@ -146,7 +140,7 @@ impl PamHandler for TestHandler {
         match q.pop_front() {
             Some(Event::PromptPassword(value)) => Ok(Some(value.to_string())),
             e => {
-                eprintln!("{:?}", e);
+                eprintln!("{e:?}");
                 panic!("Invalid event transition");
             }
         }
@@ -154,22 +148,16 @@ impl PamHandler for TestHandler {
 
     fn prompt_for_pin(&self, _msg: Option<&str>) -> PamResult<Option<String>> {
         let mut q = self.response_queue.lock().unwrap();
-        match q.pop_front() {
-            e => {
-                eprintln!("{:?}", e);
-                panic!("Invalid event transition");
-            }
-        }
+        let e = q.pop_front();
+        eprintln!("{e:?}");
+        panic!("Invalid event transition prompt_for_pin");
     }
 
     fn prompt_for_mfacode(&self) -> PamResult<Option<String>> {
-        let mut q = self.response_queue.lock().unwrap();
-        match q.pop_front() {
-            e => {
-                eprintln!("{:?}", e);
-                panic!("Invalid event transition");
-            }
-        }
+        let mut q = self.response_queue.lock().expect("Failed to lock mutex");
+        let e = q.pop_front();
+        eprintln!("{e:?}");
+        panic!("Invalid event transition prompt_for_mfacode");
     }
 }
 

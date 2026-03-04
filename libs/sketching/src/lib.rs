@@ -14,7 +14,7 @@ use tracing_subscriber::filter::Directive;
 use tracing_subscriber::prelude::*;
 
 pub mod macros;
-pub mod otel;
+pub mod pipeline;
 
 pub use {tracing, tracing_forest, tracing_subscriber};
 
@@ -120,7 +120,7 @@ impl FromStr for LogLevel {
     type Err = &'static str;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
+        match s.to_ascii_lowercase().as_str() {
             "info" => Ok(LogLevel::Info),
             "debug" => Ok(LogLevel::Debug),
             "trace" => Ok(LogLevel::Trace),

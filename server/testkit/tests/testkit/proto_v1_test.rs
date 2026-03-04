@@ -1,9 +1,9 @@
 #![deny(warnings)]
-use std::path::Path;
-use std::time::SystemTime;
-
+use compact_jwt::dangernoverify::JwsDangerReleaseWithoutVerify;
+use compact_jwt::{traits::JwsVerifiable, JwsCompact, JwsEs256Verifier, JwsVerifier};
+use hyper::header::CONTENT_TYPE;
+use kanidm_client::{ClientError, KanidmClient};
 use kanidm_proto::constants::{ATTR_GIDNUMBER, KSESSIONID};
-
 use kanidm_proto::internal::{
     ApiToken, CURegState, Filter, ImageValue, Modify, ModifyList, UatPurpose, UserAuthToken,
 };
@@ -13,18 +13,15 @@ use kanidm_proto::v1::{
 };
 use kanidmd_lib::constants::{NAME_IDM_ADMINS, NAME_SYSTEM_ADMINS};
 use kanidmd_lib::credential::totp::Totp;
-
-use kanidmd_lib::prelude::Attribute;
-use tracing::{debug, trace};
-
+use kanidmd_lib::prelude::{Attribute, APPLICATION_JSON};
+use kanidmd_testkit::{ADMIN_TEST_PASSWORD, ADMIN_TEST_USER};
+use std::path::Path;
 use std::str::FromStr;
-
-use compact_jwt::{traits::JwsVerifiable, JwsCompact, JwsEs256Verifier, JwsVerifier};
+use std::time::SystemTime;
+use time::OffsetDateTime;
+use tracing::{debug, trace};
 use webauthn_authenticator_rs::softpasskey::SoftPasskey;
 use webauthn_authenticator_rs::WebauthnAuthenticator;
-
-use kanidm_client::{ClientError, KanidmClient};
-use kanidmd_testkit::{ADMIN_TEST_PASSWORD, ADMIN_TEST_USER};
 
 const UNIX_TEST_PASSWORD: &str = "unix test user password";
 
@@ -113,7 +110,7 @@ async fn test_server_search(rsclient: &KanidmClient) {
     // First show we are un-authenticated.
     let pre_res = rsclient.whoami().await;
     // This means it was okay whoami, but no uat attached.
-    println!("Response: {:?}", pre_res);
+    println!("Response: {pre_res:?}");
     assert!(pre_res.unwrap().is_none());
 
     let res = rsclient
@@ -125,10 +122,10 @@ async fn test_server_search(rsclient: &KanidmClient) {
         .search(Filter::Eq(Attribute::Name.to_string(), "admin".to_string()))
         .await
         .unwrap();
-    println!("{:?}", rset);
+    println!("{rset:?}");
     let e = rset.first().unwrap();
     // Check it's admin.
-    println!("{:?}", e);
+    println!("{e:?}");
     let name = e.attrs.get(Attribute::Name.as_str()).unwrap();
     assert_eq!(name, &vec!["admin".to_string()]);
 }
@@ -147,7 +144,7 @@ async fn test_server_rest_group_read(rsclient: &KanidmClient) {
 
     let g = rsclient.idm_group_get(NAME_IDM_ADMINS).await.unwrap();
     assert!(g.is_some());
-    println!("{:?}", g);
+    println!("{g:?}");
 }
 
 #[kanidmd_testkit::test]
@@ -245,14 +242,14 @@ async fn test_server_rest_group_lifecycle(rsclient: &KanidmClient) {
     // Check we can get an exact group
     let g = rsclient.idm_group_get(NAME_IDM_ADMINS).await.unwrap();
     assert!(g.is_some());
-    println!("{:?}", g);
+    println!("{g:?}");
 
     // They should have members
     let members = rsclient
         .idm_group_get_members(NAME_IDM_ADMINS)
         .await
         .unwrap();
-    println!("{:?}", members);
+    println!("{members:?}");
     assert!(
         members
             == Some(vec![
@@ -275,7 +272,7 @@ async fn test_server_rest_account_read(rsclient: &KanidmClient) {
 
     let a = rsclient.idm_service_account_get("admin").await.unwrap();
     assert!(a.is_some());
-    println!("{:?}", a);
+    println!("{a:?}");
 }
 
 #[kanidmd_testkit::test]
@@ -301,14 +298,14 @@ async fn test_server_rest_schema_read(rsclient: &KanidmClient) {
         .await
         .unwrap();
     assert!(a.is_some());
-    println!("{:?}", a);
+    println!("{a:?}");
 
     let c = rsclient
         .idm_schema_classtype_get(Attribute::Account.as_ref())
         .await
         .unwrap();
     assert!(c.is_some());
-    println!("{:?}", c);
+    println!("{c:?}");
 }
 
 // Test resetting a radius cred, and then checking/viewing it.
@@ -366,7 +363,7 @@ async fn test_server_radius_credential_lifecycle(rsclient: &KanidmClient) {
         .unwrap();
 
     // Should be different
-    println!("s1 {} != s2 {}", sec1, sec2);
+    println!("s1 {sec1} != s2 {sec2}");
     assert!(sec1 != sec2);
 
     // Delete it
@@ -463,7 +460,7 @@ async fn test_server_rest_sshkey_lifecycle(rsclient: &KanidmClient) {
     // Post a valid key
     let r2 = rsclient
             .idm_service_account_post_ssh_pubkey("admin", "k1", "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAeGW1P6Pc2rPq0XqbRaDKBcXZUPRklo0L1EyR30CwoP william@amethyst").await;
-    println!("{:?}", r2);
+    println!("{r2:?}");
     assert!(r2.is_ok());
 
     // Get, should have the key
@@ -600,6 +597,13 @@ async fn test_server_rest_posix_lifecycle(rsclient: &KanidmClient) {
     let res = rsclient.idm_group_unix_extend("posix_group", None).await;
     assert!(res.is_ok());
 
+    // Add anonymous to the group that is allowed to access posix attrs, as this
+    // role may not always be granted in future.
+    rsclient
+        .idm_group_add_members("idm_unix_authentication_read", &["anonymous"])
+        .await
+        .unwrap();
+
     // Open a new connection as anonymous
     let res = rsclient.auth_anonymous().await;
     assert!(res.is_ok());
@@ -625,7 +629,7 @@ async fn test_server_rest_posix_lifecycle(rsclient: &KanidmClient) {
         .await
         .unwrap();
 
-    println!("{:?}", r);
+    println!("{r:?}");
     assert_eq!(r.name, "posix_account");
     assert_eq!(r1.name, "posix_account");
     assert_eq!(r2.name, "posix_account");
@@ -652,7 +656,7 @@ async fn test_server_rest_posix_lifecycle(rsclient: &KanidmClient) {
         .await
         .unwrap();
 
-    println!("{:?}", r);
+    println!("{r:?}");
     assert_eq!(r.name, "posix_group");
     assert_eq!(r1.name, "posix_group");
     assert_eq!(r2.name, "posix_group");
@@ -851,8 +855,7 @@ async fn test_server_rest_oauth2_basic_lifecycle(rsclient: &KanidmClient) {
 
     assert_eq!(initial_configs.len(), 1);
 
-    // Get the value. Assert we have oauth2_rs_basic_secret,
-    // but can NOT see the token_secret.
+    // Get the value. Assert we have oauth2_rs_basic_secret.
     let oauth2_config = rsclient
         .idm_oauth2_rs_get("test_integration")
         .await
@@ -860,16 +863,12 @@ async fn test_server_rest_oauth2_basic_lifecycle(rsclient: &KanidmClient) {
         .flatten()
         .expect("Failed to retrieve test_integration config");
 
-    eprintln!("{:?}", oauth2_config);
+    eprintln!("{oauth2_config:?}");
 
     // What can we see?
     assert!(oauth2_config
         .attrs
         .contains_key(Attribute::OAuth2RsBasicSecret.as_str()));
-    // This is present, but redacted.
-    assert!(oauth2_config
-        .attrs
-        .contains_key(Attribute::OAuth2RsTokenKey.as_str()));
 
     // Mod delete the secret/key and check them again.
     // Check we can patch the oauth2_rs_name / oauth2_rs_origin
@@ -880,11 +879,14 @@ async fn test_server_rest_oauth2_basic_lifecycle(rsclient: &KanidmClient) {
             Some("Test Integration"),
             Some("https://new_demo.example.com"),
             true,
-            true,
-            true,
         )
         .await
         .expect("Failed to update config");
+
+    rsclient
+        .idm_oauth2_rs_rotate_keys("test_integration", OffsetDateTime::now_utc())
+        .await
+        .expect("Failed to rotate oauth2 keys");
 
     let oauth2_config_updated = rsclient
         .idm_oauth2_rs_get("test_integration")
@@ -1006,8 +1008,8 @@ async fn test_server_rest_oauth2_basic_lifecycle(rsclient: &KanidmClient) {
         .flatten()
         .expect("Failed to retrieve test_integration config");
 
-    eprintln!("{:?}", oauth2_config_updated);
-    eprintln!("{:?}", oauth2_config_updated4);
+    eprintln!("{oauth2_config_updated:?}");
+    eprintln!("{oauth2_config_updated4:?}");
 
     assert_eq!(oauth2_config_updated, oauth2_config_updated4);
 
@@ -1097,7 +1099,7 @@ async fn test_server_credential_update_session_pw(rsclient: &KanidmClient) {
     ]);
 
     let res = rsclient.modify(f, m).await;
-    println!("{:?}", res);
+    println!("{res:?}");
     assert!(res.is_ok());
 }
 
@@ -1366,7 +1368,7 @@ async fn setup_demo_account_password(
 
 #[kanidmd_testkit::test]
 async fn test_server_credential_update_session_passkey(rsclient: &KanidmClient) {
-    let mut wa = setup_demo_account_passkey(&rsclient).await;
+    let mut wa = setup_demo_account_passkey(rsclient).await;
 
     let res = rsclient
         .auth_passkey_begin("demo_account")
@@ -1412,6 +1414,7 @@ async fn test_server_api_token_lifecycle(rsclient: &KanidmClient) {
             "test token",
             None,
             false,
+            false,
         )
         .await
         .expect("Failed to create service account api token");
@@ -1419,17 +1422,7 @@ async fn test_server_api_token_lifecycle(rsclient: &KanidmClient) {
     // Decode it?
     let token_unverified = JwsCompact::from_str(&token).expect("Failed to parse apitoken");
 
-    let key_id = token_unverified
-        .kid()
-        .expect("token does not have a key id");
-    assert!(token_unverified.get_jwk_pubkey().is_none());
-
-    let jwk = rsclient
-        .get_public_jwk(key_id)
-        .await
-        .expect("Unable to get jwk");
-
-    let jws_verifier = JwsEs256Verifier::try_from(&jwk).expect("Unable to build verifier");
+    let jws_verifier = JwsDangerReleaseWithoutVerify::default();
 
     let token = jws_verifier
         .verify(&token_unverified)
@@ -1521,9 +1514,9 @@ async fn test_server_api_token_lifecycle(rsclient: &KanidmClient) {
         .idm_service_account_update(
             test_service_account_username,
             None,
-            Some(&format!("{}displayzzzz", test_service_account_username)),
+            Some(&format!("{test_service_account_username}displayzzzz")),
             None,
-            Some(&[format!("{}@example.crabs", test_service_account_username)]),
+            Some(&[format!("{test_service_account_username}@example.crabs")]),
         )
         .await
         .is_ok());
@@ -1541,10 +1534,7 @@ async fn test_server_api_token_lifecycle(rsclient: &KanidmClient) {
     dbg!(&res);
     assert!(res.is_ok());
 
-    println!(
-        "testing deletion of service account {}",
-        test_service_account_username
-    );
+    println!("testing deletion of service account {test_service_account_username}");
     assert!(rsclient
         .idm_service_account_delete(test_service_account_username)
         .await
@@ -1690,7 +1680,7 @@ async fn test_server_user_auth_token_lifecycle(rsclient: &KanidmClient) {
 
 #[kanidmd_testkit::test]
 async fn test_server_user_auth_reauthentication(rsclient: &KanidmClient) {
-    let mut wa = setup_demo_account_passkey(&rsclient).await;
+    let mut wa = setup_demo_account_passkey(rsclient).await;
 
     let res = rsclient
         .auth_passkey_begin("demo_account")
@@ -1728,8 +1718,7 @@ async fn test_server_user_auth_reauthentication(rsclient: &KanidmClient) {
         .map(|jws| jws.from_json::<UserAuthToken>().expect("Invalid json"))
         .expect("Unable extract uat");
 
-    let now = time::OffsetDateTime::now_utc();
-    assert!(!uat.purpose_readwrite_active(now));
+    assert!(matches!(uat.purpose, UatPurpose::ReadWrite { .. }));
 
     // The auth is done, now we have to setup to re-auth for our session.
     // Should we bother looking at the internals of the token here to assert
@@ -1770,7 +1759,7 @@ async fn test_server_user_auth_reauthentication(rsclient: &KanidmClient) {
 
     let now = time::OffsetDateTime::now_utc();
     eprintln!("{:?} {:?}", now, uat.purpose);
-    assert!(uat.purpose_readwrite_active(now));
+    assert!(matches!(uat.purpose, UatPurpose::ReadWrite { .. }));
 }
 
 async fn start_password_session(
@@ -1789,17 +1778,14 @@ async fn start_password_session(
             privileged,
         },
     };
-    let authreq = serde_json::to_string(&authreq).expect("Failed to serialize AuthRequest");
-
     let res = match client
         .post(rsclient.make_url("/v1/auth"))
-        .header("Content-Type", "application/json")
-        .body(authreq)
+        .json(&authreq)
         .send()
         .await
     {
         Ok(value) => value,
-        Err(error) => panic!("Failed to post: {:#?}", error),
+        Err(error) => panic!("Failed to post: {error:#?}"),
     };
     assert_eq!(res.status(), 200);
 
@@ -1808,36 +1794,33 @@ async fn start_password_session(
     let authreq = AuthRequest {
         step: AuthStep::Begin(AuthMech::Password),
     };
-    let authreq = serde_json::to_string(&authreq).expect("Failed to serialize AuthRequest");
 
     let res = match client
         .post(rsclient.make_url("/v1/auth"))
-        .header("Content-Type", "application/json")
+        .header(CONTENT_TYPE, APPLICATION_JSON)
         .header(KSESSIONID, session_id)
-        .body(authreq)
+        .json(&authreq)
         .send()
         .await
     {
         Ok(value) => value,
-        Err(error) => panic!("Failed to post: {:#?}", error),
+        Err(error) => panic!("Failed to post: {error:#?}"),
     };
     assert_eq!(res.status(), 200);
 
     let authreq = AuthRequest {
         step: AuthStep::Cred(AuthCredential::Password(password.to_string())),
     };
-    let authreq = serde_json::to_string(&authreq).expect("Failed to serialize AuthRequest");
 
     let res = match client
         .post(rsclient.make_url("/v1/auth"))
-        .header("Content-Type", "application/json")
         .header(KSESSIONID, session_id)
-        .body(authreq)
+        .json(&authreq)
         .send()
         .await
     {
         Ok(value) => value,
-        Err(error) => panic!("Failed to post: {:#?}", error),
+        Err(error) => panic!("Failed to post: {error:#?}"),
     };
     assert_eq!(res.status(), 200);
 
@@ -1869,12 +1852,12 @@ async fn start_password_session(
 
 #[kanidmd_testkit::test]
 async fn test_server_user_auth_unprivileged(rsclient: &KanidmClient) {
-    let (account_name, account_pass) = setup_demo_account_password(&rsclient)
+    let (account_name, account_pass) = setup_demo_account_password(rsclient)
         .await
         .expect("Failed to setup demo_account");
 
     let uat = start_password_session(
-        &rsclient,
+        rsclient,
         account_name.as_str(),
         account_pass.as_str(),
         false,
@@ -1892,18 +1875,13 @@ async fn test_server_user_auth_unprivileged(rsclient: &KanidmClient) {
 
 #[kanidmd_testkit::test]
 async fn test_server_user_auth_privileged_shortcut(rsclient: &KanidmClient) {
-    let (account_name, account_pass) = setup_demo_account_password(&rsclient)
+    let (account_name, account_pass) = setup_demo_account_password(rsclient)
         .await
         .expect("Failed to setup demo_account");
 
-    let uat = start_password_session(
-        &rsclient,
-        account_name.as_str(),
-        account_pass.as_str(),
-        true,
-    )
-    .await
-    .expect("Failed to start session");
+    let uat = start_password_session(rsclient, account_name.as_str(), account_pass.as_str(), true)
+        .await
+        .expect("Failed to start session");
 
     match uat.purpose {
         UatPurpose::ReadOnly => panic!("Unexpected uat purpose"),

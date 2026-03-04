@@ -18,7 +18,7 @@ use std::process::ExitCode;
 use clap::Parser;
 use kanidm_unix_common::client::DaemonClient;
 use kanidm_unix_common::constants::DEFAULT_CONFIG_PATH;
-use kanidm_unix_common::unix_config::KanidmUnixdConfig;
+use kanidm_unix_common::unix_config::PamNssConfig;
 use kanidm_unix_common::unix_proto::{
     ClientRequest, ClientResponse, PamAuthRequest, PamAuthResponse, PamServiceInfo,
 };
@@ -28,8 +28,7 @@ include!("../opt/tool.rs");
 
 macro_rules! setup_client {
     () => {{
-        let Ok(cfg) =
-            KanidmUnixdConfig::new().read_options_from_optional_config(DEFAULT_CONFIG_PATH)
+        let Ok(cfg) = PamNssConfig::new().read_options_from_optional_config(DEFAULT_CONFIG_PATH)
         else {
             error!("Failed to parse {}", DEFAULT_CONFIG_PATH);
             return ExitCode::FAILURE;
@@ -105,22 +104,34 @@ async fn main() -> ExitCode {
                 },
             };
             loop {
-                match daemon_client.call(&req, None).await {
+                match daemon_client.call(req, None).await {
                     Ok(r) => match r {
-                        ClientResponse::PamAuthenticateStepResponse(PamAuthResponse::Success) => {
+                        ClientResponse::PamAuthenticateStepResponse {
+                            response: PamAuthResponse::Success,
+                            session_id: _,
+                        } => {
                             println!("auth success!");
                             break;
                         }
-                        ClientResponse::PamAuthenticateStepResponse(PamAuthResponse::Denied) => {
+                        ClientResponse::PamAuthenticateStepResponse {
+                            response: PamAuthResponse::Denied,
+                            session_id: _,
+                        } => {
                             println!("auth failed!");
                             break;
                         }
-                        ClientResponse::PamAuthenticateStepResponse(PamAuthResponse::Unknown) => {
+                        ClientResponse::PamAuthenticateStepResponse {
+                            response: PamAuthResponse::Unknown,
+                            session_id: _,
+                        } => {
                             debug!("User may need to be in allow_local_account_override");
                             println!("auth user unknown");
                             break;
                         }
-                        ClientResponse::PamAuthenticateStepResponse(PamAuthResponse::Password) => {
+                        ClientResponse::PamAuthenticateStepResponse {
+                            response: PamAuthResponse::Password,
+                            session_id,
+                        } => {
                             // Prompt for and get the password
                             let cred = match dialoguer::Password::new()
                                 .with_prompt("Enter Unix password")
@@ -134,16 +145,17 @@ async fn main() -> ExitCode {
                             };
 
                             // Setup the req for the next loop.
-                            req = ClientRequest::PamAuthenticateStep(PamAuthRequest::Password {
-                                cred,
-                            });
+                            req = ClientRequest::PamAuthenticateStep {
+                                request: PamAuthRequest::Password { cred },
+                                session_id,
+                            };
                             continue;
                         }
                         ClientResponse::Error(err) => {
                             error!("Error from kanidm-unixd: {}", err);
                             break;
                         }
-                        ClientResponse::PamAuthenticateStepResponse(_)
+                        ClientResponse::PamAuthenticateStepResponse { .. }
                         | ClientResponse::SshKeys(_)
                         | ClientResponse::NssAccounts(_)
                         | ClientResponse::NssAccount(_)
@@ -166,7 +178,7 @@ async fn main() -> ExitCode {
 
             let sereq = ClientRequest::PamAccountAllowed(account_id);
 
-            match daemon_client.call(&sereq, None).await {
+            match daemon_client.call(sereq, None).await {
                 Ok(r) => match r {
                     ClientResponse::PamStatus(Some(true)) => {
                         println!("account success!");
@@ -200,7 +212,7 @@ async fn main() -> ExitCode {
 
             let req = ClientRequest::ClearCache;
 
-            match daemon_client.call(&req, None).await {
+            match daemon_client.call(req, None).await {
                 Ok(r) => match r {
                     ClientResponse::Ok => info!("success"),
                     _ => {
@@ -221,7 +233,7 @@ async fn main() -> ExitCode {
 
             let req = ClientRequest::InvalidateCache;
 
-            match daemon_client.call(&req, None).await {
+            match daemon_client.call(req, None).await {
                 Ok(r) => match r {
                     ClientResponse::Ok => info!("success"),
                     _ => {
@@ -241,7 +253,7 @@ async fn main() -> ExitCode {
             let mut daemon_client = setup_client!();
             let req = ClientRequest::Status;
 
-            match daemon_client.call(&req, None).await {
+            match daemon_client.call(req, None).await {
                 Ok(r) => match r {
                     ClientResponse::ProviderStatus(results) => {
                         for provider in results {

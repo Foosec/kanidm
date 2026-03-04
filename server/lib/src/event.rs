@@ -346,6 +346,8 @@ pub struct CreateEvent {
     pub entries: Vec<Entry<EntryInit, EntryNew>>,
     // Is the CreateEvent from an internal or external source?
     // This may affect which plugins are run ...
+    /// If true, the list of created entry UUID's will be returned.
+    pub return_created_uuids: bool,
 }
 
 impl CreateEvent {
@@ -363,23 +365,31 @@ impl CreateEvent {
         // What is the correct consuming iterator here? Can we
         // even do that?
         match rentries {
-            Ok(entries) => Ok(CreateEvent { ident, entries }),
+            Ok(entries) => Ok(CreateEvent {
+                ident,
+                entries,
+                return_created_uuids: false,
+            }),
             Err(e) => Err(e),
         }
     }
 
-    #[cfg(test)]
     pub fn new_impersonate_identity(
         ident: Identity,
         entries: Vec<Entry<EntryInit, EntryNew>>,
     ) -> Self {
-        CreateEvent { ident, entries }
+        CreateEvent {
+            ident,
+            entries,
+            return_created_uuids: false,
+        }
     }
 
     pub fn new_internal(entries: Vec<Entry<EntryInit, EntryNew>>) -> Self {
         CreateEvent {
             ident: Identity::from_internal(),
             entries,
+            return_created_uuids: false,
         }
     }
 }
@@ -740,6 +750,27 @@ impl Default for PurgeRecycledEvent {
 impl PurgeRecycledEvent {
     pub fn new() -> Self {
         PurgeRecycledEvent {
+            ident: Identity::from_internal(),
+            eventid: Uuid::new_v4(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct PurgeDeleteAfterEvent {
+    pub ident: Identity,
+    pub eventid: Uuid,
+}
+
+impl Default for PurgeDeleteAfterEvent {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PurgeDeleteAfterEvent {
+    pub fn new() -> Self {
+        PurgeDeleteAfterEvent {
             ident: Identity::from_internal(),
             eventid: Uuid::new_v4(),
         }

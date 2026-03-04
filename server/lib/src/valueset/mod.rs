@@ -8,18 +8,21 @@ use crate::value::{
     Address, ApiToken, CredentialType, IntentTokenState, Oauth2Session, OauthClaimMapJoin, Session,
 };
 use compact_jwt::{crypto::JwsRs256Signer, JwsEs256Signer};
+use crypto_glue::s256::Sha256Output;
 use dyn_clone::DynClone;
 use hashbrown::HashSet;
-use kanidm_lib_crypto::{x509_cert::Certificate, Sha256Digest};
+use kanidm_lib_crypto::x509_cert::Certificate;
 use kanidm_proto::internal::ImageValue;
 use kanidm_proto::internal::{Filter as ProtoFilter, UiHint};
 use kanidm_proto::scim_v1::JsonValue;
 use kanidm_proto::scim_v1::ScimOauth2ClaimMapJoinChar;
+use kanidm_proto::v1::OutboundMessage;
 use openssl::ec::EcKey;
 use openssl::pkey::Private;
 use openssl::pkey::Public;
 use smolset::SmolSet;
 use sshkey_attest::proto::PublicKey as SshPublicKey;
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use time::OffsetDateTime;
 use webauthn_rs::prelude::AttestationCaList;
@@ -43,15 +46,18 @@ pub use self::hexstring::ValueSetHexString;
 use self::image::ValueSetImage;
 pub use self::iname::ValueSetIname;
 pub use self::index::ValueSetIndex;
+pub use self::int64::ValueSetInt64;
 pub use self::iutf8::ValueSetIutf8;
-pub use self::json::ValueSetJsonFilter;
+pub use self::json::{ValueSetJson, ValueSetJsonFilter};
 pub use self::jws::{ValueSetJwsKeyEs256, ValueSetJwsKeyRs256};
 pub use self::key_internal::{KeyInternalData, ValueSetKeyInternal};
+pub use self::message::ValueSetMessage;
 pub use self::nsuniqueid::ValueSetNsUniqueId;
 pub use self::oauth::{
     OauthClaimMapping, ValueSetOauthClaimMap, ValueSetOauthScope, ValueSetOauthScopeMap,
 };
 pub use self::restricted::ValueSetRestricted;
+pub use self::s256::ValueSetSha256;
 pub use self::secret::ValueSetSecret;
 pub use self::session::{ValueSetApiToken, ValueSetOauth2Session, ValueSetSession};
 pub use self::spn::ValueSetSpn;
@@ -60,6 +66,7 @@ pub use self::syntax::ValueSetSyntax;
 pub use self::totp::ValueSetTotpSecret;
 pub use self::uihint::ValueSetUiHint;
 pub use self::uint32::ValueSetUint32;
+pub use self::uint64::ValueSetUint64;
 pub use self::url::ValueSetUrl;
 pub use self::utf8::ValueSetUtf8;
 pub use self::uuid::{ValueSetRefer, ValueSetUuid};
@@ -78,13 +85,16 @@ mod hexstring;
 pub mod image;
 mod iname;
 mod index;
+mod int64;
 mod iutf8;
 mod json;
 mod jws;
 mod key_internal;
+mod message;
 mod nsuniqueid;
 mod oauth;
 mod restricted;
+mod s256;
 mod secret;
 mod session;
 mod spn;
@@ -93,6 +103,7 @@ mod syntax;
 mod totp;
 mod uihint;
 mod uint32;
+mod uint64;
 mod url;
 mod utf8;
 mod uuid;
@@ -123,19 +134,33 @@ pub trait ValueSetT: std::fmt::Debug + DynClone {
 
     fn contains(&self, pv: &PartialValue) -> bool;
 
-    fn substring(&self, pv: &PartialValue) -> bool;
+    fn substring(&self, _pv: &crate::value::PartialValue) -> bool {
+        false
+    }
 
-    fn startswith(&self, pv: &PartialValue) -> bool;
+    fn startswith(&self, _pv: &PartialValue) -> bool {
+        false
+    }
 
-    fn endswith(&self, pv: &PartialValue) -> bool;
+    fn endswith(&self, _pv: &PartialValue) -> bool {
+        false
+    }
 
-    fn lessthan(&self, pv: &PartialValue) -> bool;
+    fn lessthan(&self, _pv: &crate::value::PartialValue) -> bool {
+        false
+    }
 
     fn len(&self) -> usize;
 
-    fn generate_idx_eq_keys(&self) -> Vec<String>;
+    fn generate_idx_eq_keys(&self) -> Vec<String> {
+        Vec::with_capacity(0)
+    }
 
     fn generate_idx_sub_keys(&self) -> Vec<String> {
+        Vec::with_capacity(0)
+    }
+
+    fn generate_idx_ord_keys(&self) -> Vec<String> {
         Vec::with_capacity(0)
     }
 
@@ -154,6 +179,15 @@ pub trait ValueSetT: std::fmt::Debug + DynClone {
     fn to_value_iter(&self) -> Box<dyn Iterator<Item = Value> + '_>;
 
     fn equal(&self, other: &ValueSet) -> bool;
+
+    fn cmp(&self, _other: &ValueSet) -> Ordering {
+        // IMPORTANT - in the case we attempt to compare the ordering of two value sets
+        // that are different syntaxs or types, the CORRECT and reliable thing to do is
+        // report them as equal such that any sorting function won't rearrange the values.
+        error!("cmp should not be called on {:?}", self.syntax());
+        debug_assert!(false);
+        Ordering::Equal
+    }
 
     fn merge(&mut self, other: &ValueSet) -> Result<(), OperationError>;
 
@@ -258,6 +292,16 @@ pub trait ValueSetT: std::fmt::Debug + DynClone {
     }
 
     fn as_uint32_set(&self) -> Option<&SmolSet<[u32; 1]>> {
+        debug_assert!(false);
+        None
+    }
+
+    fn as_int64_set(&self) -> Option<&SmolSet<[i64; 1]>> {
+        debug_assert!(false);
+        None
+    }
+
+    fn as_uint64_set(&self) -> Option<&SmolSet<[u64; 1]>> {
         debug_assert!(false);
         None
     }
@@ -449,6 +493,24 @@ pub trait ValueSetT: std::fmt::Debug + DynClone {
         None
     }
 
+    fn to_int64_single(&self) -> Option<i64> {
+        error!(
+            "to_int64_single should not be called on {:?}",
+            self.syntax()
+        );
+        debug_assert!(false);
+        None
+    }
+
+    fn to_uint64_single(&self) -> Option<u64> {
+        error!(
+            "to_uint64_single should not be called on {:?}",
+            self.syntax()
+        );
+        debug_assert!(false);
+        None
+    }
+
     fn to_syntaxtype_single(&self) -> Option<SyntaxType> {
         error!(
             "to_syntaxtype_single should not be called on {:?}",
@@ -632,7 +694,27 @@ pub trait ValueSetT: std::fmt::Debug + DynClone {
         None
     }
 
-    fn as_certificate_set(&self) -> Option<&BTreeMap<Sha256Digest, Box<Certificate>>> {
+    fn as_certificate_set(&self) -> Option<&BTreeMap<Sha256Output, Box<Certificate>>> {
+        debug_assert!(false);
+        None
+    }
+
+    fn as_json_object(&self) -> Option<&JsonValue> {
+        debug_assert!(false);
+        None
+    }
+
+    fn as_message(&self) -> Option<&OutboundMessage> {
+        debug_assert!(false);
+        None
+    }
+
+    fn as_s256_set(&self) -> Option<&BTreeSet<Sha256Output>> {
+        debug_assert!(false);
+        None
+    }
+
+    fn as_s256_set_mut(&mut self) -> Option<&mut BTreeSet<Sha256Output>> {
         debug_assert!(false);
         None
     }
@@ -807,6 +889,8 @@ pub fn from_result_value_iter(
         Value::Refer(u) => ValueSetRefer::new(u),
         Value::Bool(u) => ValueSetBool::new(u),
         Value::Uint32(u) => ValueSetUint32::new(u),
+        Value::Int64(u) => ValueSetInt64::new(u),
+        Value::Uint64(u) => ValueSetUint64::new(u),
         Value::Syntax(u) => ValueSetSyntax::new(u),
         Value::Index(u) => ValueSetIndex::new(u),
         Value::SecretValue(u) => ValueSetSecret::new(u),
@@ -846,6 +930,8 @@ pub fn from_result_value_iter(
         | Value::JwsKeyEs256(_)
         | Value::JwsKeyRs256(_)
         | Value::HexString(_)
+        | Value::Json(_)
+        | Value::Sha256(_)
         | Value::KeyInternal { .. } => {
             debug_assert!(false);
             return Err(OperationError::InvalidValueState);
@@ -874,6 +960,8 @@ pub fn from_value_iter(mut iter: impl Iterator<Item = Value>) -> Result<ValueSet
         Value::Refer(u) => ValueSetRefer::new(u),
         Value::Bool(u) => ValueSetBool::new(u),
         Value::Uint32(u) => ValueSetUint32::new(u),
+        Value::Int64(u) => ValueSetInt64::new(u),
+        Value::Uint64(u) => ValueSetUint64::new(u),
         Value::Syntax(u) => ValueSetSyntax::new(u),
         Value::Index(u) => ValueSetIndex::new(u),
         Value::SecretValue(u) => ValueSetSecret::new(u),
@@ -924,12 +1012,19 @@ pub fn from_value_iter(mut iter: impl Iterator<Item = Value>) -> Result<ValueSet
             der,
         } => ValueSetKeyInternal::new(id, usage, valid_from, status, status_cid, der),
         Value::Certificate(certificate) => ValueSetCertificate::new(certificate)?,
-
         Value::PhoneNumber(_, _) => {
             debug_assert!(false);
             return Err(OperationError::InvalidValueState);
         }
         Value::ApplicationPassword(ap) => ValueSetApplicationPassword::new(ap),
+        Value::Sha256(_) => {
+            debug_assert!(false);
+            return Err(OperationError::InvalidValueState);
+        }
+        Value::Json(_) => {
+            debug_assert!(false);
+            return Err(OperationError::InvalidValueState);
+        }
     };
 
     for v in iter {
@@ -947,6 +1042,8 @@ pub fn from_db_valueset_v2(dbvs: DbValueSetV2) -> Result<ValueSet, OperationErro
         DbValueSetV2::Reference(set) => ValueSetRefer::from_dbvs2(set),
         DbValueSetV2::Bool(set) => ValueSetBool::from_dbvs2(set),
         DbValueSetV2::Uint32(set) => ValueSetUint32::from_dbvs2(set),
+        DbValueSetV2::Int64(set) => ValueSetInt64::from_dbvs2(set),
+        DbValueSetV2::Uint64(set) => ValueSetUint64::from_dbvs2(set),
         DbValueSetV2::SyntaxType(set) => ValueSetSyntax::from_dbvs2(set),
         DbValueSetV2::IndexType(set) => ValueSetIndex::from_dbvs2(set),
         DbValueSetV2::SecretValue(set) => ValueSetSecret::from_dbvs2(set),
@@ -991,19 +1088,22 @@ pub fn from_db_valueset_v2(dbvs: DbValueSetV2) -> Result<ValueSet, OperationErro
         DbValueSetV2::HexString(set) => ValueSetHexString::from_dbvs2(set),
         DbValueSetV2::Certificate(set) => ValueSetCertificate::from_dbvs2(set),
         DbValueSetV2::ApplicationPassword(set) => ValueSetApplicationPassword::from_dbvs2(set),
+        DbValueSetV2::Json(object) => Ok(ValueSetJson::new(object)),
+        DbValueSetV2::Sha256(set) => ValueSetSha256::from_dbvs2(set),
+        DbValueSetV2::Message(object) => Ok(ValueSetMessage::new(object)),
     }
 }
 
 #[cfg(test)]
-pub(crate) fn scim_json_reflexive(vs: ValueSet, data: &str) {
+pub(crate) fn scim_json_reflexive(vs: &ValueSet, data: &str) {
     let scim_value = vs.to_scim_value().unwrap().assume_resolved();
 
     let strout = serde_json::to_string_pretty(&scim_value).unwrap();
-    eprintln!("{}", strout);
+    eprintln!("{strout}");
 
     let json_value: serde_json::Value = serde_json::to_value(&scim_value).unwrap();
 
-    eprintln!("{}", data);
+    eprintln!("{data}");
     let expect: serde_json::Value = serde_json::from_str(data).unwrap();
 
     assert_eq!(json_value, expect);
@@ -1012,36 +1112,38 @@ pub(crate) fn scim_json_reflexive(vs: ValueSet, data: &str) {
 #[cfg(test)]
 pub(crate) fn scim_json_reflexive_unresolved(
     write_txn: &mut QueryServerWriteTransaction,
-    vs: ValueSet,
+    vs: &ValueSet,
     data: &str,
 ) {
     let scim_int_value = vs.to_scim_value().unwrap().assume_unresolved();
     let scim_value = write_txn.resolve_scim_interim(scim_int_value).unwrap();
 
-    let strout = serde_json::to_string_pretty(&scim_value).unwrap();
-    eprintln!("{}", strout);
+    let strout = serde_json::to_string_pretty(&scim_value).expect("Failed to serialize");
+    eprintln!("{strout}");
 
-    let json_value: serde_json::Value = serde_json::to_value(&scim_value).unwrap();
+    let json_value: serde_json::Value =
+        serde_json::to_value(&scim_value).expect("Failed to convert to JSON");
 
-    let expect: serde_json::Value = serde_json::from_str(data).unwrap();
+    let expect: serde_json::Value =
+        serde_json::from_str(data).expect("Failed to parse expected JSON");
 
     assert_eq!(json_value, expect);
 }
 
 #[cfg(test)]
 pub(crate) fn scim_json_put_reflexive<T: ValueSetScimPut>(
-    expect_vs: ValueSet,
+    expect_vs: &ValueSet,
     additional_tests: &[(JsonValue, ValueSet)],
 ) {
     let scim_value = expect_vs.to_scim_value().unwrap().assume_resolved();
 
     let strout = serde_json::to_string_pretty(&scim_value).unwrap();
-    eprintln!("{}", strout);
+    eprintln!("{strout}");
 
     let generic = serde_json::to_value(scim_value).unwrap();
     // Check that we can turn back into a vs from the generic version.
     let vs = T::from_scim_json_put(generic).unwrap().assume_resolved();
-    assert_eq!(&vs, &expect_vs);
+    assert_eq!(&vs, expect_vs);
 
     // For each additional check, assert they work as expected.
     for (jv, expect_vs) in additional_tests {
@@ -1053,7 +1155,7 @@ pub(crate) fn scim_json_put_reflexive<T: ValueSetScimPut>(
 #[cfg(test)]
 pub(crate) fn scim_json_put_reflexive_unresolved<T: ValueSetScimPut>(
     write_txn: &mut QueryServerWriteTransaction,
-    expect_vs: ValueSet,
+    expect_vs: &ValueSet,
     additional_tests: &[(JsonValue, ValueSet)],
 ) {
     let scim_int_value = expect_vs.to_scim_value().unwrap().assume_unresolved();
@@ -1063,7 +1165,7 @@ pub(crate) fn scim_json_put_reflexive_unresolved<T: ValueSetScimPut>(
     // Check that we can turn back into a vs from the generic version.
     let vs_inter = T::from_scim_json_put(generic).unwrap().assume_unresolved();
     let vs = write_txn.resolve_valueset_intermediate(vs_inter).unwrap();
-    assert_eq!(&vs, &expect_vs);
+    assert_eq!(&vs, expect_vs);
 
     // For each additional check, assert they work as expected.
     for (jv, expect_vs) in additional_tests {

@@ -73,7 +73,9 @@ pub struct Config {
     pub schedule: Option<String>,
     pub status_bind: Option<String>,
     pub ldap_uri: Url,
-    pub ldap_ca: String,
+    #[serde(default)]
+    pub ldap_verify_ca: Option<bool>,
+    pub ldap_ca: Option<String>,
     pub ldap_sync_dn: String,
     pub ldap_sync_pw: String,
     pub ldap_sync_base_dn: String,
@@ -113,11 +115,11 @@ pub struct Config {
     #[serde(default)]
     pub group_attr_schema: GroupAttrSchema,
 
-    #[serde(flatten)]
-    pub entry_map: BTreeMap<Uuid, EntryConfig>,
-
     /// Maximum LDAP message size (in kilobytes)
     pub max_ber_size: Option<usize>,
+
+    #[serde(flatten)]
+    pub entry_map: BTreeMap<Uuid, EntryConfig>,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]

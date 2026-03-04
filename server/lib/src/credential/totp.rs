@@ -5,7 +5,7 @@ use kanidm_proto::internal::{TotpAlgo as ProtoTotpAlgo, TotpSecret as ProtoTotp}
 use openssl::hash::MessageDigest;
 use openssl::pkey::PKey;
 use openssl::sign::Signer;
-use rand::prelude::*;
+use rand::RngExt;
 
 use crate::be::dbvalue::{DbTotpAlgoV1, DbTotpV1};
 
@@ -145,8 +145,8 @@ impl Totp {
 
     // Create a new token with secure key and algo.
     pub fn generate_secure(step: u64) -> Self {
-        let mut rng = rand::thread_rng();
-        let secret: Vec<u8> = (0..SECRET_SIZE_BYTES).map(|_| rng.gen()).collect();
+        let mut rng = rand::rng();
+        let secret: Vec<u8> = (0..SECRET_SIZE_BYTES).map(|_| rng.random()).collect();
         let algo = TotpAlgo::Sha256;
         let digits = TotpDigits::Six;
         Totp {
@@ -179,6 +179,15 @@ impl Totp {
             .last()
             .map(|v| (v & 0xf) as usize)
             .ok_or(TotpError::HmacError)?;
+
+        // This is based on "dynamic truncation" where the offset into
+        // the hmac is dynamic based on the last byte of the hmac output.
+        // Since the array is u8, and we & with 0x0F, the value of offset
+        // must be in the range 0 to 15. All hmac outputs are 20 bytes
+        // or greater, so 15 + 4 == 19 as the upper bound will always
+        // be within the bounds of the hmac array.
+        // As a result, this is safe to slice.
+        #[allow(clippy::indexing_slicing)]
         let bytes: [u8; 4] = hmac[offset..offset + 4]
             .try_into()
             .map_err(|_| TotpError::HmacError)?;

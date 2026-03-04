@@ -10,7 +10,7 @@
 #![deny(clippy::needless_pass_by_value)]
 #![deny(clippy::trivially_copy_pass_by_ref)]
 
-#[cfg(not(any(feature = "dhat-heap", target_os = "illumos")))]
+#[cfg(all(not(feature = "dhat-heap"), target_os = "linux"))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -18,110 +18,43 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
-use std::fs::{metadata, File};
-// This works on both unix and windows.
-use fs4::fs_std::FileExt;
-use kanidm_proto::messages::ConsoleOutputMode;
-use sketching::otel::TracingPipelineGuard;
-use std::io::Read;
 #[cfg(target_family = "unix")]
 use std::os::unix::fs::MetadataExt;
-use std::path::PathBuf;
-use std::process::ExitCode;
 
-use clap::{Args, Parser, Subcommand};
-use futures::{SinkExt, StreamExt};
-#[cfg(not(target_family = "windows"))] // not needed for windows builds
+#[cfg(target_family = "unix")]
 use kanidm_utils_users::{get_current_gid, get_current_uid, get_effective_gid, get_effective_uid};
+
+#[cfg(target_family = "windows")] // for windows builds
+use whoami;
+
+use std::fs::{metadata, File};
+// This works on both unix and windows.
+use clap::{Args, Parser, Subcommand};
+use fs4::fs_std::FileExt;
+use futures::{SinkExt, StreamExt};
 use kanidmd_core::admin::{
     AdminTaskRequest, AdminTaskResponse, ClientCodec, ProtoDomainInfo,
     ProtoDomainUpgradeCheckReport, ProtoDomainUpgradeCheckStatus,
 };
-use kanidmd_core::config::{Configuration, ServerConfig};
+use kanidmd_core::config::{Configuration, ServerConfigUntagged};
 use kanidmd_core::{
     backup_server_core, cert_generate_core, create_server_core, dbscan_get_id2entry_core,
     dbscan_list_id2entry_core, dbscan_list_index_analysis_core, dbscan_list_index_core,
     dbscan_list_indexes_core, dbscan_list_quarantined_core, dbscan_quarantine_id2entry_core,
     dbscan_restore_quarantined_core, domain_rename_core, reindex_server_core, restore_server_core,
-    vacuum_server_core, verify_server_core,
+    vacuum_server_core, verify_server_core, CoreAction,
 };
+use serde::Serialize;
+use sketching::pipeline::TracingPipelineGuard;
 use sketching::tracing_forest::util::*;
+use std::fmt;
+use std::io::Read;
+use std::path::PathBuf;
+use std::process::ExitCode;
 use tokio::net::UnixStream;
 use tokio_util::codec::Framed;
-#[cfg(target_family = "windows")] // for windows builds
-use whoami;
 
 include!("./opt.rs");
-
-impl KanidmdOpt {
-    fn commonopt(&self) -> &CommonOpt {
-        match self {
-            KanidmdOpt::Server(sopt)
-            | KanidmdOpt::CertGenerate(sopt)
-            | KanidmdOpt::ConfigTest(sopt)
-            | KanidmdOpt::DbScan {
-                commands: DbScanOpt::ListIndexes(sopt),
-            }
-            | KanidmdOpt::DbScan {
-                commands: DbScanOpt::ListId2Entry(sopt),
-            }
-            | KanidmdOpt::DbScan {
-                commands: DbScanOpt::ListIndexAnalysis(sopt),
-            } => sopt,
-            KanidmdOpt::Database {
-                commands: DbCommands::Backup(bopt),
-            } => &bopt.commonopts,
-            KanidmdOpt::Database {
-                commands: DbCommands::Restore(ropt),
-            } => &ropt.commonopts,
-            KanidmdOpt::DbScan {
-                commands: DbScanOpt::QuarantineId2Entry { commonopts, .. },
-            }
-            | KanidmdOpt::DbScan {
-                commands: DbScanOpt::ListQuarantined { commonopts },
-            }
-            | KanidmdOpt::DbScan {
-                commands: DbScanOpt::RestoreQuarantined { commonopts, .. },
-            }
-            | KanidmdOpt::ShowReplicationCertificate { commonopts }
-            | KanidmdOpt::RenewReplicationCertificate { commonopts }
-            | KanidmdOpt::RefreshReplicationConsumer { commonopts, .. } => commonopts,
-            KanidmdOpt::RecoverAccount { commonopts, .. } => commonopts,
-            KanidmdOpt::DbScan {
-                commands: DbScanOpt::ListIndex(dopt),
-            } => &dopt.commonopts,
-            KanidmdOpt::DbScan {
-                commands: DbScanOpt::GetId2Entry(dopt),
-            } => &dopt.commonopts,
-            KanidmdOpt::DomainSettings {
-                commands: DomainSettingsCmds::Show { commonopts },
-            }
-            | KanidmdOpt::DomainSettings {
-                commands: DomainSettingsCmds::Change { commonopts },
-            }
-            | KanidmdOpt::DomainSettings {
-                commands: DomainSettingsCmds::UpgradeCheck { commonopts },
-            }
-            | KanidmdOpt::DomainSettings {
-                commands: DomainSettingsCmds::Raise { commonopts },
-            }
-            | KanidmdOpt::DomainSettings {
-                commands: DomainSettingsCmds::Remigrate { commonopts, .. },
-            } => commonopts,
-            KanidmdOpt::Database {
-                commands: DbCommands::Verify(sopt),
-            }
-            | KanidmdOpt::Database {
-                commands: DbCommands::Reindex(sopt),
-            } => sopt,
-            KanidmdOpt::Database {
-                commands: DbCommands::Vacuum(copt),
-            } => copt,
-            KanidmdOpt::HealthCheck(hcopt) => &hcopt.commonopts,
-            KanidmdOpt::Version(copt) => copt,
-        }
-    }
-}
 
 /// Get information on the windows username
 #[cfg(target_family = "windows")]
@@ -132,7 +65,104 @@ fn get_user_details_windows() {
     );
 }
 
-async fn submit_admin_req(path: &str, req: AdminTaskRequest, output_mode: ConsoleOutputMode) {
+fn display_json_success() {
+    let json_output = serde_json::json!({
+        "status": "ok",
+    });
+    println!("{json_output}");
+}
+
+fn display_json_success_output<T: Serialize>(data: T) {
+    let json_output = serde_json::json!({
+        "status": "ok",
+        "output": data,
+    });
+    println!("{json_output}");
+}
+
+fn display_json_error<E, M>(error: E, message: M)
+where
+    E: fmt::Display,
+    M: fmt::Display,
+{
+    let json_output = serde_json::json!({
+        "status": "error",
+        "reason": format!("{error}"),
+        "message": format!("{message}")
+    });
+    println!("{json_output}");
+}
+
+fn display_json_error_context<E, M, C>(error: E, message: M, context: C)
+where
+    E: fmt::Display,
+    M: fmt::Display,
+    C: fmt::Display,
+{
+    let json_output = serde_json::json!({
+        "status": "error",
+        "reason": format!("{error}"),
+        "message": format!("{message}"),
+        "context": format!("{context}"),
+    });
+    println!("{json_output}");
+}
+
+async fn submit_admin_req_json(path: &str, req: AdminTaskRequest) -> ExitCode {
+    // Connect to the socket.
+    let stream = match UnixStream::connect(path).await {
+        Ok(s) => s,
+        Err(err) => {
+            display_json_error(err, "Unable to connect to socket path.");
+
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let mut reqs = Framed::new(stream, ClientCodec);
+
+    if let Err(err) = reqs.send(req).await {
+        display_json_error(err, "Unable to connect to send request.");
+
+        return ExitCode::FAILURE;
+    };
+
+    if let Err(err) = reqs.flush().await {
+        display_json_error(err, "Unable to connect to flush request.");
+
+        return ExitCode::FAILURE;
+    }
+
+    match reqs.next().await {
+        Some(Ok(AdminTaskResponse::RecoverAccount { password })) => {
+            display_json_success_output(password)
+        }
+        Some(Ok(AdminTaskResponse::Success)) => {
+            display_json_success();
+        }
+        Some(Ok(AdminTaskResponse::Error)) => {
+            display_json_error(
+                "ResponseError",
+                "Error processing request - you should inspect the server logs.",
+            );
+            return ExitCode::FAILURE;
+        }
+        Some(Err(err)) => {
+            display_json_error(err, "Error during admin task operation.");
+            return ExitCode::FAILURE;
+        }
+        None => {
+            display_json_error("SocketClosed", "Error makeing request to admin socket.");
+            return ExitCode::FAILURE;
+        }
+
+        _ => {}
+    }
+
+    ExitCode::SUCCESS
+}
+
+async fn submit_admin_req_human(path: &str, req: AdminTaskRequest) -> ExitCode {
     // Connect to the socket.
     let stream = match UnixStream::connect(path).await {
         Ok(s) => s,
@@ -140,7 +170,7 @@ async fn submit_admin_req(path: &str, req: AdminTaskRequest, output_mode: Consol
             error!(err = ?e, %path, "Unable to connect to socket path");
             let diag = kanidm_lib_file_permissions::diagnose_path(path.as_ref());
             info!(%diag);
-            return;
+            return ExitCode::FAILURE;
         }
     };
 
@@ -148,173 +178,133 @@ async fn submit_admin_req(path: &str, req: AdminTaskRequest, output_mode: Consol
 
     if let Err(e) = reqs.send(req).await {
         error!(err = ?e, "Unable to send request");
-        return;
+        return ExitCode::FAILURE;
     };
 
     if let Err(e) = reqs.flush().await {
         error!(err = ?e, "Unable to flush request");
-        return;
+        return ExitCode::FAILURE;
     }
 
     trace!("flushed, waiting ...");
 
     match reqs.next().await {
-        Some(Ok(AdminTaskResponse::RecoverAccount { password })) => match output_mode {
-            ConsoleOutputMode::JSON => {
-                let json_output = serde_json::json!({
-                    "password": password
-                });
-                println!("{}", json_output);
-            }
-            ConsoleOutputMode::Text => {
-                info!(new_password = ?password)
-            }
-        },
-        Some(Ok(AdminTaskResponse::ShowReplicationCertificate { cert })) => match output_mode {
-            ConsoleOutputMode::JSON => {
-                println!("{{\"certificate\":\"{}\"}}", cert)
-            }
-            ConsoleOutputMode::Text => {
-                info!(certificate = ?cert)
-            }
-        },
-
+        Some(Ok(AdminTaskResponse::RecoverAccount { password })) => info!(new_password = ?password),
+        Some(Ok(AdminTaskResponse::ShowReplicationCertificate { cert })) => {
+            info!(certificate = ?cert)
+        }
         Some(Ok(AdminTaskResponse::DomainUpgradeCheck { report })) => {
-            match output_mode {
-                ConsoleOutputMode::JSON => {
-                    let json_output = serde_json::json!({
-                        "domain_upgrade_check": report
-                    });
-                    println!("{}", json_output);
-                }
-                ConsoleOutputMode::Text => {
-                    let ProtoDomainUpgradeCheckReport {
-                        name,
-                        uuid,
-                        current_level,
-                        upgrade_level,
-                        report_items,
-                    } = report;
+            let ProtoDomainUpgradeCheckReport {
+                name,
+                uuid,
+                current_level,
+                upgrade_level,
+                report_items,
+            } = report;
 
-                    info!("domain_name            : {}", name);
-                    info!("domain_uuid            : {}", uuid);
-                    info!("domain_current_level   : {}", current_level);
-                    info!("domain_upgrade_level   : {}", upgrade_level);
+            info!("domain_name            : {}", name);
+            info!("domain_uuid            : {}", uuid);
+            info!("domain_current_level   : {}", current_level);
+            info!("domain_upgrade_level   : {}", upgrade_level);
 
-                    for item in report_items {
-                        info!("------------------------");
-                        match item.status {
-                            ProtoDomainUpgradeCheckStatus::Pass6To7Gidnumber => {
-                                info!("upgrade_item           : gidnumber range validity");
-                                debug!("from_level             : {}", item.from_level);
-                                debug!("to_level               : {}", item.to_level);
-                                info!("status                 : PASS");
-                            }
-                            ProtoDomainUpgradeCheckStatus::Fail6To7Gidnumber => {
-                                info!("upgrade_item           : gidnumber range validity");
-                                debug!("from_level             : {}", item.from_level);
-                                debug!("to_level               : {}", item.to_level);
-                                info!("status                 : FAIL");
-                                info!("description            : The automatically allocated gidnumbers for posix accounts was found to allocate numbers into systemd-reserved ranges. These can no longer be used.");
-                                info!("action                 : Modify the gidnumber of affected entries so that they are in the range 65536 to 524287 OR reset the gidnumber to cause it to automatically regenerate.");
-                                for entry_id in item.affected_entries {
-                                    info!("affected_entry         : {}", entry_id);
-                                }
-                            }
-                            // ===========
-                            ProtoDomainUpgradeCheckStatus::Pass7To8SecurityKeys => {
-                                info!("upgrade_item           : security key usage");
-                                debug!("from_level             : {}", item.from_level);
-                                debug!("to_level               : {}", item.to_level);
-                                info!("status                 : PASS");
-                            }
-                            ProtoDomainUpgradeCheckStatus::Fail7To8SecurityKeys => {
-                                info!("upgrade_item           : security key usage");
-                                debug!("from_level             : {}", item.from_level);
-                                debug!("to_level               : {}", item.to_level);
-                                info!("status                 : FAIL");
-                                info!("description            : Security keys no longer function as a second factor due to the introduction of CTAP2 and greater forcing PIN interactions.");
-                                info!("action                 : Modify the accounts in question to remove their security key and add it as a passkey or enable TOTP");
-                                for entry_id in item.affected_entries {
-                                    info!("affected_entry         : {}", entry_id);
-                                }
-                            }
-                            // ===========
-                            ProtoDomainUpgradeCheckStatus::Pass7To8Oauth2StrictRedirectUri => {
-                                info!("upgrade_item           : oauth2 strict redirect uri enforcement");
-                                debug!("from_level             : {}", item.from_level);
-                                debug!("to_level               : {}", item.to_level);
-                                info!("status                 : PASS");
-                            }
-                            ProtoDomainUpgradeCheckStatus::Fail7To8Oauth2StrictRedirectUri => {
-                                info!("upgrade_item           : oauth2 strict redirect uri enforcement");
-                                debug!("from_level             : {}", item.from_level);
-                                debug!("to_level               : {}", item.to_level);
-                                info!("status                 : FAIL");
-                                info!("description            : To harden against possible public client open redirection vulnerabilities, redirect uris must now be registered ahead of time and are validated rather than the former origin verification process.");
-                                info!("action                 : Verify the redirect uri's for OAuth2 clients and then enable strict-redirect-uri on each client.");
-                                for entry_id in item.affected_entries {
-                                    info!("affected_entry         : {}", entry_id);
-                                }
-                            }
+            if report_items.is_empty() {
+                // Nothing to report, so this implies a pass.
+                info!("------------------------");
+                info!("status                 : PASS");
+                return ExitCode::SUCCESS;
+            }
+
+            for item in report_items {
+                info!("------------------------");
+                match item.status {
+                    ProtoDomainUpgradeCheckStatus::Pass6To7Gidnumber => {
+                        info!("upgrade_item           : gidnumber range validity");
+                        debug!("from_level             : {}", item.from_level);
+                        debug!("to_level               : {}", item.to_level);
+                        info!("status                 : PASS");
+                    }
+                    ProtoDomainUpgradeCheckStatus::Fail6To7Gidnumber => {
+                        info!("upgrade_item           : gidnumber range validity");
+                        debug!("from_level             : {}", item.from_level);
+                        debug!("to_level               : {}", item.to_level);
+                        info!("status                 : FAIL");
+                        info!("description            : The automatically allocated gidnumbers for posix accounts was found to allocate numbers into systemd-reserved ranges. These can no longer be used.");
+                        info!("action                 : Modify the gidnumber of affected entries so that they are in the range 65536 to 524287 OR reset the gidnumber to cause it to automatically regenerate.");
+                        for entry_id in item.affected_entries {
+                            info!("affected_entry         : {}", entry_id);
+                        }
+                    }
+                    // ===========
+                    ProtoDomainUpgradeCheckStatus::Pass7To8SecurityKeys => {
+                        info!("upgrade_item           : security key usage");
+                        debug!("from_level             : {}", item.from_level);
+                        debug!("to_level               : {}", item.to_level);
+                        info!("status                 : PASS");
+                    }
+                    ProtoDomainUpgradeCheckStatus::Fail7To8SecurityKeys => {
+                        info!("upgrade_item           : security key usage");
+                        debug!("from_level             : {}", item.from_level);
+                        debug!("to_level               : {}", item.to_level);
+                        info!("status                 : FAIL");
+                        info!("description            : Security keys no longer function as a second factor due to the introduction of CTAP2 and greater forcing PIN interactions.");
+                        info!("action                 : Modify the accounts in question to remove their security key and add it as a passkey or enable TOTP");
+                        for entry_id in item.affected_entries {
+                            info!("affected_entry         : {}", entry_id);
+                        }
+                    }
+                    // ===========
+                    ProtoDomainUpgradeCheckStatus::Pass7To8Oauth2StrictRedirectUri => {
+                        info!("upgrade_item           : oauth2 strict redirect uri enforcement");
+                        debug!("from_level             : {}", item.from_level);
+                        debug!("to_level               : {}", item.to_level);
+                        info!("status                 : PASS");
+                    }
+                    ProtoDomainUpgradeCheckStatus::Fail7To8Oauth2StrictRedirectUri => {
+                        info!("upgrade_item           : oauth2 strict redirect uri enforcement");
+                        debug!("from_level             : {}", item.from_level);
+                        debug!("to_level               : {}", item.to_level);
+                        info!("status                 : FAIL");
+                        info!("description            : To harden against possible public client open redirection vulnerabilities, redirect uris must now be registered ahead of time and are validated rather than the former origin verification process.");
+                        info!("action                 : Verify the redirect uri's for OAuth2 clients and then enable strict-redirect-uri on each client.");
+                        for entry_id in item.affected_entries {
+                            info!("affected_entry         : {}", entry_id);
                         }
                     }
                 }
-            }
+            } // end for report items
         }
+        Some(Ok(AdminTaskResponse::DomainRaise { level })) => {
+            info!("success - raised domain level to {}", level)
+        }
+        Some(Ok(AdminTaskResponse::DomainShow { domain_info })) => {
+            let ProtoDomainInfo {
+                name,
+                displayname,
+                uuid,
+                level,
+            } = domain_info;
 
-        Some(Ok(AdminTaskResponse::DomainRaise { level })) => match output_mode {
-            ConsoleOutputMode::JSON => {
-                eprintln!("{{\"success\":\"{}\"}}", level)
-            }
-            ConsoleOutputMode::Text => {
-                info!("success - raised domain level to {}", level)
-            }
-        },
-        Some(Ok(AdminTaskResponse::DomainShow { domain_info })) => match output_mode {
-            ConsoleOutputMode::JSON => {
-                let json_output = serde_json::json!({
-                    "domain_info": domain_info
-                });
-                println!("{}", json_output);
-            }
-            ConsoleOutputMode::Text => {
-                let ProtoDomainInfo {
-                    name,
-                    displayname,
-                    uuid,
-                    level,
-                } = domain_info;
-
-                info!("domain_name   : {}", name);
-                info!("domain_display: {}", displayname);
-                info!("domain_uuid   : {}", uuid);
-                info!("domain_level  : {}", level);
-            }
-        },
-        Some(Ok(AdminTaskResponse::Success)) => match output_mode {
-            ConsoleOutputMode::JSON => {
-                eprintln!("\"success\"")
-            }
-            ConsoleOutputMode::Text => {
-                info!("success")
-            }
-        },
-        Some(Ok(AdminTaskResponse::Error)) => match output_mode {
-            ConsoleOutputMode::JSON => {
-                eprintln!("\"error\"")
-            }
-            ConsoleOutputMode::Text => {
-                info!("Error - you should inspect the logs.")
-            }
-        },
+            info!("domain_name   : {}", name);
+            info!("domain_display: {}", displayname);
+            info!("domain_uuid   : {}", uuid);
+            info!("domain_level  : {}", level);
+        }
+        Some(Ok(AdminTaskResponse::Success)) => info!("success"),
+        Some(Ok(AdminTaskResponse::Error)) => {
+            info!("Error - you should inspect the logs.");
+            return ExitCode::FAILURE;
+        }
         Some(Err(err)) => {
             error!(?err, "Error during admin task operation");
+            return ExitCode::FAILURE;
         }
         None => {
             error!("Error making request to admin socket");
+            return ExitCode::FAILURE;
         }
-    }
+    };
+
+    ExitCode::SUCCESS
 }
 
 /// Check what we're running as and various filesystem permissions.
@@ -341,10 +331,10 @@ fn check_file_ownership(opt: &KanidmdParser) -> Result<(), ExitCode> {
         (cuid, ceuid)
     };
 
-    if let Some(cfg_path) = opt.config_path() {
+    if let Some(cfg_path) = &opt.config_path {
         #[cfg(target_family = "unix")]
         {
-            if let Some(cfg_meta) = match metadata(&cfg_path) {
+            if let Some(cfg_meta) = match metadata(cfg_path) {
                 Ok(m) => Some(m),
                 Err(e) => {
                     error!(
@@ -378,29 +368,144 @@ fn check_file_ownership(opt: &KanidmdParser) -> Result<(), ExitCode> {
     Ok(())
 }
 
+async fn scripting_command(cmd: ScriptingCommand, config: Configuration) -> ExitCode {
+    match cmd {
+        ScriptingCommand::RecoverAccount { name } => {
+            submit_admin_req_json(
+                config.adminbindpath.as_str(),
+                AdminTaskRequest::RecoverAccount {
+                    name: name.to_owned(),
+                },
+            )
+            .await;
+        }
+
+        ScriptingCommand::Backup { path } => {
+            backup_server_core(&config, path.as_deref());
+        }
+
+        ScriptingCommand::Reload => {
+            submit_admin_req_json(config.adminbindpath.as_str(), AdminTaskRequest::Reload).await;
+        }
+
+        ScriptingCommand::HealthCheck {
+            verify_tls,
+            check_origin,
+        } => {
+            let healthcheck_url = match check_origin {
+                true => format!("{}/status", config.origin),
+                false => {
+                    // the replace covers when you specify an ipv6-capable "all" address
+                    format!(
+                        "https://{}/status",
+                        config.address[0].replace("[::]", "localhost")
+                    )
+                }
+            };
+
+            let mut client = reqwest::ClientBuilder::new()
+                .danger_accept_invalid_certs(!verify_tls)
+                .danger_accept_invalid_hostnames(!verify_tls)
+                .https_only(true);
+
+            client = match &config.tls_config {
+                None => client,
+                Some(tls_config) => {
+                    // if the ca_cert file exists, then we'll use it
+                    let ca_cert_path = tls_config.chain.clone();
+                    match ca_cert_path.exists() {
+                        true => {
+                            let mut cert_buf = Vec::new();
+                            if let Err(err) = std::fs::File::open(&ca_cert_path)
+                                .and_then(|mut file| file.read_to_end(&mut cert_buf))
+                            {
+                                display_json_error_context(
+                                    err,
+                                    "Failed to read from filesystem.",
+                                    ca_cert_path.display(),
+                                );
+
+                                return ExitCode::FAILURE;
+                            }
+
+                            let ca_chain_parsed =
+                                match reqwest::Certificate::from_pem_bundle(&cert_buf) {
+                                    Ok(val) => val,
+                                    Err(err) => {
+                                        display_json_error_context(
+                                            err,
+                                            "Failed to parse into ca_chain.",
+                                            ca_cert_path.display(),
+                                        );
+
+                                        return ExitCode::FAILURE;
+                                    }
+                                };
+
+                            // Need at least 2 certs for the leaf + chain. We skip the leaf.
+                            for cert in ca_chain_parsed.into_iter().skip(1) {
+                                client = client.add_root_certificate(cert)
+                            }
+                            client
+                        }
+                        false => {
+                            display_json_error_context(
+                                "NoSuchFile",
+                                "Requested ca file does not exist.",
+                                ca_cert_path.display(),
+                            );
+
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                }
+            };
+            #[allow(clippy::unwrap_used)]
+            let client = client.build().unwrap();
+
+            let _ = match client.get(&healthcheck_url).send().await {
+                Ok(val) => val,
+                Err(error) => {
+                    let error_message = {
+                        if error.is_timeout() {
+                            format!("Timeout connecting to url={healthcheck_url}")
+                        } else if error.is_connect() {
+                            format!("Connection failed: {error}")
+                        } else {
+                            format!("Failed to complete healthcheck: {error:?}")
+                        }
+                    };
+
+                    display_json_error("HealthcheckFailed", error_message);
+
+                    return ExitCode::FAILURE;
+                }
+            };
+            display_json_success();
+        }
+    }
+
+    ExitCode::SUCCESS
+}
+
 // We have to do this because we can't use tracing until we've started the logging pipeline, and we can't start the logging pipeline until the tokio runtime's doing its thing.
-async fn start_daemon(
-    opt: KanidmdParser,
-    mut config: Configuration,
-    sconfig: ServerConfig,
-) -> ExitCode {
+async fn start_daemon(opt: KanidmdParser, config: Configuration) -> ExitCode {
     // if we have a server config and it has an OTEL URL, then we'll start the logging pipeline now.
 
     // TODO: only send to stderr when we're not in a TTY
-    let sub = match sketching::otel::start_logging_pipeline(
-        &sconfig.otel_grpc_url,
-        sconfig.log_level.unwrap_or_default(),
-        "kanidmd",
+    let (provider, logging_subscriber) = match sketching::pipeline::start_logging_pipeline(
+        &config.otel_grpc_url,
+        config.log_level,
     ) {
         Err(err) => {
-            eprintln!("Error starting logger - {:} - Bailing on startup!", err);
+            eprintln!("Error starting logger - {err:} - Bailing on startup!");
             return ExitCode::FAILURE;
         }
         Ok(val) => val,
     };
 
-    if let Err(err) = tracing::subscriber::set_global_default(sub).map_err(|err| {
-        eprintln!("Error starting logger - {:} - Bailing on startup!", err);
+    if let Err(err) = tracing::subscriber::set_global_default(logging_subscriber).map_err(|err| {
+        eprintln!("Error starting logger - {err:} - Bailing on startup!");
         ExitCode::FAILURE
     }) {
         return err;
@@ -409,11 +514,10 @@ async fn start_daemon(
     // ************************************************
     // HERE'S WHERE YOU CAN START USING THE LOGGER
     // ************************************************
-
     info!(version = %env!("KANIDM_PKG_VERSION"), "Starting Kanidmd");
 
     // guard which shuts down the logging/tracing providers when we close out
-    let _otelguard = TracingPipelineGuard {};
+    let _otelguard = TracingPipelineGuard(provider);
 
     // ===========================================================================
     // Start pre-run checks
@@ -423,8 +527,8 @@ async fn start_daemon(
         return err;
     };
 
-    if let Some(db_path) = sconfig.db_path.as_ref() {
-        let db_pathbuf = PathBuf::from(db_path.as_str());
+    if let Some(db_path) = config.db_path.as_ref() {
+        let db_pathbuf = db_path.to_path_buf();
         // We can't check the db_path permissions because it may not exist yet!
         if let Some(db_parent_path) = db_pathbuf.parent() {
             if !db_parent_path.exists() {
@@ -464,72 +568,75 @@ async fn start_daemon(
                 warn!("WARNING: DB folder {} has 'everyone' permission bits in the mode. This could be a security risk ...", db_par_path_buf.to_str().unwrap_or("invalid file path"));
             }
         }
-        config.update_db_path(db_path);
     } else {
         error!("No db_path set in configuration, server startup will FAIL!");
         return ExitCode::FAILURE;
     }
 
-    if let Some(origin) = sconfig.origin.clone() {
-        config.update_origin(&origin);
-    } else {
-        error!("No origin set in configuration, server startup will FAIL!");
-        return ExitCode::FAILURE;
-    }
-
-    if let Some(domain) = sconfig.domain.clone() {
-        config.update_domain(&domain);
-    } else {
-        error!("No domain set in configuration, server startup will FAIL!");
-        return ExitCode::FAILURE;
-    }
-
-    config.update_db_arc_size(sconfig.get_db_arc_size());
-    config.update_role(sconfig.role);
-    config.update_output_mode(opt.commands.commonopt().output_mode.to_owned().into());
-    config.update_trust_x_forward_for(sconfig.trust_x_forward_for);
-    config.update_admin_bind_path(&sconfig.adminbindpath);
-    config.update_replication_config(sconfig.repl_config.clone());
-
-    match &opt.commands {
+    let lock_was_setup = match &opt.commands {
         // we aren't going to touch the DB so we can carry on
-        KanidmdOpt::ShowReplicationCertificate { .. }
-        | KanidmdOpt::RenewReplicationCertificate { .. }
+        KanidmdOpt::ShowReplicationCertificate
+        | KanidmdOpt::RenewReplicationCertificate
         | KanidmdOpt::RefreshReplicationConsumer { .. }
         | KanidmdOpt::RecoverAccount { .. }
-        | KanidmdOpt::HealthCheck(_) => (),
+        | KanidmdOpt::DisableAccount { .. } => None,
         _ => {
             // Okay - Lets now create our lock and go.
             #[allow(clippy::expect_used)]
-            let klock_path = match sconfig.db_path.clone() {
-                Some(val) => format!("{}.klock", val),
-                None => std::env::temp_dir()
-                    .join("kanidmd.klock")
-                    .to_str()
-                    .expect("Unable to create klock path, this is a critical error!")
-                    .to_string(),
+            let klock_path = match config.db_path.clone() {
+                Some(val) => val.with_extension("klock"),
+                None => std::env::temp_dir().join("kanidmd.klock"),
             };
 
             let flock = match File::create(&klock_path) {
                 Ok(flock) => flock,
-                Err(e) => {
-                    error!("ERROR: Refusing to start - unable to create kanidmd exclusive lock at {} - {:?}", klock_path, e);
+                Err(err) => {
+                    error!(
+                        "ERROR: Refusing to start - unable to create kanidmd exclusive lock at {}",
+                        klock_path.display()
+                    );
+                    error!(?err);
                     return ExitCode::FAILURE;
                 }
             };
 
             match flock.try_lock_exclusive() {
-                Ok(()) => debug!("Acquired kanidm exclusive lock"),
-                Err(e) => {
-                    error!("ERROR: Refusing to start - unable to lock kanidmd exclusive lock at {} - {:?}", klock_path, e);
+                Ok(true) => debug!("Acquired kanidm exclusive lock"),
+                Ok(false) => {
+                    error!(
+                        "ERROR: Refusing to start - unable to lock kanidmd exclusive lock at {}",
+                        klock_path.display()
+                    );
                     error!("Is another kanidmd process running?");
                     return ExitCode::FAILURE;
                 }
+                Err(err) => {
+                    error!(
+                        "ERROR: Refusing to start - unable to lock kanidmd exclusive lock at {}",
+                        klock_path.display()
+                    );
+                    error!(?err);
+                    return ExitCode::FAILURE;
+                }
             };
+
+            Some(klock_path)
+        }
+    };
+
+    let result_code = kanidm_main(config, opt).await;
+
+    if let Some(klock_path) = lock_was_setup {
+        if let Err(reason) = std::fs::remove_file(&klock_path) {
+            warn!(
+                ?reason,
+                "WARNING: Unable to clean up kanidmd exclusive lock at {}",
+                klock_path.display()
+            );
         }
     }
 
-    kanidm_main(sconfig, config, opt).await
+    result_code
 }
 
 fn main() -> ExitCode {
@@ -551,24 +658,20 @@ fn main() -> ExitCode {
     let opt = KanidmdParser::parse();
 
     // print the app version and bail
-    if let KanidmdOpt::Version(_) = &opt.commands {
+    if let KanidmdOpt::Version = &opt.commands {
         println!("kanidmd {}", env!("KANIDM_PKG_VERSION"));
         return ExitCode::SUCCESS;
     };
 
-    //we set up a list of these so we can set the log config THEN log out the errors.
-    let mut config_error: Vec<String> = Vec::new();
-    let mut config = Configuration::new();
-
     if env!("KANIDM_SERVER_CONFIG_PATH").is_empty() {
-        println!("CRITICAL: Kanidmd was not built correctly and is missing a valid KANIDM_SERVER_CONFIG_PATH value");
+        eprintln!("CRITICAL: Kanidmd was not built correctly and is missing a valid KANIDM_SERVER_CONFIG_PATH value");
         return ExitCode::FAILURE;
     }
 
     let default_config_path = PathBuf::from(env!("KANIDM_SERVER_CONFIG_PATH"));
 
-    let maybe_config_path = if let Some(p) = opt.config_path() {
-        Some(p)
+    let maybe_config_path = if let Some(p) = &opt.config_path {
+        Some(p.clone())
     } else {
         // The user didn't ask for a file, lets check if the default path exists?
         if default_config_path.exists() {
@@ -581,49 +684,43 @@ fn main() -> ExitCode {
         }
     };
 
-    let sconfig = match ServerConfig::new(maybe_config_path) {
-        Ok(c) => Some(c),
-        Err(e) => {
-            config_error.push(format!("Config Parse failure {:?}", e));
-            return ExitCode::FAILURE;
+    let maybe_sconfig = if let Some(config_path) = maybe_config_path {
+        match ServerConfigUntagged::new(config_path) {
+            Ok(c) => Some(c),
+            Err(err) => {
+                eprintln!("ERROR: Configuration Parse Failure: {err:?}");
+                return ExitCode::FAILURE;
+            }
         }
+    } else {
+        eprintln!("WARNING: No configuration path was provided, relying on environment variables.");
+        None
     };
 
-    // Get information on the windows username
-    #[cfg(target_family = "windows")]
-    get_user_details_windows();
+    let is_server = matches!(&opt.commands, KanidmdOpt::Server);
 
-    if !config_error.is_empty() {
-        println!("There were errors on startup, which prevent the server from starting:");
-        for e in config_error {
-            println!(" - {}", e);
-        }
+    let config = Configuration::build()
+        .add_opt_toml_config(maybe_sconfig)
+        .add_cli_config(&opt.kanidmd_options)
+        // set threads to 1 unless it's the main server.
+        .is_server_mode(is_server)
+        .finish();
+
+    let Some(config) = config else {
+        eprintln!(
+            "ERROR: Unable to build server configuration from provided configuration inputs."
+        );
         return ExitCode::FAILURE;
-    }
-
-    let sconfig = match sconfig {
-        Some(val) => val,
-        None => {
-            println!("Somehow you got an empty ServerConfig after error checking? Cannot start!");
-            return ExitCode::FAILURE;
-        }
     };
 
     // ===========================================================================
     // Config ready
 
-    // We always set threads to 1 unless it's the main server.
-    if matches!(&opt.commands, KanidmdOpt::Server(_)) {
-        // If not updated, will default to maximum
-        if let Some(threads) = sconfig.thread_count {
-            config.update_threads_count(threads);
-        }
-    } else {
-        config.update_threads_count(1);
-    };
+    // Get information on the windows username
+    #[cfg(target_family = "windows")]
+    get_user_details_windows();
 
     // Start the runtime
-
     let maybe_rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(config.threads)
         .enable_all()
@@ -638,112 +735,116 @@ fn main() -> ExitCode {
     let rt = match maybe_rt {
         Ok(rt) => rt,
         Err(err) => {
-            eprintln!("CRITICAL: Unable to start runtime! {:?}", err);
+            eprintln!("CRITICAL: Unable to start runtime! {err:?}");
             return ExitCode::FAILURE;
         }
     };
 
-    rt.block_on(start_daemon(opt, config, sconfig))
+    // Choose where we go.
+
+    if let KanidmdOpt::Scripting { command } = opt.commands {
+        rt.block_on(scripting_command(command, config))
+    } else {
+        rt.block_on(start_daemon(opt, config))
+    }
 }
 
 /// Build and execute the main server. The ServerConfig are the configuration options
 /// that we are processing into the config for the main server.
-async fn kanidm_main(
-    sconfig: ServerConfig,
-    mut config: Configuration,
-    opt: KanidmdParser,
-) -> ExitCode {
+async fn kanidm_main(config: Configuration, opt: KanidmdParser) -> ExitCode {
     match &opt.commands {
-        KanidmdOpt::Server(_sopt) | KanidmdOpt::ConfigTest(_sopt) => {
-            let config_test = matches!(&opt.commands, KanidmdOpt::ConfigTest(_));
+        KanidmdOpt::Server | KanidmdOpt::ConfigTest => {
+            let config_test = matches!(&opt.commands, KanidmdOpt::ConfigTest);
             if config_test {
                 info!("Running in server configuration test mode ...");
             } else {
                 info!("Running in server mode ...");
             };
 
-            // configuration options that only relate to server mode
-            config.update_config_for_server_mode(&sconfig);
-
-            if let Some(i_str) = &(sconfig.tls_chain) {
-                let i_path = PathBuf::from(i_str.as_str());
-                let i_meta = match metadata(&i_path) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        error!(
-                            "Unable to read metadata for TLS chain file '{}' - {:?}",
-                            &i_path.to_str().unwrap_or("invalid file path"),
-                            e
-                        );
-                        let diag = kanidm_lib_file_permissions::diagnose_path(&i_path);
-                        info!(%diag);
-                        return ExitCode::FAILURE;
+            // Verify the TLs configs.
+            if let Some(tls_config) = config.tls_config.as_ref() {
+                {
+                    let i_meta = match metadata(&tls_config.chain) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            error!(
+                                "Unable to read metadata for TLS chain file '{}' - {:?}",
+                                tls_config.chain.display(),
+                                e
+                            );
+                            let diag =
+                                kanidm_lib_file_permissions::diagnose_path(&tls_config.chain);
+                            info!(%diag);
+                            return ExitCode::FAILURE;
+                        }
+                    };
+                    if !kanidm_lib_file_permissions::readonly(&i_meta) {
+                        warn!("permissions on {} may not be secure. Should be readonly to running uid. This could be a security risk ...", tls_config.chain.display());
                     }
-                };
-                if !kanidm_lib_file_permissions::readonly(&i_meta) {
-                    warn!("permissions on {} may not be secure. Should be readonly to running uid. This could be a security risk ...", i_str);
                 }
-            }
 
-            if let Some(i_str) = &(sconfig.tls_key) {
-                let i_path = PathBuf::from(i_str.as_str());
-
-                let i_meta = match metadata(&i_path) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        error!(
-                            "Unable to read metadata for TLS key file '{}' - {:?}",
-                            &i_path.to_str().unwrap_or("invalid file path"),
-                            e
-                        );
-                        let diag = kanidm_lib_file_permissions::diagnose_path(&i_path);
-                        info!(%diag);
-                        return ExitCode::FAILURE;
+                {
+                    let i_meta = match metadata(&tls_config.key) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            error!(
+                                "Unable to read metadata for TLS key file '{}' - {:?}",
+                                tls_config.key.display(),
+                                e
+                            );
+                            let diag = kanidm_lib_file_permissions::diagnose_path(&tls_config.key);
+                            info!(%diag);
+                            return ExitCode::FAILURE;
+                        }
+                    };
+                    if !kanidm_lib_file_permissions::readonly(&i_meta) {
+                        warn!("permissions on {} may not be secure. Should be readonly to running uid. This could be a security risk ...", tls_config.key.display());
                     }
-                };
-                if !kanidm_lib_file_permissions::readonly(&i_meta) {
-                    warn!("permissions on {} may not be secure. Should be readonly to running uid. This could be a security risk ...", i_str);
-                }
-                #[cfg(not(target_os = "windows"))]
-                if i_meta.mode() & 0o007 != 0 {
-                    warn!("WARNING: {} has 'everyone' permission bits in the mode. This could be a security risk ...", i_str);
-                }
-            }
-
-            if let Some(ca_dir) = &(sconfig.tls_client_ca) {
-                // check that the TLS client CA config option is what we expect
-                let ca_dir_path = PathBuf::from(&ca_dir);
-                if !ca_dir_path.exists() {
-                    error!(
-                        "TLS CA folder {} does not exist, server startup will FAIL!",
-                        ca_dir
-                    );
-                    let diag = kanidm_lib_file_permissions::diagnose_path(&ca_dir_path);
-                    info!(%diag);
+                    #[cfg(not(target_os = "windows"))]
+                    if i_meta.mode() & 0o007 != 0 {
+                        warn!("WARNING: {} has 'everyone' permission bits in the mode. This could be a security risk ...", tls_config.key.display());
+                    }
                 }
 
-                let i_meta = match metadata(&ca_dir_path) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        error!("Unable to read metadata for '{}' - {:?}", ca_dir, e);
+                if let Some(ca_dir) = tls_config.client_ca.as_ref() {
+                    // check that the TLS client CA config option is what we expect
+                    let ca_dir_path = PathBuf::from(&ca_dir);
+                    if !ca_dir_path.exists() {
+                        error!(
+                            "TLS CA folder {} does not exist, server startup will FAIL!",
+                            ca_dir.display()
+                        );
                         let diag = kanidm_lib_file_permissions::diagnose_path(&ca_dir_path);
                         info!(%diag);
+                    }
+
+                    let i_meta = match metadata(&ca_dir_path) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            error!(
+                                "Unable to read metadata for '{}' - {:?}",
+                                ca_dir.display(),
+                                e
+                            );
+                            let diag = kanidm_lib_file_permissions::diagnose_path(&ca_dir_path);
+                            info!(%diag);
+                            return ExitCode::FAILURE;
+                        }
+                    };
+                    if !i_meta.is_dir() {
+                        error!(
+                            "ERROR: Refusing to run - TLS Client CA folder {} may not be a directory",
+                            ca_dir.display()
+                        );
                         return ExitCode::FAILURE;
                     }
-                };
-                if !i_meta.is_dir() {
-                    error!(
-                        "ERROR: Refusing to run - TLS Client CA folder {} may not be a directory",
-                        ca_dir
-                    );
-                    return ExitCode::FAILURE;
-                }
-                if kanidm_lib_file_permissions::readonly(&i_meta) {
-                    warn!("WARNING: TLS Client CA folder permissions on {} indicate it may not be RW. This could cause the server start up to fail!", ca_dir);
-                }
-                #[cfg(not(target_os = "windows"))]
-                if i_meta.mode() & 0o007 != 0 {
-                    warn!("WARNING: TLS Client CA folder {} has 'everyone' permission bits in the mode. This could be a security risk ...", ca_dir);
+                    if kanidm_lib_file_permissions::readonly(&i_meta) {
+                        warn!("WARNING: TLS Client CA folder permissions on {} indicate it may not be RW. This could cause the server start up to fail!", ca_dir.display());
+                    }
+                    #[cfg(not(target_os = "windows"))]
+                    if i_meta.mode() & 0o007 != 0 {
+                        warn!("WARNING: TLS Client CA folder {} has 'everyone' permission bits in the mode. This could be a security risk ...", ca_dir.display());
+                    }
                 }
             }
 
@@ -753,14 +854,6 @@ async fn kanidm_main(
                 #[cfg(target_os = "linux")]
                 {
                     let _ = sd_notify::notify(true, &[sd_notify::NotifyState::Ready]);
-                    // Undocumented systemd feature - all messages should have a monotonic usec sent
-                    // with them. In some cases like "reloading" messages, it is undocumented but
-                    // failure to send this message causes the reload to fail.
-                    if let Ok(monotonic_usec) = sd_notify::NotifyState::monotonic_usec_now() {
-                        let _ = sd_notify::notify(true, &[monotonic_usec]);
-                    } else {
-                        error!("CRITICAL!!! Unable to access clock monotonic time. SYSTEMD WILL KILL US.");
-                    };
                     let _ = sd_notify::notify(
                         true,
                         &[sd_notify::NotifyState::Status("Started Kanidm 🦀")],
@@ -774,86 +867,55 @@ async fn kanidm_main(
                             {
                                 let mut listener = sctx.subscribe();
                                 tokio::select! {
-                                                Ok(()) = tokio::signal::ctrl_c() => {
-                                                    break
-                                                }
-                                                Some(()) = async move {
-                                                    let sigterm = tokio::signal::unix::SignalKind::terminate();
-                                                    #[allow(clippy::unwrap_used)]
-                                                    tokio::signal::unix::signal(sigterm).unwrap().recv().await
-                                                } => {
-                                                    break
-                                                }
-                                                Some(()) = async move {
-                                                    let sigterm = tokio::signal::unix::SignalKind::alarm();
-                                                    #[allow(clippy::unwrap_used)]
-                                                    tokio::signal::unix::signal(sigterm).unwrap().recv().await
-                                                } => {
-                                                    // Ignore
-                                                }
-                                                Some(()) = async move {
-                                                    let sigterm = tokio::signal::unix::SignalKind::hangup();
-                                                    #[allow(clippy::unwrap_used)]
-                                                    tokio::signal::unix::signal(sigterm).unwrap().recv().await
-                                                } => {
-                                                    // Reload TLS certificates
-                                                    // systemd has a special reload handler for this.
-                                                    #[cfg(target_os = "linux")]
-                                                    {
-                                                    let _ = sd_notify::notify(true, &[sd_notify::NotifyState::Reloading]);
-                                                    // CRITICAL - if you do not send a monotonic usec message after a reloading
-                                                    // message, your service WILL BE KILLED.
-                                if let Ok(monotonic_usec) = sd_notify::NotifyState::monotonic_usec_now() {
-                                let _ =
-                                    sd_notify::notify(true, &[monotonic_usec]);
-                                } else {
-                                    error!("CRITICAL!!! Unable to access clock monotonic time. SYSTEMD WILL KILL US.");
-                                };
-                                                    let _ = sd_notify::notify(true, &[sd_notify::NotifyState::Status("Reloading ...")]);
-                                                    }
-
-                                                    sctx.tls_acceptor_reload().await;
-
-                                                    // Systemd freaks out if you send the ready state too fast after the
-                                                    // reload state and can kill Kanidmd as a result.
-                                                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-
-                                                    #[cfg(target_os = "linux")]
-                                                    {
-                                                    let _ = sd_notify::notify(true, &[sd_notify::NotifyState::Ready]);
-                                if let Ok(monotonic_usec) = sd_notify::NotifyState::monotonic_usec_now() {
-                                let _ =
-                                    sd_notify::notify(true, &[monotonic_usec]);
-                                } else {
-                                    error!("CRITICAL!!! Unable to access clock monotonic time. SYSTEMD WILL KILL US.");
-                                };
-                                                    let _ = sd_notify::notify(true, &[sd_notify::NotifyState::Status("Reload Success")]);
-                                                    }
-
-                                                    info!("Reload complete");
-                                                }
-                                                Some(()) = async move {
-                                                    let sigterm = tokio::signal::unix::SignalKind::user_defined1();
-                                                    #[allow(clippy::unwrap_used)]
-                                                    tokio::signal::unix::signal(sigterm).unwrap().recv().await
-                                                } => {
-                                                    // Ignore
-                                                }
-                                                Some(()) = async move {
-                                                    let sigterm = tokio::signal::unix::SignalKind::user_defined2();
-                                                    #[allow(clippy::unwrap_used)]
-                                                    tokio::signal::unix::signal(sigterm).unwrap().recv().await
-                                                } => {
-                                                    // Ignore
-                                                }
-                                                // we got a message on thr broadcast from somewhere else
-                                                Ok(msg) = async move {
-                                                    listener.recv().await
-                                                } => {
-                                                    debug!("Main loop received message: {:?}", msg);
-                                                    break
-                                                }
-                                            }
+                                    Ok(()) = tokio::signal::ctrl_c() => {
+                                        break
+                                    }
+                                    Some(()) = async move {
+                                        let sigterm = tokio::signal::unix::SignalKind::terminate();
+                                        #[allow(clippy::unwrap_used)]
+                                        tokio::signal::unix::signal(sigterm).unwrap().recv().await
+                                    } => {
+                                        break
+                                    }
+                                    Some(()) = async move {
+                                        let sigterm = tokio::signal::unix::SignalKind::alarm();
+                                        #[allow(clippy::unwrap_used)]
+                                        tokio::signal::unix::signal(sigterm).unwrap().recv().await
+                                    } => {
+                                        // Ignore
+                                    }
+                                    Some(()) = async move {
+                                        let sigterm = tokio::signal::unix::SignalKind::hangup();
+                                        #[allow(clippy::unwrap_used)]
+                                        tokio::signal::unix::signal(sigterm).unwrap().recv().await
+                                    } => {
+                                        // Initiate a reload of server components.
+                                        sctx.reload().await;
+                                        info!("Reload complete");
+                                    }
+                                    Some(()) = async move {
+                                        let sigterm = tokio::signal::unix::SignalKind::user_defined1();
+                                        #[allow(clippy::unwrap_used)]
+                                        tokio::signal::unix::signal(sigterm).unwrap().recv().await
+                                    } => {
+                                        // Ignore
+                                    }
+                                    Some(()) = async move {
+                                        let sigterm = tokio::signal::unix::SignalKind::user_defined2();
+                                        #[allow(clippy::unwrap_used)]
+                                        tokio::signal::unix::signal(sigterm).unwrap().recv().await
+                                    } => {
+                                        // Ignore
+                                    }
+                                    // we got a message on thr broadcast from somewhere else
+                                    Ok(msg) = async move {
+                                        listener.recv().await
+                                    } =>
+                                        match msg {
+                                            CoreAction::Shutdown => break,
+                                            CoreAction::Reload => {}
+                                        },
+                                }
                             }
                             #[cfg(target_family = "windows")]
                             {
@@ -878,112 +940,99 @@ async fn kanidm_main(
                 info!("Stopped 🛑 ");
             }
         }
-        KanidmdOpt::CertGenerate(_sopt) => {
+        KanidmdOpt::CertGenerate => {
             info!("Running in certificate generate mode ...");
-            config.update_config_for_server_mode(&sconfig);
             cert_generate_core(&config);
         }
         KanidmdOpt::Database {
             commands: DbCommands::Backup(bopt),
         } => {
             info!("Running in backup mode ...");
-            let p = match bopt.path.to_str() {
-                Some(p) => p,
-                None => {
-                    error!("Invalid backup path");
-                    return ExitCode::FAILURE;
-                }
-            };
-            backup_server_core(&config, p);
+
+            backup_server_core(&config, Some(&bopt.path));
         }
         KanidmdOpt::Database {
             commands: DbCommands::Restore(ropt),
         } => {
             info!("Running in restore mode ...");
-            let p = match ropt.path.to_str() {
-                Some(p) => p,
-                None => {
-                    error!("Invalid restore path");
-                    return ExitCode::FAILURE;
-                }
-            };
-            restore_server_core(&config, p).await;
+            restore_server_core(&config, &ropt.path).await;
         }
         KanidmdOpt::Database {
-            commands: DbCommands::Verify(_vopt),
+            commands: DbCommands::Verify,
         } => {
             info!("Running in db verification mode ...");
             verify_server_core(&config).await;
         }
-        KanidmdOpt::ShowReplicationCertificate { commonopts } => {
+        KanidmdOpt::ShowReplicationCertificate => {
             info!("Running show replication certificate ...");
-            let output_mode: ConsoleOutputMode = commonopts.output_mode.to_owned().into();
-            submit_admin_req(
+            submit_admin_req_human(
                 config.adminbindpath.as_str(),
                 AdminTaskRequest::ShowReplicationCertificate,
-                output_mode,
             )
             .await;
         }
-        KanidmdOpt::RenewReplicationCertificate { commonopts } => {
+        KanidmdOpt::RenewReplicationCertificate => {
             info!("Running renew replication certificate ...");
-            let output_mode: ConsoleOutputMode = commonopts.output_mode.to_owned().into();
-            submit_admin_req(
+            submit_admin_req_human(
                 config.adminbindpath.as_str(),
                 AdminTaskRequest::RenewReplicationCertificate,
-                output_mode,
             )
             .await;
         }
-        KanidmdOpt::RefreshReplicationConsumer {
-            commonopts,
-            proceed,
-        } => {
+        KanidmdOpt::RefreshReplicationConsumer { proceed } => {
             info!("Running refresh replication consumer ...");
             if !proceed {
                 error!("Unwilling to proceed. Check --help.");
             } else {
-                let output_mode: ConsoleOutputMode = commonopts.output_mode.to_owned().into();
-                submit_admin_req(
+                submit_admin_req_human(
                     config.adminbindpath.as_str(),
                     AdminTaskRequest::RefreshReplicationConsumer,
-                    output_mode,
                 )
                 .await;
             }
         }
-        KanidmdOpt::RecoverAccount { name, commonopts } => {
+        KanidmdOpt::RecoverAccount { name } => {
             info!("Running account recovery ...");
-            let output_mode: ConsoleOutputMode = commonopts.output_mode.to_owned().into();
-            submit_admin_req(
+
+            submit_admin_req_human(
                 config.adminbindpath.as_str(),
                 AdminTaskRequest::RecoverAccount {
                     name: name.to_owned(),
                 },
-                output_mode,
+            )
+            .await;
+        }
+        KanidmdOpt::DisableAccount { name } => {
+            info!("Running account disable ...");
+
+            submit_admin_req_human(
+                config.adminbindpath.as_str(),
+                AdminTaskRequest::DisableAccount {
+                    name: name.to_owned(),
+                },
             )
             .await;
         }
         KanidmdOpt::Database {
-            commands: DbCommands::Reindex(_copt),
+            commands: DbCommands::Reindex,
         } => {
             info!("Running in reindex mode ...");
             reindex_server_core(&config).await;
         }
         KanidmdOpt::DbScan {
-            commands: DbScanOpt::ListIndexes(_),
+            commands: DbScanOpt::ListIndexes,
         } => {
             info!("👀 db scan - list indexes");
             dbscan_list_indexes_core(&config);
         }
         KanidmdOpt::DbScan {
-            commands: DbScanOpt::ListId2Entry(_),
+            commands: DbScanOpt::ListId2Entry,
         } => {
             info!("👀 db scan - list id2entry");
             dbscan_list_id2entry_core(&config);
         }
         KanidmdOpt::DbScan {
-            commands: DbScanOpt::ListIndexAnalysis(_),
+            commands: DbScanOpt::ListIndexAnalysis,
         } => {
             info!("👀 db scan - list index analysis");
             dbscan_list_index_analysis_core(&config);
@@ -1002,189 +1051,82 @@ async fn kanidm_main(
         }
 
         KanidmdOpt::DbScan {
-            commands: DbScanOpt::QuarantineId2Entry { id, commonopts: _ },
+            commands: DbScanOpt::QuarantineId2Entry { id },
         } => {
             info!("☣️  db scan - quarantine id2 entry - {}", id);
             dbscan_quarantine_id2entry_core(&config, *id);
         }
 
         KanidmdOpt::DbScan {
-            commands: DbScanOpt::ListQuarantined { commonopts: _ },
+            commands: DbScanOpt::ListQuarantined,
         } => {
             info!("☣️  db scan - list quarantined");
             dbscan_list_quarantined_core(&config);
         }
 
         KanidmdOpt::DbScan {
-            commands: DbScanOpt::RestoreQuarantined { id, commonopts: _ },
+            commands: DbScanOpt::RestoreQuarantined { id },
         } => {
             info!("☣️  db scan - restore quarantined entry - {}", id);
             dbscan_restore_quarantined_core(&config, *id);
         }
 
         KanidmdOpt::DomainSettings {
-            commands: DomainSettingsCmds::Change { .. },
+            commands: DomainSettingsCmds::Change,
         } => {
             info!("Running in domain name change mode ... this may take a long time ...");
             domain_rename_core(&config).await;
         }
 
         KanidmdOpt::DomainSettings {
-            commands: DomainSettingsCmds::Show { commonopts },
+            commands: DomainSettingsCmds::Show,
         } => {
             info!("Running domain show ...");
-            let output_mode: ConsoleOutputMode = commonopts.output_mode.to_owned().into();
-            submit_admin_req(
-                config.adminbindpath.as_str(),
-                AdminTaskRequest::DomainShow,
-                output_mode,
-            )
-            .await;
+
+            submit_admin_req_human(config.adminbindpath.as_str(), AdminTaskRequest::DomainShow)
+                .await;
         }
 
         KanidmdOpt::DomainSettings {
-            commands: DomainSettingsCmds::UpgradeCheck { commonopts },
+            commands: DomainSettingsCmds::UpgradeCheck,
         } => {
             info!("Running domain upgrade check ...");
-            let output_mode: ConsoleOutputMode = commonopts.output_mode.to_owned().into();
-            submit_admin_req(
+
+            submit_admin_req_human(
                 config.adminbindpath.as_str(),
                 AdminTaskRequest::DomainUpgradeCheck,
-                output_mode,
             )
             .await;
         }
 
         KanidmdOpt::DomainSettings {
-            commands: DomainSettingsCmds::Raise { commonopts },
+            commands: DomainSettingsCmds::Raise,
         } => {
             info!("Running domain raise ...");
-            let output_mode: ConsoleOutputMode = commonopts.output_mode.to_owned().into();
-            submit_admin_req(
-                config.adminbindpath.as_str(),
-                AdminTaskRequest::DomainRaise,
-                output_mode,
-            )
-            .await;
+
+            submit_admin_req_human(config.adminbindpath.as_str(), AdminTaskRequest::DomainRaise)
+                .await;
         }
 
         KanidmdOpt::DomainSettings {
-            commands: DomainSettingsCmds::Remigrate { commonopts, level },
+            commands: DomainSettingsCmds::Remigrate { level },
         } => {
             info!("⚠️  Running domain remigrate ...");
-            let output_mode: ConsoleOutputMode = commonopts.output_mode.to_owned().into();
-            submit_admin_req(
+
+            submit_admin_req_human(
                 config.adminbindpath.as_str(),
                 AdminTaskRequest::DomainRemigrate { level: *level },
-                output_mode,
             )
             .await;
         }
 
         KanidmdOpt::Database {
-            commands: DbCommands::Vacuum(_copt),
+            commands: DbCommands::Vacuum,
         } => {
             info!("Running in vacuum mode ...");
             vacuum_server_core(&config);
         }
-        KanidmdOpt::HealthCheck(sopt) => {
-            config.update_config_for_server_mode(&sconfig);
-
-            debug!("{sopt:?}");
-
-            let healthcheck_url = match &sopt.check_origin {
-                true => format!("{}/status", config.origin),
-                false => {
-                    // the replace covers when you specify an ipv6-capable "all" address
-                    format!(
-                        "https://{}/status",
-                        config.address.replace("[::]", "localhost")
-                    )
-                }
-            };
-
-            info!("Checking {healthcheck_url}");
-
-            let mut client = reqwest::ClientBuilder::new()
-                .danger_accept_invalid_certs(!sopt.verify_tls)
-                .danger_accept_invalid_hostnames(!sopt.verify_tls)
-                .https_only(true);
-
-            client = match &sconfig.tls_chain {
-                None => client,
-                Some(ca_cert) => {
-                    debug!("Trying to load {} to build a CA cert path", ca_cert);
-                    // if the ca_cert file exists, then we'll use it
-                    let ca_cert_path = PathBuf::from(ca_cert);
-                    match ca_cert_path.exists() {
-                        true => {
-                            let mut cert_buf = Vec::new();
-                            if let Err(err) = std::fs::File::open(&ca_cert_path)
-                                .and_then(|mut file| file.read_to_end(&mut cert_buf))
-                            {
-                                error!(
-                                    "Failed to read {:?} from filesystem: {:?}",
-                                    ca_cert_path, err
-                                );
-                                return ExitCode::FAILURE;
-                            }
-
-                            let ca_chain_parsed =
-                                match reqwest::Certificate::from_pem_bundle(&cert_buf) {
-                                    Ok(val) => val,
-                                    Err(e) => {
-                                        error!(
-                                            "Failed to parse {:?} into CA chain!\nError: {:?}",
-                                            ca_cert_path, e
-                                        );
-                                        return ExitCode::FAILURE;
-                                    }
-                                };
-
-                            // Need at least 2 certs for the leaf + chain. We skip the leaf.
-                            for cert in ca_chain_parsed.into_iter().skip(1) {
-                                client = client.add_root_certificate(cert)
-                            }
-                            client
-                        }
-                        false => {
-                            warn!("Couldn't find ca cert {} but carrying on...", ca_cert);
-                            client
-                        }
-                    }
-                }
-            };
-            #[allow(clippy::unwrap_used)]
-            let client = client.build().unwrap();
-
-            let req = match client.get(&healthcheck_url).send().await {
-                Ok(val) => val,
-                Err(error) => {
-                    let error_message = {
-                        if error.is_timeout() {
-                            format!("Timeout connecting to url={healthcheck_url}")
-                        } else if error.is_connect() {
-                            format!("Connection failed: {}", error)
-                        } else {
-                            format!("Failed to complete healthcheck: {:?}", error)
-                        }
-                    };
-                    error!("CRITICAL: {error_message}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            debug!("Request: {req:?}");
-            let output_mode: ConsoleOutputMode = sopt.commonopts.output_mode.to_owned().into();
-            match output_mode {
-                ConsoleOutputMode::JSON => {
-                    println!("{{\"result\":\"OK\"}}")
-                }
-                ConsoleOutputMode::Text => {
-                    info!("OK")
-                }
-            }
-        }
-        KanidmdOpt::Version(_) => {}
+        KanidmdOpt::Scripting { .. } | KanidmdOpt::Version => {}
     }
     ExitCode::SUCCESS
 }

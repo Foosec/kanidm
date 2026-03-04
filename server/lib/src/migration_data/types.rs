@@ -33,28 +33,13 @@ impl Default for BuiltinAccount {
     }
 }
 
-#[cfg(test)]
-impl From<BuiltinAccount> for crate::idm::account::Account {
-    fn from(value: BuiltinAccount) -> Self {
-        Self {
-            name: value.name.to_string(),
-            uuid: value.uuid,
-            displayname: value.displayname.to_string(),
-            spn: format!("{}@example.com", value.name),
-            mail_primary: None,
-            mail: Vec::with_capacity(0),
-            ..Default::default()
-        }
-    }
-}
-
 impl From<BuiltinAccount> for EntryInitNew {
     fn from(value: BuiltinAccount) -> Self {
         let mut entry = EntryInitNew::new();
         entry.add_ava(Attribute::Name, Value::new_iname(value.name));
         #[allow(clippy::panic)]
         if value.uuid >= DYNAMIC_RANGE_MINIMUM_UUID {
-            panic!("Builtin ACP has invalid UUID! {:?}", value);
+            panic!("Builtin ACP has invalid UUID! {value:?}");
         }
         entry.add_ava(Attribute::Uuid, Value::Uuid(value.uuid));
         entry.add_ava(Attribute::Description, Value::new_utf8s(value.description));

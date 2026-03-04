@@ -2,7 +2,7 @@ use super::modify::ModifyPartial;
 use crate::event::ReviveRecycledEvent;
 use crate::prelude::*;
 use crate::server::Plugins;
-use hashbrown::HashMap;
+use std::collections::BTreeMap;
 
 impl QueryServerWriteTransaction<'_> {
     #[instrument(level = "debug", skip_all)]
@@ -75,6 +75,28 @@ impl QueryServerWriteTransaction<'_> {
     }
 
     #[instrument(level = "debug", skip_all)]
+    /// Delete all items that have expired / delete_after *now*.
+    pub fn purge_delete_after(&mut self) -> Result<usize, OperationError> {
+        let curtime_odt = self.get_curtime_odt();
+
+        let filter = filter!(f_and(vec![
+            f_pres(Attribute::DeleteAfter),
+            f_lt(Attribute::DeleteAfter, PartialValue::DateTime(curtime_odt))
+        ]));
+
+        // First, search to see if anything matches.
+        let entries = self.internal_search(filter.clone())?;
+
+        if entries.is_empty() {
+            return Ok(0);
+        }
+
+        self.internal_delete(&filter)?;
+
+        Ok(entries.len())
+    }
+
+    #[instrument(level = "debug", skip_all)]
     pub fn revive_recycled(&mut self, re: &ReviveRecycledEvent) -> Result<(), OperationError> {
         // Revive an entry to live. This is a specialised function, and draws a lot of
         // inspiration from modify.
@@ -86,7 +108,7 @@ impl QueryServerWriteTransaction<'_> {
         }
 
         // Get the list of pre_candidates, using impersonate search.
-        let pre_candidates =
+        let mut pre_candidates =
             self.impersonate_search_valid(re.filter.clone(), re.filter.clone(), &re.ident)?;
 
         // Is the list empty?
@@ -98,7 +120,7 @@ impl QueryServerWriteTransaction<'_> {
                 );
                 return Ok(());
             } else {
-                request_error!(
+                error!(
                     "revive: no candidates match filter, failure {:?}",
                     re.filter
                 );
@@ -139,29 +161,27 @@ impl QueryServerWriteTransaction<'_> {
             return Err(OperationError::AccessDenied);
         }
 
-        // Build the list of mods from directmo, to revive memberships.
-        let mut dm_mods: HashMap<Uuid, ModifyList<ModifyInvalid>> =
-            HashMap::with_capacity(pre_candidates.len());
+        // ======= Access Control and Invariants Checked !!! ========
 
-        for e in &pre_candidates {
-            // Get this entries uuid.
-            let u: Uuid = e.get_uuid();
+        // From the pre_candidate set, find all related entries that also need to
+        // be revived at the same time.
+        let references_filt = filter_rec!(f_or(
+            pre_candidates
+                .iter()
+                .map(|entry| {
+                    f_eq(
+                        Attribute::CascadeDeleted,
+                        PartialValue::Uuid(entry.get_uuid()),
+                    )
+                })
+                .collect(),
+        ));
 
-            if let Some(riter) = e.get_ava_as_refuuid(Attribute::RecycledDirectMemberOf) {
-                for g_uuid in riter {
-                    dm_mods
-                        .entry(g_uuid)
-                        .and_modify(|mlist| {
-                            let m = Modify::Present(Attribute::Member, Value::Refer(u));
-                            mlist.push_mod(m);
-                        })
-                        .or_insert({
-                            let m = Modify::Present(Attribute::Member, Value::Refer(u));
-                            ModifyList::new_list(vec![m])
-                        });
-                }
-            }
-        }
+        let mut pre_cascade_revive_candidates = self
+            .internal_search(references_filt)
+            .inspect_err(|err| error!(?err, "unable to find reference entries"))?;
+
+        pre_candidates.append(&mut pre_cascade_revive_candidates);
 
         // clone the writeable entries.
         let mut candidates: Vec<Entry<EntryInvalid, EntryCommitted>> = pre_candidates
@@ -171,22 +191,97 @@ impl QueryServerWriteTransaction<'_> {
                     .clone()
                     .invalidate(self.cid.clone(), &self.trim_cid)
             })
+            // Restore their Refers attribute.
+            .map(|mut entry| {
+                if let Some(refers_uuid) = entry.get_ava_single_uuid(Attribute::CascadeDeleted) {
+                    entry.set_ava_set(&Attribute::Refers, ValueSetRefer::new(refers_uuid));
+                }
+                entry
+            })
             // Mutate to apply the revive.
             .map(|er| er.to_revived())
             .collect();
 
         // Are they all revived?
         if candidates.iter().all(|e| e.mask_recycled().is_none()) {
-            admin_error!("Not all candidates were correctly revived, unable to proceed");
+            error!("Not all candidates were correctly revived, unable to proceed");
             return Err(OperationError::InvalidEntryState);
         }
 
+        // Were there any established memorials to these entries?
+        let memoriam_filters = candidates
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .get_uuid()
+                    .map(PartialValue::Uuid)
+                    .map(|pv| f_eq(Attribute::InMemoriam, pv))
+            })
+            .collect::<Vec<_>>();
+
+        let memorial_candidates = self.internal_search(filter!(f_and(vec![
+            f_eq(Attribute::Class, EntryClass::Memorial.into()),
+            f_or(memoriam_filters)
+        ])))?;
+
+        if !memorial_candidates.is_empty() {
+            // We need to create a linkage between the memorial and the entry.
+            let memorial_map: BTreeMap<Uuid, &EntrySealedCommitted> = memorial_candidates
+                .iter()
+                .map(|entry| (entry.get_uuid(), entry.as_ref()))
+                .collect();
+
+            // We need to setup a map of the pairs, so we can mod candidates based on the content
+            // of their memorials. For example, we want to ensure that any hmacNameHistories
+            // that were merged on memorials, are all brought back together.
+            let mut memorial_candidate_pairs: Vec<(
+                &EntrySealedCommitted,
+                &mut EntryInvalidCommitted,
+            )> = candidates
+                .iter_mut()
+                .filter_map(|entry| {
+                    entry
+                        .get_uuid()
+                        .and_then(|uuid| memorial_map.get(&uuid).map(|memorial| (*memorial, entry)))
+                })
+                .collect();
+
+            // If so, we need to clean them up NOW!
+            Plugins::run_teardown_memorials(self, &mut memorial_candidate_pairs, re).inspect_err(
+                |err| {
+                    error!(?err, "Revive operation failed (plugin)");
+                },
+            )?;
+
+            // Delete the memorials NOW! Unlike a normal delete, go STRAIGHT TO TOMBSTONE!!!
+            let tombstone_cand = memorial_candidates
+                .iter()
+                .map(|e| {
+                    e.to_tombstone(self.cid.clone())
+                        .validate(&self.schema)
+                        .map_err(|e| {
+                            error!("Schema Violation in teardown memorials validation: {:?}", e);
+                            OperationError::SchemaViolation(e)
+                        })
+                        // seal if it worked.
+                        .map(|e| e.seal(&self.schema))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+            self.be_txn
+                .modify(&self.cid, &memorial_candidates, &tombstone_cand)
+                .inspect_err(|err| {
+                    error!(?err, "Teardown memorials operation failed (backend)");
+                })?;
+        };
+
         // Do we need to apply pre-mod?
         // Very likely, in case domain has renamed etc.
-        Plugins::run_pre_modify(self, &pre_candidates, &mut candidates, &me).map_err(|e| {
-            admin_error!("Revive operation failed (plugin), {:?}", e);
-            e
-        })?;
+        Plugins::run_pre_modify(self, &pre_candidates, &mut candidates, &me).inspect_err(
+            |err| {
+                error!(?err, "Revive operation failed (plugin)");
+            },
+        )?;
 
         // Schema validate
         let res: Result<Vec<Entry<EntrySealed, EntryCommitted>>, OperationError> = candidates
@@ -202,6 +297,29 @@ impl QueryServerWriteTransaction<'_> {
             .collect();
 
         let norm_cand: Vec<Entry<_, _>> = res?;
+
+        // Finally, setup the mod for restoring memberships from direct member of
+        let mut dm_mods: BTreeMap<Uuid, ModifyList<ModifyInvalid>> = Default::default();
+
+        for entry in &pre_candidates {
+            // Get this entry's uuid.
+            let u: Uuid = entry.get_uuid();
+
+            if let Some(riter) = entry.get_ava_as_refuuid(Attribute::RecycledDirectMemberOf) {
+                for g_uuid in riter {
+                    dm_mods
+                        .entry(g_uuid)
+                        .and_modify(|mlist| {
+                            let m = Modify::Present(Attribute::Member, Value::Refer(u));
+                            mlist.push_mod(m);
+                        })
+                        .or_insert({
+                            let m = Modify::Present(Attribute::Member, Value::Refer(u));
+                            ModifyList::new_list(vec![m])
+                        });
+                }
+            }
+        }
 
         // build the mod partial
         let mp = ModifyPartial {
@@ -240,13 +358,14 @@ impl QueryServerWriteTransaction<'_> {
 
 #[cfg(test)]
 mod tests {
-    use crate::prelude::*;
-
+    use super::ReviveRecycledEvent;
     use crate::event::{CreateEvent, DeleteEvent};
+    use crate::prelude::*;
     use crate::server::ModifyEvent;
     use crate::server::SearchEvent;
-
-    use super::ReviveRecycledEvent;
+    use crate::server::ValueSetMessage;
+    use kanidm_proto::v1::OutboundMessage;
+    use time::OffsetDateTime;
 
     #[qs_test]
     async fn test_recycle_simple(server: &QueryServer) {
@@ -794,5 +913,66 @@ mod tests {
         ));
 
         assert!(server_txn.commit().is_ok());
+    }
+
+    #[qs_test]
+    async fn test_entry_delete_after(server: &QueryServer) {
+        let time_p1 = duration_from_epoch_now();
+        let time_p2 = time_p1 + Duration::from_secs(CHANGELOG_MAX_AGE * 2);
+        let time_p3 = time_p2 + Duration::from_secs(1);
+
+        let odt_p1 = OffsetDateTime::UNIX_EPOCH + time_p1;
+        let odt_p2 = OffsetDateTime::UNIX_EPOCH + time_p2;
+
+        let message_uuid = Uuid::new_v4();
+
+        let mut server_txn = server.write(time_p1).await.unwrap();
+
+        let mut e_msg = entry_init!(
+            (Attribute::Class, EntryClass::Object.to_value()),
+            (Attribute::Class, EntryClass::OutboundMessage.to_value()),
+            (Attribute::Uuid, Value::Uuid(message_uuid)),
+            (Attribute::SendAfter, Value::DateTime(odt_p1)),
+            (Attribute::DeleteAfter, Value::DateTime(odt_p2))
+        );
+
+        e_msg.set_ava_set(
+            &Attribute::MessageTemplate,
+            ValueSetMessage::new(OutboundMessage::TestMessageV1 {
+                display_name: "testuser".into(),
+            }),
+        );
+
+        server_txn.internal_create(vec![e_msg]).unwrap();
+
+        server_txn.commit().unwrap();
+
+        // Now start a new txn, should not delete the message.
+        let mut server_txn = server.write(time_p1).await.unwrap();
+
+        server_txn.purge_delete_after().unwrap();
+
+        let _msg = server_txn
+            .internal_search_uuid(message_uuid)
+            .expect("Message was deleted!!!");
+
+        server_txn.commit().unwrap();
+
+        // Clock forwards, will now delete.
+        let mut server_txn = server.write(time_p3).await.unwrap();
+
+        trace!(?odt_p2);
+        server_txn.purge_delete_after().unwrap();
+
+        server_txn
+            .internal_search_uuid(message_uuid)
+            .expect_err("Message is still present");
+
+        // Search recycle bin
+        let _msg = server_txn
+            .internal_search_all_uuid(message_uuid)
+            .expect("It's not in the recycle bin!");
+
+        server_txn.commit().unwrap();
     }
 }

@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use kanidm_hsm_crypto::provider::BoxedDynTpm;
 use kanidm_unix_common::unix_proto::{
     DeviceAuthorizationResponse, PamAuthRequest, PamAuthResponse,
 };
@@ -36,6 +37,8 @@ pub enum IdpError {
     KeyStore,
     /// The idp failed to interact with the configured TPM
     Tpm,
+    /// The cached usertoken has no offline credentials available
+    NoOfflineCredentials,
 }
 
 pub enum UserTokenState {
@@ -70,7 +73,7 @@ pub enum ProviderOrigin {
     // causes these items to be nixed.
     #[default]
     Ignore,
-    /// Provided by /etc/passwd or /etc/group
+    /// Provided by local files, commonly /etc/passwd, /etc/group and /etc/shadow
     System,
     Kanidm,
 }
@@ -194,7 +197,8 @@ impl Into<PamAuthResponse> for AuthRequest {
 }
 
 pub enum AuthResult {
-    Success { token: UserToken },
+    Success,
+    SuccessUpdate { new_token: UserToken },
     Denied,
     Next(AuthRequest),
 }
@@ -206,7 +210,11 @@ pub trait IdProvider {
     fn origin(&self) -> ProviderOrigin;
 
     /// Attempt to go online *immediately*
-    async fn attempt_online(&self, _tpm: &mut tpm::BoxedDynTpm, _now: SystemTime) -> bool;
+    async fn attempt_online(&self, _tpm: &mut BoxedDynTpm, _now: SystemTime) -> bool;
+
+    /// Indicate if this provider is online or offline at this point in time. This will
+    /// not attempt to go online.
+    async fn is_online(&self) -> bool;
 
     /// Mark that this provider should attempt to go online next time it
     /// receives a request
@@ -225,7 +233,7 @@ pub trait IdProvider {
     async fn configure_machine_identity(
         &self,
         _keystore: &mut KeyStoreTxn,
-        _tpm: &mut tpm::BoxedDynTpm,
+        _tpm: &mut BoxedDynTpm,
         _machine_key: &tpm::MachineKey,
     ) -> Result<(), IdpError> {
         Ok(())
@@ -236,7 +244,7 @@ pub trait IdProvider {
         &self,
         _id: &Id,
         _token: Option<&UserToken>,
-        _tpm: &mut tpm::BoxedDynTpm,
+        _tpm: &mut BoxedDynTpm,
         _now: SystemTime,
     ) -> Result<UserTokenState, IdpError>;
 
@@ -244,25 +252,30 @@ pub trait IdProvider {
         &self,
         _account_id: &str,
         _token: &UserToken,
-        _tpm: &mut tpm::BoxedDynTpm,
+        _tpm: &mut BoxedDynTpm,
         _shutdown_rx: &broadcast::Receiver<()>,
     ) -> Result<(AuthRequest, AuthCredHandler), IdpError>;
 
     async fn unix_user_online_auth_step(
         &self,
         _account_id: &str,
+        _current_token: Option<&UserToken>,
         _cred_handler: &mut AuthCredHandler,
         _pam_next_req: PamAuthRequest,
-        _tpm: &mut tpm::BoxedDynTpm,
+        _tpm: &mut BoxedDynTpm,
         _shutdown_rx: &broadcast::Receiver<()>,
     ) -> Result<AuthResult, IdpError>;
 
     async fn unix_unknown_user_online_auth_init(
         &self,
         _account_id: &str,
-        _tpm: &mut tpm::BoxedDynTpm,
+        _tpm: &mut BoxedDynTpm,
         _shutdown_rx: &broadcast::Receiver<()>,
     ) -> Result<Option<(AuthRequest, AuthCredHandler)>, IdpError>;
+
+    /// Determine if this cached user *could* continue with offline authentication. This
+    /// MUST NOT perform network checks or requests.
+    async fn unix_user_can_offline_auth(&self, _token: &UserToken) -> bool;
 
     async fn unix_user_offline_auth_init(
         &self,
@@ -290,10 +303,11 @@ pub trait IdProvider {
     // TPM key.
     async fn unix_user_offline_auth_step(
         &self,
-        _token: &UserToken,
+        _current_token: Option<&UserToken>,
+        _session_token: &UserToken,
         _cred_handler: &mut AuthCredHandler,
         _pam_next_req: PamAuthRequest,
-        _tpm: &mut tpm::BoxedDynTpm,
+        _tpm: &mut BoxedDynTpm,
     ) -> Result<AuthResult, IdpError>;
 
     async fn unix_user_authorise(&self, _token: &UserToken) -> Result<Option<bool>, IdpError>;
@@ -301,7 +315,7 @@ pub trait IdProvider {
     async fn unix_group_get(
         &self,
         id: &Id,
-        _tpm: &mut tpm::BoxedDynTpm,
+        _tpm: &mut BoxedDynTpm,
         _now: SystemTime,
     ) -> Result<GroupTokenState, IdpError>;
 }

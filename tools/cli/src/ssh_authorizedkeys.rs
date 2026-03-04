@@ -94,7 +94,7 @@ async fn main() -> Result<(), ()> {
     if r.is_err() {
         match r {
             Err(ClientError::Transport(value)) => {
-                error!("Failed to connect to kanidm server: {}", value.to_string());
+                error!("Failed to connect to Kanidm server: {}", value.to_string());
             }
             _ => error!("Error during authentication phase: {:?}", r),
         }
@@ -104,7 +104,7 @@ async fn main() -> Result<(), ()> {
     client
         .idm_account_get_ssh_pubkeys(opt.account_id.as_str())
         .await
-        .map(|pkeys| pkeys.iter().for_each(|pkey| println!("{}", pkey)))
+        .map(|pkeys| pkeys.iter().for_each(|pkey| println!("{pkey}")))
         .map_err(|e| {
             error!(
                 "Failed to retrieve SSH keys for {} - {:?}",

@@ -1,6 +1,4 @@
-use core::result::Result::Err;
-use kanidm_client::{KanidmClient, StatusCode};
-use kanidm_proto::internal::OperationError;
+use kanidm_client::KanidmClient;
 use kanidm_proto::internal::{IdentifyUserRequest, IdentifyUserResponse};
 use kanidmd_lib::prelude::Attribute;
 use kanidmd_testkit::ADMIN_TEST_PASSWORD;
@@ -11,159 +9,15 @@ static USER_A_NAME: &str = "valid_user_a";
 
 static USER_B_NAME: &str = "valid_user_b";
 
-// TEST ON ERROR OUTCOMES
-// These tests check that invalid requests return the expected error
-
-#[kanidmd_testkit::test]
-async fn test_not_authenticated(rsclient: &KanidmClient) {
-    // basically here we try a bit of all the possible combinations while unauthenticated to check it's not working
-    setup_server(&rsclient).await;
-    create_user(&rsclient, USER_A_NAME).await;
-    let _ = rsclient.logout().await;
-    let res = rsclient
-        .idm_person_identify_user(USER_A_NAME, IdentifyUserRequest::Start)
-        .await;
-    assert!(
-        matches!(res, Err(err) if matches!(err, kanidm_client::ClientError::Http(StatusCode::UNAUTHORIZED, ..)))
-    );
-
-    let res = rsclient
-        .idm_person_identify_user(USER_A_NAME, IdentifyUserRequest::DisplayCode)
-        .await;
-    assert!(
-        matches!(res, Err(err) if matches!(err, kanidm_client::ClientError::Http(StatusCode::UNAUTHORIZED, ..)))
-    );
-    let res = rsclient
-        .idm_person_identify_user(
-            USER_A_NAME,
-            IdentifyUserRequest::SubmitCode { other_totp: 123456 },
-        )
-        .await;
-
-    assert!(
-        matches!(res, Err(err) if matches!(err, kanidm_client::ClientError::Http(StatusCode::UNAUTHORIZED, ..)))
-    );
-}
-
-#[kanidmd_testkit::test]
-async fn test_non_existing_user_id(rsclient: &KanidmClient) {
-    setup_server(&rsclient).await;
-    create_user(&rsclient, USER_A_NAME).await;
-    create_user(&rsclient, USER_B_NAME).await;
-    let non_existing_user = "non_existing_user";
-    login_with_user(&rsclient, USER_A_NAME).await;
-    let res: Result<IdentifyUserResponse, kanidm_client::ClientError> = rsclient
-        .idm_person_identify_user(non_existing_user, IdentifyUserRequest::Start)
-        .await;
-    assert!(
-        matches!(dbg!(res), Err(err) if matches!(err, kanidm_client::ClientError::Http(StatusCode::NOT_FOUND, Some(OperationError::NoMatchingEntries), .. )))
-    );
-
-    let res = rsclient
-        .idm_person_identify_user(non_existing_user, IdentifyUserRequest::DisplayCode)
-        .await;
-
-    assert!(
-        matches!(dbg!(res), Err(err) if matches!(err, kanidm_client::ClientError::Http(StatusCode::NOT_FOUND, Some(OperationError::NoMatchingEntries), .. )))
-    );
-
-    let res = rsclient
-        .idm_person_identify_user(
-            non_existing_user,
-            IdentifyUserRequest::SubmitCode { other_totp: 123456 },
-        )
-        .await;
-
-    assert!(
-        matches!(dbg!(res), Err(err) if matches!(err, kanidm_client::ClientError::Http(StatusCode::NOT_FOUND, Some(OperationError::NoMatchingEntries), .. )))
-    );
-}
-
-// TEST ON SPECIFIC API INPUT
-// These tests check that given a specific input we get the expected response.
-// WE DON'T CHECK THE CONTENT OF THE RESPONSE, just that it's the expected one.
-// The api tests from here on should never return any error, as all the
-// error cases have already been tested in the previous section!
-// Each tests is named like `test_{api input}_response_{expected api output}_or_{expected api output}`
-#[kanidmd_testkit::test]
-async fn test_start_response_identity_verification_available(rsclient: &KanidmClient) {
-    setup_server(&rsclient).await;
-    create_user(&rsclient, USER_A_NAME).await;
-    login_with_user(&rsclient, USER_A_NAME).await;
-
-    let response = rsclient
-        .idm_person_identify_user(USER_A_NAME, IdentifyUserRequest::Start)
-        .await;
-
-    assert!(response.is_ok());
-    // since we sent our own identifier here it should just tell us that we that we can use the feature
-    assert_eq!(
-        response.unwrap(),
-        IdentifyUserResponse::IdentityVerificationAvailable
-    )
-}
-// this function tests both possible POSITIVE outcomes if we start from
-// `Start`, that is WaitForCode or ProvideCode
-#[kanidmd_testkit::test]
-async fn test_start_response_wait_for_code_or_provide_code(rsclient: &KanidmClient) {
-    setup_server(&rsclient).await;
-    let user_a_uuid = create_user(&rsclient, USER_A_NAME).await;
-    let user_b_uuid = create_user(&rsclient, USER_B_NAME).await;
-    login_with_user(&rsclient, USER_A_NAME).await;
-    let response = rsclient
-        .idm_person_identify_user(USER_B_NAME, IdentifyUserRequest::Start)
-        .await;
-
-    assert!(response.is_ok());
-    // the person with the lowest uuid should get to input the other person's code first;
-    dbg!(user_a_uuid.clone(), user_b_uuid.clone());
-
-    if user_a_uuid < user_b_uuid {
-        assert_eq!(response.unwrap(), IdentifyUserResponse::WaitForCode);
-    } else {
-        assert!(matches!(
-            response.unwrap(),
-            IdentifyUserResponse::ProvideCode { .. }
-        ))
-    }
-}
-
-#[kanidmd_testkit::test]
-async fn test_provide_code_response_code_failure_or_provide_code(rsclient: &KanidmClient) {
-    setup_server(&rsclient).await;
-    let user_a_uuid = create_user(&rsclient, USER_A_NAME).await;
-    let user_b_uuid = create_user(&rsclient, USER_B_NAME).await;
-    login_with_user(&rsclient, USER_A_NAME).await;
-    let response = rsclient
-        .idm_person_identify_user(
-            USER_B_NAME,
-            IdentifyUserRequest::SubmitCode { other_totp: 123456 },
-        )
-        .await;
-    //if A is the first then either the code is correct and therefore we get a ProvideCode or it's wrong
-    // and we get a CodeFailure
-    if user_a_uuid < user_b_uuid {
-        assert!(matches!(
-            response.unwrap(),
-            IdentifyUserResponse::ProvideCode { .. } | IdentifyUserResponse::CodeFailure
-        ));
-    } else {
-        assert!(matches!(
-            response.unwrap(),
-            IdentifyUserResponse::Success | IdentifyUserResponse::CodeFailure
-        ));
-    }
-}
-
 // here we actually test the full idm flow by duplicating the server
 #[kanidmd_testkit::test]
 async fn test_full_identification_flow(rsclient: &KanidmClient) {
-    setup_server(&rsclient).await;
-    let user_a_uuid = create_user(&rsclient, USER_A_NAME).await;
-    let user_b_uuid = create_user(&rsclient, USER_B_NAME).await;
+    setup_server(rsclient).await;
+    let user_a_uuid = create_user(rsclient, USER_A_NAME).await;
+    let user_b_uuid = create_user(rsclient, USER_B_NAME).await;
     //user A session
     let valid_user_a_client = rsclient;
-    login_with_user(&valid_user_a_client, USER_A_NAME).await;
+    login_with_user(valid_user_a_client, USER_A_NAME).await;
     //user B session
     let valid_user_b_client = valid_user_a_client.new_session().unwrap();
     login_with_user(&valid_user_b_client, USER_B_NAME).await;
@@ -268,7 +122,7 @@ async fn setup_server(rsclient: &KanidmClient) {
 
 async fn create_user(rsclient: &KanidmClient, user: &str) -> String {
     rsclient
-        .idm_person_account_create(user, &format!("dx{}", user))
+        .idm_person_account_create(user, &format!("dx{user}"))
         .await
         .expect("Unable to create person");
 

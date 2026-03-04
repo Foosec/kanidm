@@ -36,7 +36,7 @@ use std::convert::TryFrom;
 use std::ffi::CStr;
 
 use kanidm_unix_common::constants::DEFAULT_CONFIG_PATH;
-use kanidm_unix_common::unix_config::KanidmUnixdConfig;
+use kanidm_unix_common::unix_config::PamNssConfig;
 
 use crate::core::{self, RequestOptions};
 use crate::pam::constants::*;
@@ -50,8 +50,8 @@ use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt;
 use tracing_subscriber::prelude::*;
 
-pub fn get_cfg() -> Result<KanidmUnixdConfig, PamResultCode> {
-    KanidmUnixdConfig::new()
+pub fn get_cfg() -> Result<PamNssConfig, PamResultCode> {
+    PamNssConfig::new()
         .read_options_from_optional_config(DEFAULT_CONFIG_PATH)
         .map_err(|_| PamResultCode::PAM_SERVICE_ERR)
 }
@@ -86,7 +86,7 @@ impl TryFrom<&Vec<&CStr>> for ModuleOptions {
         let gopts = match opts {
             Ok(o) => o,
             Err(e) => {
-                println!("Error in module args -> {:?}", e);
+                println!("Error in module args -> {e:?}");
                 return Err(());
             }
         };
@@ -114,6 +114,8 @@ impl PamHooks for PamKanidm {
 
         debug!(?args, ?opts, "acct_mgmt");
 
+        #[allow(clippy::disallowed_methods)]
+        // Allowed as this is the source of time for the operation.
         let current_time = OffsetDateTime::now_utc();
 
         let req_opt = RequestOptions::Main {
@@ -133,6 +135,8 @@ impl PamHooks for PamKanidm {
 
         debug!(?args, ?opts, "acct_mgmt");
 
+        #[allow(clippy::disallowed_methods)]
+        // Allowed as this is the source of time for the operation.
         let current_time = OffsetDateTime::now_utc();
 
         let req_opt = RequestOptions::Main {

@@ -8,7 +8,8 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use super::{errors::WebError, ServerState};
 
-pub(crate) mod path_schema;
+// pub(crate) mod path_schema;
+
 pub(crate) mod response_schema;
 #[cfg(test)]
 pub(crate) mod tests;
@@ -55,8 +56,6 @@ impl Modify for SecurityAddon {
         super::v1::raw_modify,
         super::v1::raw_search,
 
-        super::v1_oauth2::oauth2_id_image_delete,
-        super::v1_oauth2::oauth2_id_image_post,
         super::v1_oauth2::oauth2_get,
         super::v1_oauth2::oauth2_basic_post,
         super::v1_oauth2::oauth2_public_post,
@@ -76,8 +75,25 @@ impl Modify for SecurityAddon {
 
         super::v1_scim::scim_sync_post,
         super::v1_scim::scim_sync_get,
+        super::v1_scim::scim_entry_get,
+        super::v1_scim::scim_entry_post,
+        super::v1_scim::scim_entry_put,
         super::v1_scim::scim_entry_id_get,
+        super::v1_scim::scim_entry_id_delete,
         super::v1_scim::scim_person_id_get,
+        super::v1_scim::scim_person_id_application_create_password,
+        super::v1_scim::scim_person_id_application_delete_password,
+        super::v1_scim::scim_person_id_message_send_test_get,
+        super::v1_scim::scim_application_get,
+        super::v1_scim::scim_application_post,
+        super::v1_scim::scim_application_id_get,
+        super::v1_scim::scim_application_id_delete,
+        super::v1_scim::scim_schema_attribute_get,
+        super::v1_scim::scim_schema_class_get,
+        super::v1_scim::scim_message_get,
+        super::v1_scim::scim_message_id_get,
+        super::v1_scim::scim_message_ready_get,
+        super::v1_scim::scim_message_id_sent_post,
 
         super::v1::schema_get,
         super::v1::whoami,
@@ -122,13 +138,11 @@ impl Modify for SecurityAddon {
         super::v1::person_id_radius_token_get,
 
         super::v1::account_id_ssh_pubkeys_get,
-        super::v1::account_id_radius_token_post,
+        // super::v1::account_id_radius_token_post,
         super::v1::person_id_unix_post,
         super::v1::person_id_unix_credential_put,
         super::v1::person_id_unix_credential_delete,
         super::v1::person_identify_user_post,
-        super::v1::service_account_get,
-        super::v1::service_account_post,
         super::v1::service_account_get,
         super::v1::service_account_post,
         super::v1::service_account_id_get,
@@ -139,21 +153,20 @@ impl Modify for SecurityAddon {
         super::v1::service_account_id_post_attr,
         super::v1::service_account_id_delete_attr,
         super::v1::service_account_into_person,
-        super::v1::service_account_api_token_post,
-        super::v1::service_account_api_token_get,
-        super::v1::service_account_api_token_delete,
-        super::v1::service_account_credential_generate,
+        // super::v1::service_account_api_token_post,
+        // super::v1::service_account_api_token_get,
+        // super::v1::service_account_api_token_delete,
+        // super::v1::service_account_credential_generate,
         super::v1::service_account_id_credential_status_get,
         super::v1::service_account_id_ssh_pubkeys_tag_get,
         super::v1::service_account_id_ssh_pubkeys_tag_delete,
         super::v1::service_account_id_unix_post,
-        super::v1::account_id_unix_post,
         super::v1::account_id_unix_auth_post,
-        super::v1::account_id_unix_token,
+        // super::v1::account_id_unix_token,
         super::v1::account_id_unix_token,
         super::v1::account_id_radius_token_post,
         super::v1::account_id_radius_token_get,
-        super::v1::account_id_ssh_pubkeys_get,
+        // super::v1::account_id_ssh_pubkeys_get,
         super::v1::account_id_ssh_pubkeys_tag_get,
         super::v1::account_id_user_auth_token_get,
         super::v1::account_user_auth_token_delete,
@@ -211,7 +224,6 @@ impl Modify for SecurityAddon {
         schemas(
             attribute::Attribute,
 
-
             scim_v1::ScimSyncState,
             scim_v1::ScimSyncRequest,
             scim_v1::ScimSyncRetentionMode,
@@ -219,6 +231,9 @@ impl Modify for SecurityAddon {
             scim_v1::ScimValue,
             scim_v1::ScimMeta,
             scim_v1::ScimAttr,
+            scim_v1::ScimApplicationPasswordCreate,
+            scim_v1::ScimApplicationPassword,
+            scim_v1::client::ScimEntryPostGeneric,
 
             internal::ApiToken,
             internal::ApiTokenPurpose,

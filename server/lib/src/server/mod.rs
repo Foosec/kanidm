@@ -17,8 +17,11 @@ use crate::filter::{
     Filter, FilterInvalid, FilterValid, FilterValidResolved, ResolveFilterCache,
     ResolveFilterCacheReadTxn,
 };
-use crate::plugins::dyngroup::{DynGroup, DynGroupCache};
-use crate::plugins::Plugins;
+use crate::plugins::{
+    self,
+    dyngroup::{DynGroup, DynGroupCache},
+    Plugins,
+};
 use crate::prelude::*;
 use crate::repl::cid::Cid;
 use crate::repl::proto::ReplRuvRange;
@@ -28,26 +31,26 @@ use crate::schema::{
     SchemaWriteTransaction,
 };
 use crate::value::{CredentialType, EXTRACT_VAL_DN};
-use crate::valueset::uuid_to_proto_string;
-use crate::valueset::ScimValueIntermediate;
 use crate::valueset::*;
-use concread::arcache::{ARCacheBuilder, ARCacheReadTxn};
+use concread::arcache::{ARCacheBuilder, ARCacheReadTxn, ARCacheWriteTxn};
 use concread::cowcell::*;
+use crypto_glue::{hmac_s256::HmacSha256Key, s256::Sha256Output};
 use hashbrown::{HashMap, HashSet};
 use kanidm_proto::internal::{DomainInfo as ProtoDomainInfo, ImageValue, UiHint};
-use kanidm_proto::scim_v1::client::ScimFilter;
-use kanidm_proto::scim_v1::server::ScimOAuth2ClaimMap;
-use kanidm_proto::scim_v1::server::ScimOAuth2ScopeMap;
-use kanidm_proto::scim_v1::server::ScimReference;
-use kanidm_proto::scim_v1::JsonValue;
-use kanidm_proto::scim_v1::ScimEntryGetQuery;
-use std::collections::BTreeSet;
+use kanidm_proto::scim_v1::{
+    server::{ScimListResponse, ScimOAuth2ClaimMap, ScimOAuth2ScopeMap, ScimReference},
+    JsonValue, ScimEntryGetQuery, ScimFilter,
+};
+use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroU64;
 use std::str::FromStr;
 use std::sync::Arc;
+use time::OffsetDateTime;
 use tokio::sync::{Semaphore, SemaphorePermit};
 use tracing::trace;
 
 pub(crate) mod access;
+pub mod assert;
 pub mod batch_modify;
 pub mod create;
 pub mod delete;
@@ -132,11 +135,23 @@ pub struct SystemConfig {
     pub(crate) pw_badlist: HashSet<String>,
 }
 
+#[derive(Clone, Default)]
+pub struct HmacNameHistoryConfig {
+    pub(crate) enabled: bool,
+    pub(crate) key: HmacSha256Key,
+}
+
+#[derive(Clone, Default)]
+pub struct FeatureConfig {
+    pub(crate) hmac_name_history: HmacNameHistoryConfig,
+}
+
 #[derive(Clone)]
 pub struct QueryServer {
     phase: Arc<CowCell<ServerPhase>>,
     pub(crate) d_info: Arc<CowCell<DomainInfo>>,
     system_config: Arc<CowCell<SystemConfig>>,
+    feature_config: Arc<CowCell<FeatureConfig>>,
     be: Backend,
     schema: Arc<Schema>,
     accesscontrols: Arc<AccessControls>,
@@ -155,6 +170,7 @@ pub struct QueryServerReadTransaction<'a> {
     // type, maybe others?
     pub(crate) d_info: CowCellReadTxn<DomainInfo>,
     system_config: CowCellReadTxn<SystemConfig>,
+    feature_config: CowCellReadTxn<FeatureConfig>,
     schema: SchemaReadTransaction,
     accesscontrols: AccessControlsReadTransaction<'a>,
     key_providers: KeyProvidersReadTransaction,
@@ -164,6 +180,7 @@ pub struct QueryServerReadTransaction<'a> {
     // Future we may need this.
     // cid_max: CowCellReadTxn<Cid>,
     trim_cid: Cid,
+    txn_name_to_uuid: BTreeMap<String, Uuid>,
 }
 
 unsafe impl Sync for QueryServerReadTransaction<'_> {}
@@ -172,15 +189,17 @@ unsafe impl Send for QueryServerReadTransaction<'_> {}
 
 bitflags::bitflags! {
     #[derive(Copy, Clone, Debug)]
-    pub struct ChangeFlag: u32 {
-        const SCHEMA =         0b0000_0001;
-        const ACP =            0b0000_0010;
-        const OAUTH2 =         0b0000_0100;
-        const DOMAIN =         0b0000_1000;
-        const SYSTEM_CONFIG =  0b0001_0000;
-        const SYNC_AGREEMENT = 0b0010_0000;
-        const KEY_MATERIAL   = 0b0100_0000;
-        const APPLICATION    = 0b1000_0000;
+    pub struct ChangeFlag: u64 {
+        const SCHEMA =                      0b0000_0000_0000_0001;
+        const ACP =                         0b0000_0000_0000_0010;
+        const OAUTH2 =                      0b0000_0000_0000_0100;
+        const DOMAIN =                      0b0000_0000_0000_1000;
+        const SYSTEM_CONFIG =               0b0000_0000_0001_0000;
+        const SYNC_AGREEMENT =              0b0000_0000_0010_0000;
+        const KEY_MATERIAL   =              0b0000_0000_0100_0000;
+        const APPLICATION    =              0b0000_0000_1000_0000;
+        const OAUTH2_CLIENT            =    0b0000_0001_0000_0000;
+        const FEATURE                  =    0b0000_0010_0000_0000;
     }
 }
 
@@ -189,6 +208,7 @@ pub struct QueryServerWriteTransaction<'a> {
     phase: CowCellWriteTxn<'a, ServerPhase>,
     d_info: CowCellWriteTxn<'a, DomainInfo>,
     system_config: CowCellWriteTxn<'a, SystemConfig>,
+    feature_config: CowCellWriteTxn<'a, FeatureConfig>,
     curtime: Duration,
     cid: CowCellWriteTxn<'a, Cid>,
     trim_cid: Cid,
@@ -205,6 +225,13 @@ pub struct QueryServerWriteTransaction<'a> {
     pub(super) changed_uuid: HashSet<Uuid>,
     _db_ticket: SemaphorePermit<'a>,
     _write_ticket: SemaphorePermit<'a>,
+    resolve_filter_cache_clear: bool,
+    resolve_filter_cache_write: ARCacheWriteTxn<
+        'a,
+        (IdentityId, Arc<Filter<FilterValid>>),
+        Arc<Filter<FilterValidResolved>>,
+        (),
+    >,
     resolve_filter_cache: ARCacheReadTxn<
         'a,
         (IdentityId, Arc<Filter<FilterValid>>),
@@ -212,6 +239,7 @@ pub struct QueryServerWriteTransaction<'a> {
         (),
     >,
     dyngroup_cache: CowCellWriteTxn<'a, DynGroupCache>,
+    txn_name_to_uuid: BTreeMap<String, Uuid>,
 }
 
 impl QueryServerWriteTransaction<'_> {
@@ -260,7 +288,11 @@ pub trait QueryServerTransaction<'a> {
 
     fn get_domain_image_value(&self) -> Option<ImageValue>;
 
-    fn get_resolve_filter_cache(&mut self) -> &mut ResolveFilterCacheReadTxn<'a>;
+    fn get_resolve_filter_cache(&mut self) -> Option<&mut ResolveFilterCacheReadTxn<'a>>;
+
+    fn get_feature_hmac_name_history_config(&self) -> &HmacNameHistoryConfig;
+
+    fn txn_name_to_uuid(&mut self) -> &mut BTreeMap<String, Uuid>;
 
     // Because of how borrowck in rust works, if we need to get two inner types we have to get them
     // in a single fn.
@@ -269,7 +301,7 @@ pub trait QueryServerTransaction<'a> {
         &mut self,
     ) -> (
         &mut Self::BackendTransactionType,
-        &mut ResolveFilterCacheReadTxn<'a>,
+        Option<&mut ResolveFilterCacheReadTxn<'a>>,
     );
 
     /// Conduct a search and apply access controls to yield a set of entries that
@@ -326,11 +358,15 @@ pub trait QueryServerTransaction<'a> {
         // NOTE: Filters are validated in event conversion.
 
         let (be_txn, resolve_filter_cache) = self.get_resolve_filter_cache_and_be_txn();
+
         let idxmeta = be_txn.get_idxmeta_ref();
+
+        trace!(resolve_filter_cache = %resolve_filter_cache.is_some());
+
         // Now resolve all references and indexes.
         let vfr = se
             .filter
-            .resolve(&se.ident, Some(idxmeta), Some(resolve_filter_cache))
+            .resolve(&se.ident, Some(idxmeta), resolve_filter_cache)
             .map_err(|e| {
                 admin_error!(?e, "search filter resolve failure");
                 e
@@ -366,7 +402,7 @@ pub trait QueryServerTransaction<'a> {
 
         let vfr = ee
             .filter
-            .resolve(&ee.ident, Some(idxmeta), Some(resolve_filter_cache))
+            .resolve(&ee.ident, Some(idxmeta), resolve_filter_cache)
             .map_err(|e| {
                 admin_error!(?e, "Failed to resolve filter");
                 e
@@ -415,7 +451,6 @@ pub trait QueryServerTransaction<'a> {
         // is only a single correct answer that *can* match these values. This also
         // hugely simplifies the process of matching when we have app based searches
         // in future too.
-
         let work = EXTRACT_VAL_DN
             .captures(name)
             .and_then(|caps| caps.name("val"))
@@ -423,11 +458,19 @@ pub trait QueryServerTransaction<'a> {
             .ok_or(OperationError::InvalidValueState)?;
 
         // Is it just a uuid?
-        Uuid::parse_str(&work).or_else(|_| {
-            self.get_be_txn()
-                .name2uuid(&work)?
-                .ok_or(OperationError::NoMatchingEntries)
-        })
+        if let Ok(uuid) = Uuid::parse_str(&work) {
+            return Ok(uuid);
+        }
+
+        if let Some(uuid) = self.get_be_txn().name2uuid(&work)? {
+            return Ok(uuid);
+        }
+
+        if let Some(uuid) = self.txn_name_to_uuid().get(name) {
+            Ok(*uuid)
+        } else {
+            Err(OperationError::NoMatchingEntries)
+        }
     }
 
     // Similar to name, but where we lookup from external_id instead.
@@ -463,7 +506,7 @@ pub trait QueryServerTransaction<'a> {
 
     /// From internal, generate an "exists" event and dispatch
     #[instrument(level = "debug", skip_all)]
-    fn internal_exists(&mut self, filter: Filter<FilterInvalid>) -> Result<bool, OperationError> {
+    fn internal_exists(&mut self, filter: &Filter<FilterInvalid>) -> Result<bool, OperationError> {
         // Check the filter
         let f_valid = filter
             .validate(self.get_schema())
@@ -472,6 +515,12 @@ pub trait QueryServerTransaction<'a> {
         let ee = ExistsEvent::new_internal(f_valid);
         // Submit it
         self.exists(&ee)
+    }
+
+    #[instrument(level = "debug", skip_all)]
+    fn internal_exists_uuid(&mut self, uuid: Uuid) -> Result<bool, OperationError> {
+        let filter = filter!(f_eq(Attribute::Uuid, PartialValue::Uuid(uuid)));
+        self.internal_exists(&filter)
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -688,6 +737,10 @@ pub trait QueryServerTransaction<'a> {
                     SyntaxType::SecurityPrincipalName => Err(OperationError::InvalidAttribute("SPNs are generated and not able to be set.".to_string())),
                     SyntaxType::Uint32 => Value::new_uint32_str(value)
                         .ok_or_else(|| OperationError::InvalidAttribute("Invalid uint32 syntax".to_string())),
+                    SyntaxType::Int64 => Value::new_int64_str(value)
+                        .ok_or_else(|| OperationError::InvalidAttribute("Invalid int64 syntax".to_string())),
+                    SyntaxType::Uint64 => Value::new_uint64_str(value)
+                        .ok_or_else(|| OperationError::InvalidAttribute("Invalid uint64 syntax".to_string())),
                     SyntaxType::Cid => Err(OperationError::InvalidAttribute("CIDs are generated and not able to be set.".to_string())),
                     SyntaxType::NsUniqueId => Value::new_nsuniqueid_s(value)
                         .ok_or_else(|| OperationError::InvalidAttribute("Invalid NsUniqueId syntax".to_string())),
@@ -724,6 +777,9 @@ pub trait QueryServerTransaction<'a> {
                     SyntaxType::Certificate => Value::new_certificate_s(value)
                         .ok_or_else(|| OperationError::InvalidAttribute("Invalid x509 certificate syntax".to_string())),
                     SyntaxType::ApplicationPassword => Err(OperationError::InvalidAttribute("ApplicationPassword values can not be supplied through modification".to_string())),
+                    SyntaxType::Json => Err(OperationError::InvalidAttribute("Json values can not be supplied through modification".to_string())),
+                    SyntaxType::Sha256 => Err(OperationError::InvalidAttribute("SHA256 values can not be supplied through modification".to_string())),
+                    SyntaxType::Message => Err(OperationError::InvalidAttribute("Message values can not be supplied through modification".to_string())),
                 }
             }
             None => {
@@ -805,6 +861,12 @@ pub trait QueryServerTransaction<'a> {
                     SyntaxType::Uint32 => PartialValue::new_uint32_str(value).ok_or_else(|| {
                         OperationError::InvalidAttribute("Invalid uint32 syntax".to_string())
                     }),
+                    SyntaxType::Uint64 => PartialValue::new_uint64_str(value).ok_or_else(|| {
+                        OperationError::InvalidAttribute("Invalid uint64 syntax".to_string())
+                    }),
+                    SyntaxType::Int64 => PartialValue::new_int64_str(value).ok_or_else(|| {
+                        OperationError::InvalidAttribute("Invalid int64 syntax".to_string())
+                    }),
                     SyntaxType::Cid => PartialValue::new_cid_s(value).ok_or_else(|| {
                         OperationError::InvalidAttribute("Invalid cid syntax".to_string())
                     }),
@@ -855,6 +917,22 @@ pub trait QueryServerTransaction<'a> {
                             )
                         })
                     }
+                    SyntaxType::Sha256 => {
+                        let mut sha256bytes = Sha256Output::default();
+                        if hex::decode_to_slice(value, &mut sha256bytes).is_ok() {
+                            Ok(PartialValue::Sha256(sha256bytes))
+                        } else {
+                            Err(OperationError::InvalidAttribute(
+                                "Invalid syntax, expected sha256 hex string containing 64 characters".to_string(),
+                            ))
+                        }
+                    }
+                    SyntaxType::Json => Err(OperationError::InvalidAttribute(
+                        "Json values can not be validated by this interface".to_string(),
+                    )),
+                    SyntaxType::Message => Err(OperationError::InvalidAttribute(
+                        "Message values can not be validated by this interface".to_string(),
+                    )),
                 }
             }
             None => {
@@ -948,6 +1026,8 @@ pub trait QueryServerTransaction<'a> {
             return Err(OperationError::InvalidAttributeName(attr.to_string()));
         };
 
+        debug!(schema_syntax = ?schema_a.syntax, ?value);
+
         match schema_a.syntax {
             SyntaxType::Utf8String => {
                 let JsonValue::String(value) = value else {
@@ -975,6 +1055,21 @@ pub trait QueryServerTransaction<'a> {
                 let un = self.name_to_uuid(value).unwrap_or(UUID_DOES_NOT_EXIST);
                 Ok(PartialValue::Uuid(un))
             }
+            SyntaxType::Boolean => {
+                let JsonValue::Bool(value) = value else {
+                    return Err(OperationError::InvalidAttribute(attr.to_string()));
+                };
+                Ok(PartialValue::Bool(*value))
+            }
+            SyntaxType::SyntaxId => {
+                let JsonValue::String(value) = value else {
+                    return Err(OperationError::InvalidAttribute(attr.to_string()));
+                };
+                let Ok(value) = SyntaxType::try_from(value.as_str()) else {
+                    return Err(OperationError::InvalidAttribute(attr.to_string()));
+                };
+                Ok(PartialValue::Syntax(value))
+            }
             SyntaxType::ReferenceUuid
             | SyntaxType::OauthScopeMap
             | SyntaxType::Session
@@ -991,138 +1086,6 @@ pub trait QueryServerTransaction<'a> {
 
             _ => Err(OperationError::InvalidAttribute(attr.to_string())),
         }
-    }
-
-    fn resolve_scim_json_put(
-        &mut self,
-        attr: &Attribute,
-        value: Option<JsonValue>,
-    ) -> Result<Option<ValueSet>, OperationError> {
-        let schema = self.get_schema();
-        // Lookup the attr
-        let Some(schema_a) = schema.get_attributes().get(attr) else {
-            // No attribute of this name exists - fail fast, there is no point to
-            // proceed, as nothing can be satisfied.
-            return Err(OperationError::InvalidAttributeName(attr.to_string()));
-        };
-
-        let Some(value) = value else {
-            // It's a none so the value needs to be unset, and the attr DOES exist in
-            // schema.
-            return Ok(None);
-        };
-
-        let resolve_status = match schema_a.syntax {
-            SyntaxType::Utf8String => ValueSetUtf8::from_scim_json_put(value),
-            SyntaxType::Utf8StringInsensitive => ValueSetIutf8::from_scim_json_put(value),
-            SyntaxType::Uuid => ValueSetUuid::from_scim_json_put(value),
-            SyntaxType::Boolean => ValueSetBool::from_scim_json_put(value),
-            SyntaxType::SyntaxId => ValueSetSyntax::from_scim_json_put(value),
-            SyntaxType::IndexId => ValueSetIndex::from_scim_json_put(value),
-            SyntaxType::ReferenceUuid => ValueSetRefer::from_scim_json_put(value),
-            SyntaxType::Utf8StringIname => ValueSetIname::from_scim_json_put(value),
-            SyntaxType::NsUniqueId => ValueSetNsUniqueId::from_scim_json_put(value),
-            SyntaxType::DateTime => ValueSetDateTime::from_scim_json_put(value),
-            SyntaxType::EmailAddress => ValueSetEmailAddress::from_scim_json_put(value),
-            SyntaxType::Url => ValueSetUrl::from_scim_json_put(value),
-            SyntaxType::OauthScope => ValueSetOauthScope::from_scim_json_put(value),
-            SyntaxType::OauthScopeMap => ValueSetOauthScopeMap::from_scim_json_put(value),
-            SyntaxType::OauthClaimMap => ValueSetOauthClaimMap::from_scim_json_put(value),
-            SyntaxType::UiHint => ValueSetUiHint::from_scim_json_put(value),
-            SyntaxType::CredentialType => ValueSetCredentialType::from_scim_json_put(value),
-            SyntaxType::Certificate => ValueSetCertificate::from_scim_json_put(value),
-            SyntaxType::SshKey => ValueSetSshKey::from_scim_json_put(value),
-            SyntaxType::Uint32 => ValueSetUint32::from_scim_json_put(value),
-
-            // Not Yet ... if ever
-            // SyntaxType::JsonFilter => ValueSetJsonFilter::from_scim_json_put(value),
-            SyntaxType::JsonFilter => Err(OperationError::InvalidAttribute(
-                "Json Filters are not able to be set.".to_string(),
-            )),
-            // Can't be set currently as these are only internally generated for key-id's
-            // SyntaxType::HexString => ValueSetHexString::from_scim_json_put(value),
-            SyntaxType::HexString => Err(OperationError::InvalidAttribute(
-                "Hex strings are not able to be set.".to_string(),
-            )),
-
-            // Can't be set until we have better error handling in the set paths
-            // SyntaxType::Image => ValueSetImage::from_scim_json_put(value),
-            SyntaxType::Image => Err(OperationError::InvalidAttribute(
-                "Images are not able to be set.".to_string(),
-            )),
-
-            // Can't be set yet, mostly as I'm lazy
-            // SyntaxType::WebauthnAttestationCaList => {
-            //    ValueSetWebauthnAttestationCaList::from_scim_json_put(value)
-            // }
-            SyntaxType::WebauthnAttestationCaList => Err(OperationError::InvalidAttribute(
-                "Webauthn Attestation Ca Lists are not able to be set.".to_string(),
-            )),
-
-            // Syntax types that can not be submitted
-            SyntaxType::Credential => Err(OperationError::InvalidAttribute(
-                "Credentials are not able to be set.".to_string(),
-            )),
-            SyntaxType::SecretUtf8String => Err(OperationError::InvalidAttribute(
-                "Secrets are not able to be set.".to_string(),
-            )),
-            SyntaxType::SecurityPrincipalName => Err(OperationError::InvalidAttribute(
-                "SPNs are not able to be set.".to_string(),
-            )),
-            SyntaxType::Cid => Err(OperationError::InvalidAttribute(
-                "CIDs are not able to be set.".to_string(),
-            )),
-            SyntaxType::PrivateBinary => Err(OperationError::InvalidAttribute(
-                "Private Binaries are not able to be set.".to_string(),
-            )),
-            SyntaxType::IntentToken => Err(OperationError::InvalidAttribute(
-                "Intent Tokens are not able to be set.".to_string(),
-            )),
-            SyntaxType::Passkey => Err(OperationError::InvalidAttribute(
-                "Passkeys are not able to be set.".to_string(),
-            )),
-            SyntaxType::AttestedPasskey => Err(OperationError::InvalidAttribute(
-                "Attested Passkeys are not able to be set.".to_string(),
-            )),
-            SyntaxType::Session => Err(OperationError::InvalidAttribute(
-                "Sessions are not able to be set.".to_string(),
-            )),
-            SyntaxType::JwsKeyEs256 => Err(OperationError::InvalidAttribute(
-                "Jws ES256 Private Keys are not able to be set.".to_string(),
-            )),
-            SyntaxType::JwsKeyRs256 => Err(OperationError::InvalidAttribute(
-                "Jws RS256 Private Keys are not able to be set.".to_string(),
-            )),
-            SyntaxType::Oauth2Session => Err(OperationError::InvalidAttribute(
-                "Sessions are not able to be set.".to_string(),
-            )),
-            SyntaxType::TotpSecret => Err(OperationError::InvalidAttribute(
-                "TOTP Secrets are not able to be set.".to_string(),
-            )),
-            SyntaxType::ApiToken => Err(OperationError::InvalidAttribute(
-                "API Tokens are not able to be set.".to_string(),
-            )),
-            SyntaxType::AuditLogString => Err(OperationError::InvalidAttribute(
-                "Audit Strings are not able to be set.".to_string(),
-            )),
-            SyntaxType::EcKeyPrivate => Err(OperationError::InvalidAttribute(
-                "EC Private Keys are not able to be set.".to_string(),
-            )),
-            SyntaxType::KeyInternal => Err(OperationError::InvalidAttribute(
-                "Key Internal Structures are not able to be set.".to_string(),
-            )),
-            SyntaxType::ApplicationPassword => Err(OperationError::InvalidAttribute(
-                "Application Passwords are not able to be set.".to_string(),
-            )),
-        }?;
-
-        match resolve_status {
-            ValueSetResolveStatus::Resolved(vs) => Ok(vs),
-            ValueSetResolveStatus::NeedsResolution(vs_inter) => {
-                self.resolve_valueset_intermediate(vs_inter)
-            }
-        }
-        .map(Some)
     }
 
     fn resolve_valueset_intermediate(
@@ -1250,10 +1213,7 @@ pub trait QueryServerTransaction<'a> {
 
                     let joined = str_concat!(claims, ",");
 
-                    v.push(format!(
-                        "{}:{}:{}:{:?}",
-                        claim_name, resolved_id, join_char, joined
-                    ))
+                    v.push(format!("{claim_name}:{resolved_id}:{join_char}:{joined:?}"))
                 }
             }
             Ok(v)
@@ -1444,17 +1404,25 @@ impl<'a> QueryServerTransaction<'a> for QueryServerReadTransaction<'a> {
         &self.key_providers
     }
 
-    fn get_resolve_filter_cache(&mut self) -> &mut ResolveFilterCacheReadTxn<'a> {
-        &mut self.resolve_filter_cache
+    fn get_resolve_filter_cache(&mut self) -> Option<&mut ResolveFilterCacheReadTxn<'a>> {
+        Some(&mut self.resolve_filter_cache)
+    }
+
+    fn get_feature_hmac_name_history_config(&self) -> &HmacNameHistoryConfig {
+        &self.feature_config.hmac_name_history
+    }
+
+    fn txn_name_to_uuid(&mut self) -> &mut BTreeMap<String, Uuid> {
+        &mut self.txn_name_to_uuid
     }
 
     fn get_resolve_filter_cache_and_be_txn(
         &mut self,
     ) -> (
         &mut BackendReadTransaction<'a>,
-        &mut ResolveFilterCacheReadTxn<'a>,
+        Option<&mut ResolveFilterCacheReadTxn<'a>>,
     ) {
-        (&mut self.be_txn, &mut self.resolve_filter_cache)
+        (&mut self.be_txn, Some(&mut self.resolve_filter_cache))
     }
 
     fn pw_badlist(&self) -> &HashSet<String> {
@@ -1530,6 +1498,8 @@ impl QueryServerReadTransaction<'_> {
         if !sc_errs.is_empty() {
             return sc_errs;
         }
+
+        // The schema is now valid, so we load this up
 
         //  * Indexing (req be + sch )
         let idx_errs = self.get_be_txn().verify_indexes();
@@ -1621,9 +1591,24 @@ impl QueryServerReadTransaction<'_> {
         ident: Identity,
         filter: ScimFilter,
         query: ScimEntryGetQuery,
-    ) -> Result<Vec<ScimEntryKanidm>, OperationError> {
+    ) -> Result<ScimListResponse, OperationError> {
+        let filter = if let Some(ref user_filter) = query.filter {
+            ScimFilter::And(Box::new(filter), Box::new(user_filter.clone()))
+        } else {
+            filter
+        };
+
         let filter_intent = Filter::from_scim_ro(&ident, &filter, self)?;
 
+        self.scim_search_filter_ext(ident, &filter_intent, query)
+    }
+
+    pub fn scim_search_filter_ext(
+        &mut self,
+        ident: Identity,
+        filter_intent: &Filter<FilterInvalid>,
+        query: ScimEntryGetQuery,
+    ) -> Result<ScimListResponse, OperationError> {
         let f_intent_valid = filter_intent
             .validate(self.get_schema())
             .map_err(OperationError::SchemaViolation)?;
@@ -1642,11 +1627,93 @@ impl QueryServerReadTransaction<'_> {
             effective_access_check: query.ext_access_check,
         };
 
-        let vs = self.search_ext(&se)?;
+        let mut result_set = self.search_ext(&se)?;
 
-        vs.into_iter()
+        // We need to know total_results before we paginate.
+        let total_results = result_set.len() as u64;
+
+        // These are STUPID ways to do this, but they demonstrate that the feature
+        // works and it's viable on small datasets. We will make this use indexes
+        // in the future!
+
+        // First, sort if any.
+        if let Some(sort_attr) = query.sort_by {
+            result_set.sort_unstable_by(|entry_left, entry_right| {
+                let left = entry_left.get_ava_set(&sort_attr);
+                let right = entry_right.get_ava_set(&sort_attr);
+                match (left, right) {
+                    (Some(left), Some(right)) => left.cmp(right),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                }
+            });
+        }
+
+        // Paginate, if any.
+        let (items_per_page, start_index, paginated_result_set) = if let Some(count) = query.count {
+            let count: u64 = count.get();
+            // User wants pagination. Count is how many elements they want.
+
+            let start_index: u64 = query
+                .start_index
+                .map(|non_zero_index|
+                    // SCIM pagination is 1 indexed, not 0.
+                    non_zero_index.get() - 1)
+                .unwrap_or_default();
+
+            // First, check that our start_index is valid.
+            if start_index as usize > result_set.len() {
+                // SCIM rfc doesn't define what happens if start index
+                // is OOB of the result set.
+                return Err(OperationError::SC0029PaginationOutOfBounds);
+            }
+
+            let mut result_set = result_set.split_off(start_index as usize);
+            result_set.truncate(count as usize);
+
+            (
+                NonZeroU64::new(count),
+                NonZeroU64::new(start_index + 1),
+                result_set,
+            )
+        } else {
+            // Unchanged
+            (None, None, result_set)
+        };
+
+        let resources = paginated_result_set
+            .into_iter()
             .map(|entry| entry.to_scim_kanidm(self))
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(ScimListResponse {
+            // Requires other schema changes in future.
+            schemas: Vec::with_capacity(0),
+            total_results,
+            items_per_page,
+            start_index,
+            resources,
+        })
+    }
+
+    #[instrument(level = "debug", skip_all)]
+    pub fn scim_search_message_ready_ext(
+        &mut self,
+        ident: Identity,
+        curtime: Duration,
+    ) -> Result<ScimListResponse, OperationError> {
+        let curtime_odt = OffsetDateTime::UNIX_EPOCH + curtime;
+
+        let filter_intent = filter_all!(f_and(vec![
+            f_eq(Attribute::Class, EntryClass::OutboundMessage.into()),
+            f_lt(Attribute::SendAfter, PartialValue::DateTime(curtime_odt)),
+            f_andnot(f_pres(Attribute::SentAt))
+        ]));
+
+        let query = ScimEntryGetQuery::default();
+
+        self.scim_search_filter_ext(ident, &filter_intent, query)
     }
 }
 
@@ -1678,17 +1745,33 @@ impl<'a> QueryServerTransaction<'a> for QueryServerWriteTransaction<'a> {
         &self.key_providers
     }
 
-    fn get_resolve_filter_cache(&mut self) -> &mut ResolveFilterCacheReadTxn<'a> {
-        &mut self.resolve_filter_cache
+    fn get_resolve_filter_cache(&mut self) -> Option<&mut ResolveFilterCacheReadTxn<'a>> {
+        if self.resolve_filter_cache_clear || *self.phase < ServerPhase::SchemaReady {
+            None
+        } else {
+            Some(&mut self.resolve_filter_cache)
+        }
+    }
+
+    fn get_feature_hmac_name_history_config(&self) -> &HmacNameHistoryConfig {
+        &self.feature_config.hmac_name_history
+    }
+
+    fn txn_name_to_uuid(&mut self) -> &mut BTreeMap<String, Uuid> {
+        &mut self.txn_name_to_uuid
     }
 
     fn get_resolve_filter_cache_and_be_txn(
         &mut self,
     ) -> (
         &mut BackendWriteTransaction<'a>,
-        &mut ResolveFilterCacheReadTxn<'a>,
+        Option<&mut ResolveFilterCacheReadTxn<'a>>,
     ) {
-        (&mut self.be_txn, &mut self.resolve_filter_cache)
+        if self.resolve_filter_cache_clear || *self.phase < ServerPhase::SchemaReady {
+            (&mut self.be_txn, None)
+        } else {
+            (&mut self.be_txn, Some(&mut self.resolve_filter_cache))
+        }
     }
 
     fn pw_badlist(&self) -> &HashSet<String> {
@@ -1774,6 +1857,8 @@ impl QueryServer {
         // These default to empty, but they'll be populated shortly.
         let system_config = Arc::new(CowCell::new(SystemConfig::default()));
 
+        let feature_config = Arc::new(CowCell::new(FeatureConfig::default()));
+
         let dyngroup_cache = Arc::new(CowCell::new(DynGroupCache::default()));
 
         let phase = Arc::new(CowCell::new(ServerPhase::Bootstrap));
@@ -1800,6 +1885,7 @@ impl QueryServer {
             phase,
             d_info,
             system_config,
+            feature_config,
             be,
             schema: Arc::new(schema),
             accesscontrols: Arc::new(AccessControls::default()),
@@ -1894,12 +1980,14 @@ impl QueryServer {
             schema,
             d_info: self.d_info.read(),
             system_config: self.system_config.read(),
+            feature_config: self.feature_config.read(),
             accesscontrols: self.accesscontrols.read(),
             key_providers: self.key_providers.read(),
             _db_ticket: db_ticket,
             _read_ticket: read_ticket,
             resolve_filter_cache: self.resolve_filter_cache.read(),
             trim_cid,
+            txn_name_to_uuid: Default::default(),
         })
     }
 
@@ -1973,6 +2061,7 @@ impl QueryServer {
         let schema_write = self.schema.write();
         let d_info = self.d_info.write();
         let system_config = self.system_config.write();
+        let feature_config = self.feature_config.write();
         let phase = self.phase.write();
 
         let mut cid = self.cid_max.write();
@@ -1992,6 +2081,7 @@ impl QueryServer {
             phase,
             d_info,
             system_config,
+            feature_config,
             curtime,
             cid,
             trim_cid,
@@ -2003,8 +2093,11 @@ impl QueryServer {
             _db_ticket: db_ticket,
             _write_ticket: write_ticket,
             resolve_filter_cache: self.resolve_filter_cache.read(),
+            resolve_filter_cache_clear: false,
+            resolve_filter_cache_write: self.resolve_filter_cache.write(),
             dyngroup_cache: self.dyngroup_cache.write(),
             key_providers: self.key_providers.write(),
+            txn_name_to_uuid: Default::default(),
         })
     }
 
@@ -2017,6 +2110,23 @@ impl QueryServer {
     }
 
     pub async fn verify(&self) -> Vec<Result<(), ConsistencyError>> {
+        let current_time = duration_from_epoch_now();
+        // Before we can proceed, command the QS to load schema in full.
+        // IMPORTANT: While we take a write txn, this does no writes to the
+        // actual db, it's only so we can write to the in memory schema
+        // structures.
+        if self
+            .write(current_time)
+            .await
+            .and_then(|mut txn| {
+                txn.force_schema_reload();
+                txn.commit()
+            })
+            .is_err()
+        {
+            return vec![Err(ConsistencyError::Unknown)];
+        };
+
         match self.read().await {
             Ok(mut r_txn) => r_txn.verify(),
             Err(_) => vec![Err(ConsistencyError::Unknown)],
@@ -2047,6 +2157,10 @@ impl<'a> QueryServerWriteTransaction<'a> {
         self.curtime
     }
 
+    pub(crate) fn get_curtime_odt(&self) -> OffsetDateTime {
+        OffsetDateTime::UNIX_EPOCH + self.curtime
+    }
+
     pub(crate) fn get_cid(&self) -> &Cid {
         &self.cid
     }
@@ -2073,15 +2187,16 @@ impl<'a> QueryServerWriteTransaction<'a> {
     pub fn domain_remigrate(&mut self, level: u32) -> Result<(), OperationError> {
         let mut_d_info = self.d_info.get_mut();
 
+        // NOTE: See reload_domain_info_version which asserts that we are not attempting
+        // an unsupported remigration. This check is just a smoke check to no-op if we
+        // are not requesting any meaningful action.
         if level > mut_d_info.d_vers {
             // Nothing to do.
             return Ok(());
-        } else if level < DOMAIN_MIN_REMIGRATION_LEVEL {
-            return Err(OperationError::MG0001InvalidReMigrationLevel);
         };
 
         info!(
-            "Prepare to re-migrate from {} -> {}",
+            "Preparing to re-migrate from {} -> {}",
             level, mut_d_info.d_vers
         );
         mut_d_info.d_vers = level;
@@ -2152,16 +2267,13 @@ impl<'a> QueryServerWriteTransaction<'a> {
             ))
         }?;
 
-        // TODO: Clear the filter resolve cache.
-        // currently we can't do this because of the limits of types with arccache txns. The only
-        // thing this impacts is if something in indexed though, and the backend does handle
-        // incorrectly indexed items correctly.
+        // Since we reloaded the schema, we need to reload the filter cache since it
+        // may have incorrect or outdated information about indexes now.
+        self.resolve_filter_cache_clear = true;
 
         // Trigger reloads on services that require post-schema reloads.
         // Mainly this is plugins.
-        if *self.phase >= ServerPhase::SchemaReady {
-            DynGroup::reload(self)?;
-        }
+        DynGroup::reload(self)?;
 
         Ok(())
     }
@@ -2401,12 +2513,16 @@ impl<'a> QueryServerWriteTransaction<'a> {
         // will now see it's been increased. This also prevents recursion during reloads
         // inside of a domain migration.
         let mut_d_info = self.d_info.get_mut();
+        debug!(?mut_d_info);
+        // This is the value that is set as part of re-migrate.
         let previous_version = mut_d_info.d_vers;
         let previous_patch_level = mut_d_info.d_patch_level;
         mut_d_info.d_vers = domain_info_version;
         mut_d_info.d_patch_level = domain_info_patch_level;
         mut_d_info.d_devel_taint = domain_info_devel_taint;
         mut_d_info.d_allow_easter_eggs = domain_allow_easter_eggs;
+
+        debug!(?mut_d_info);
 
         // We must both be at the correct domain version *and* the correct patch level. If we are
         // not, then we only proceed to migrate *if* our server boot phase is correct.
@@ -2431,38 +2547,68 @@ impl<'a> QueryServerWriteTransaction<'a> {
         }
 
         if previous_version < DOMAIN_MIN_REMIGRATION_LEVEL {
-            error!("UNABLE TO PROCEED. You are attempting a Skip update which is NOT SUPPORTED. You must upgrade one-version of Kanidm at a time.");
+            let valid_levels: Vec<_> =
+                (DOMAIN_MIN_REMIGRATION_LEVEL..DOMAIN_PREVIOUS_TGT_LEVEL).collect();
+            error!("UNABLE TO PROCEED. You have requested an initial migration level which is lower than supported.");
             error!("For more see: https://kanidm.github.io/kanidm/stable/support.html#upgrade-policy and https://kanidm.github.io/kanidm/stable/server_updates.html");
             error!(domain_previous_version = ?previous_version, domain_target_version = ?domain_info_version);
             error!(domain_previous_patch_level = ?previous_patch_level, domain_target_patch_level = ?domain_info_patch_level);
-            return Err(OperationError::MG0008SkipUpgradeAttempted);
+            error!(?valid_levels);
+
+            debug_assert!(false);
+
+            return Err(OperationError::MG0001InvalidReMigrationLevel);
         }
 
-        if previous_version <= DOMAIN_LEVEL_8 && domain_info_version >= DOMAIN_LEVEL_9 {
-            // 1.4 -> 1.5
-            self.migrate_domain_8_to_9()?;
-        }
-
+        // Commented as an example of patch application
+        /*
         if previous_patch_level < PATCH_LEVEL_2
             && domain_info_patch_level >= PATCH_LEVEL_2
             && domain_info_version == DOMAIN_LEVEL_9
         {
             self.migrate_domain_patch_level_2()?;
         }
+        */
 
-        if previous_version <= DOMAIN_LEVEL_9 && domain_info_version >= DOMAIN_LEVEL_10 {
-            // 1.5 -> 1.6
-            self.migrate_domain_9_to_10()?;
-        }
+        // This is to catch during development if we incorrectly move MIN_REMIGRATION but
+        // without actually updating these values correctly.
+        const { assert!(DOMAIN_MIN_REMIGRATION_LEVEL <= DOMAIN_PREVIOUS_TGT_LEVEL) };
+        const { assert!(DOMAIN_MIN_REMIGRATION_LEVEL >= DOMAIN_MIN_CREATION_LEVEL) };
 
+        const { assert!(DOMAIN_MIN_CREATION_LEVEL >= DOMAIN_LEVEL_10) };
+
+        //                     /--- This needs to be the minimum creation level.
+        //                     |                                          /-- This is the minlevel we can remigrate from
+        //                     v                                          v
         if previous_version <= DOMAIN_LEVEL_10 && domain_info_version >= DOMAIN_LEVEL_11 {
             // 1.6 -> 1.7
             self.migrate_domain_10_to_11()?;
         }
 
+        if previous_version <= DOMAIN_LEVEL_11 && domain_info_version >= DOMAIN_LEVEL_12 {
+            // 1.7 -> 1.8
+            self.migrate_domain_11_to_12()?;
+        }
+
+        if previous_version <= DOMAIN_LEVEL_12 && domain_info_version >= DOMAIN_LEVEL_13 {
+            // 1.8 -> 1.9
+            self.migrate_domain_12_to_13()?;
+        }
+
+        if previous_version <= DOMAIN_LEVEL_13 && domain_info_version >= DOMAIN_LEVEL_14 {
+            // 1.9 -> 1.10
+            self.migrate_domain_13_to_14()?;
+        }
+
+        if previous_version <= DOMAIN_LEVEL_14 && domain_info_version >= DOMAIN_LEVEL_15 {
+            // 1.10 -> 1.11
+            self.migrate_domain_14_to_15()?;
+        }
+
         // This is here to catch when we increase domain levels but didn't create the migration
         // hooks. If this fails it probably means you need to add another migration hook
         // in the above.
+        const { assert!(DOMAIN_MAX_LEVEL == DOMAIN_LEVEL_15) };
         debug_assert!(domain_info_version <= DOMAIN_MAX_LEVEL);
 
         Ok(())
@@ -2481,7 +2627,7 @@ impl<'a> QueryServerWriteTransaction<'a> {
         let display_name = domain_entry
             .get_ava_single_utf8(Attribute::DomainDisplayName)
             .map(str::to_string)
-            .unwrap_or_else(|| format!("Kanidm {}", domain_name));
+            .unwrap_or_else(|| format!("Kanidm {domain_name}"));
 
         let domain_ldap_allow_unix_pw_bind = domain_entry
             .get_ava_single_bool(Attribute::LdapAllowUnixPwBind)
@@ -2514,6 +2660,75 @@ impl<'a> QueryServerWriteTransaction<'a> {
         }
         mut_d_info.d_display = display_name;
         mut_d_info.d_image = domain_image;
+        Ok(())
+    }
+
+    /// Reloads feature configurations if they have changed in this operation
+    #[instrument(level = "debug", skip_all)]
+    pub(crate) fn reload_feature_config(&mut self) -> Result<(), OperationError> {
+        let filt = filter!(f_eq(Attribute::Class, EntryClass::Feature.into()));
+
+        let feature_configs = self.internal_search(filt).inspect_err(|err| {
+            error!(?err, "reload feature configuration internal search failed",)
+        })?;
+
+        let current_time = self.get_curtime();
+        let domain_level = self.get_domain_version();
+
+        let mut hmac_name_history_fixup = false;
+
+        // TODO: How to handle disabling on a delete? Needs thought ... but also
+        // should be impossible for someone TO delete a feature config entry?
+
+        for feature_entry in feature_configs {
+            match feature_entry.get_uuid() {
+                UUID_HMAC_NAME_FEATURE => {
+                    if domain_level < DOMAIN_LEVEL_12 {
+                        trace!("Skipping hmac name history config");
+                        continue;
+                    }
+
+                    let key_object = self
+                        .get_key_providers()
+                        .get_key_object_handle(UUID_HMAC_NAME_FEATURE)
+                        .ok_or(OperationError::KP0079KeyObjectNotFound)?;
+
+                    let mut key = HmacSha256Key::default();
+                    key_object.hkdf_s256_expand(
+                        UUID_HMAC_NAME_FEATURE.as_bytes(),
+                        key.as_mut_slice(),
+                        current_time,
+                    )?;
+
+                    drop(key_object);
+
+                    let new_feature_enabled_state = feature_entry
+                        .get_ava_single_bool(Attribute::Enabled)
+                        .unwrap_or_default();
+
+                    let feature_config_txn = self.feature_config.get_mut();
+
+                    hmac_name_history_fixup =
+                        !feature_config_txn.hmac_name_history.enabled && new_feature_enabled_state;
+
+                    feature_config_txn.hmac_name_history.enabled = new_feature_enabled_state;
+
+                    std::mem::swap(&mut key, &mut feature_config_txn.hmac_name_history.key);
+                }
+                feature_uuid => {
+                    error!(
+                        ?feature_uuid,
+                        "Unrecognised feature uuid, unable to proceed"
+                    );
+                    return Err(OperationError::KG004UnknownFeatureUuid);
+                }
+            }
+        }
+
+        if hmac_name_history_fixup {
+            plugins::hmac_name_unique::HmacNameUnique::fixup(self)?;
+        }
+
         Ok(())
     }
 
@@ -2584,7 +2799,19 @@ impl<'a> QueryServerWriteTransaction<'a> {
         self.changed_flags.remove(ChangeFlag::OAUTH2)
     }
 
-    fn set_phase(&mut self, phase: ServerPhase) {
+    #[inline]
+    pub(crate) fn get_changed_oauth2_client(&self) -> bool {
+        self.changed_flags.contains(ChangeFlag::OAUTH2_CLIENT)
+    }
+
+    /// Indicate that we are about to re-bootstrap this server. You should ONLY
+    /// call this during a replication refresh!!!
+    pub(crate) fn set_phase_bootstrap(&mut self) {
+        *self.phase = ServerPhase::Bootstrap;
+    }
+
+    /// Raise the currently running server phase.
+    pub(crate) fn set_phase(&mut self, phase: ServerPhase) {
         // Phase changes are one way
         if phase > *self.phase {
             *self.phase = phase
@@ -2598,7 +2825,7 @@ impl<'a> QueryServerWriteTransaction<'a> {
     pub(crate) fn reload(&mut self) -> Result<(), OperationError> {
         // First, check if the domain version has changed. This can trigger
         // changes to schema, access controls and more.
-        if self.changed_flags.contains(ChangeFlag::DOMAIN) {
+        if self.changed_flags.intersects(ChangeFlag::DOMAIN) {
             self.reload_domain_info_version()?;
         }
 
@@ -2606,7 +2833,7 @@ impl<'a> QueryServerWriteTransaction<'a> {
         // in an operation so we can check if we need to do the reload or not
         //
         // Reload the schema from qs.
-        if self.changed_flags.contains(ChangeFlag::SCHEMA) {
+        if self.changed_flags.intersects(ChangeFlag::SCHEMA) {
             self.reload_schema()?;
 
             // If the server is in a late phase of start up or is
@@ -2646,18 +2873,26 @@ impl<'a> QueryServerWriteTransaction<'a> {
             //    .invalidate_related_cache(self.changed_uuid.into_inner().as_slice())
         }
 
-        if self.changed_flags.contains(ChangeFlag::SYSTEM_CONFIG) {
+        if self.changed_flags.intersects(ChangeFlag::SYSTEM_CONFIG) {
             self.reload_system_config()?;
         }
 
-        if self.changed_flags.contains(ChangeFlag::DOMAIN) {
+        if self.changed_flags.intersects(ChangeFlag::DOMAIN) {
             self.reload_domain_info()?;
+        }
+
+        if self
+            .changed_flags
+            .intersects(ChangeFlag::FEATURE | ChangeFlag::KEY_MATERIAL)
+        {
+            self.reload_feature_config()?;
         }
 
         // Clear flags
         self.changed_flags.remove(
             ChangeFlag::DOMAIN
                 | ChangeFlag::SCHEMA
+                | ChangeFlag::FEATURE
                 | ChangeFlag::SYSTEM_CONFIG
                 | ChangeFlag::ACP
                 | ChangeFlag::SYNC_AGREEMENT
@@ -2673,7 +2908,7 @@ impl<'a> QueryServerWriteTransaction<'a> {
         self.be_txn.clear_cache()
     }
 
-    #[instrument(level = "info", name="qswt_commit" skip_all)]
+    #[instrument(level = "debug", name="qswt_commit" skip_all)]
     pub fn commit(mut self) -> Result<(), OperationError> {
         self.reload()?;
 
@@ -2683,6 +2918,7 @@ impl<'a> QueryServerWriteTransaction<'a> {
             phase,
             d_info,
             system_config,
+            feature_config,
             mut be_txn,
             schema,
             accesscontrols,
@@ -2698,6 +2934,9 @@ impl<'a> QueryServerWriteTransaction<'a> {
             changed_flags,
             changed_uuid: _,
             resolve_filter_cache: _,
+            resolve_filter_cache_clear,
+            mut resolve_filter_cache_write,
+            txn_name_to_uuid: _,
         } = self;
         debug_assert!(!committed);
 
@@ -2711,6 +2950,12 @@ impl<'a> QueryServerWriteTransaction<'a> {
         be_txn.set_db_ts_max(cid.ts)?;
         cid.commit();
 
+        // We don't care if this passes/fails, committing this is fine.
+        if resolve_filter_cache_clear {
+            resolve_filter_cache_write.clear();
+        }
+        resolve_filter_cache_write.commit();
+
         // Point of no return - everything has been validated and reloaded.
         //
         // = Lets commit =
@@ -2718,6 +2963,7 @@ impl<'a> QueryServerWriteTransaction<'a> {
             .commit()
             .map(|_| d_info.commit())
             .map(|_| system_config.commit())
+            .map(|_| feature_config.commit())
             .map(|_| phase.commit())
             .map(|_| dyngroup_cache.commit())
             .and_then(|_| key_providers.commit())
@@ -2733,10 +2979,11 @@ impl<'a> QueryServerWriteTransaction<'a> {
 #[cfg(test)]
 mod tests {
     use crate::prelude::*;
-    use kanidm_proto::scim_v1::client::ScimFilter;
-    use kanidm_proto::scim_v1::server::ScimReference;
-    use kanidm_proto::scim_v1::JsonValue;
-    use kanidm_proto::scim_v1::ScimEntryGetQuery;
+    use kanidm_proto::scim_v1::{
+        server::{ScimListResponse, ScimReference},
+        JsonValue, ScimEntryGetQuery, ScimFilter,
+    };
+    use std::num::NonZeroU64;
 
     #[qs_test]
     async fn test_name_to_uuid(server: &QueryServer) {
@@ -3104,7 +3351,7 @@ mod tests {
                 assert_eq!(name.clone(), "idm_people_self_name_write")
             }
             _ => {
-                panic!("expected String, actual {:?}", name_scim);
+                panic!("expected String, actual {name_scim:?}");
             }
         }
 
@@ -3121,10 +3368,7 @@ mod tests {
                 )
             }
             _ => {
-                panic!(
-                    "expected EntryReference, actual {:?}",
-                    entry_managed_by_scim
-                );
+                panic!("expected EntryReference, actual {entry_managed_by_scim:?}");
             }
         }
 
@@ -3140,7 +3384,7 @@ mod tests {
                 )
             }
             _ => {
-                panic!("expected EntryReferences, actual {:?}", members_scim);
+                panic!("expected EntryReferences, actual {members_scim:?}");
             }
         }
     }
@@ -3220,11 +3464,149 @@ mod tests {
             )),
         );
 
-        let base: Vec<ScimEntryKanidm> = server_txn
+        let base: ScimListResponse = server_txn
             .scim_search_ext(idm_admin_ident, filter, ScimEntryGetQuery::default())
             .unwrap();
 
-        assert_eq!(base.len(), 1);
-        assert_eq!(base[0].header.id, group_uuid);
+        assert_eq!(base.resources.len(), 1);
+        assert_eq!(base.total_results, 1);
+        // Pagination not requested,
+        assert_eq!(base.items_per_page, None);
+        assert_eq!(base.start_index, None);
+        assert_eq!(base.resources[0].header.id, group_uuid);
+    }
+
+    #[qs_test]
+    async fn test_scim_basic_search_ext_query_with_sort(server: &QueryServer) {
+        let mut server_txn = server.write(duration_from_epoch_now()).await.unwrap();
+
+        for i in (1..4).rev() {
+            let e1 = entry_init!(
+                (Attribute::Class, EntryClass::Object.to_value()),
+                (Attribute::Class, EntryClass::Group.to_value()),
+                (
+                    Attribute::Name,
+                    Value::new_iname(format!("testgroup{i}").as_str())
+                )
+            );
+            assert!(server_txn.internal_create(vec![e1]).is_ok());
+        }
+
+        assert!(server_txn.commit().is_ok());
+
+        // Now read that entry.
+        let mut server_txn = server.read().await.unwrap();
+
+        let idm_admin_entry = server_txn.internal_search_uuid(UUID_IDM_ADMIN).unwrap();
+        let idm_admin_ident = Identity::from_impersonate_entry_readwrite(idm_admin_entry);
+
+        let filter = ScimFilter::And(
+            Box::new(ScimFilter::Equal(
+                Attribute::Class.into(),
+                EntryClass::Group.into(),
+            )),
+            Box::new(ScimFilter::StartsWith(
+                Attribute::Name.into(),
+                JsonValue::String("testgroup".into()),
+            )),
+        );
+
+        let base: ScimListResponse = server_txn
+            .scim_search_ext(
+                idm_admin_ident.clone(),
+                filter.clone(),
+                ScimEntryGetQuery {
+                    sort_by: Some(Attribute::Name),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(base.resources.len(), 3);
+        assert_eq!(base.total_results, 3);
+        // Pagination not requested,
+        assert_eq!(base.items_per_page, None);
+        assert_eq!(base.start_index, None);
+
+        let Some(ScimValueKanidm::String(testgroup_name_0)) =
+            base.resources[0].attrs.get(&Attribute::Name)
+        else {
+            panic!("Invalid data in attribute.");
+        };
+        let Some(ScimValueKanidm::String(testgroup_name_1)) =
+            base.resources[1].attrs.get(&Attribute::Name)
+        else {
+            panic!("Invalid data in attribute.");
+        };
+        let Some(ScimValueKanidm::String(testgroup_name_2)) =
+            base.resources[2].attrs.get(&Attribute::Name)
+        else {
+            panic!("Invalid data in attribute.");
+        };
+
+        assert!(testgroup_name_0 < testgroup_name_1);
+        assert!(testgroup_name_0 < testgroup_name_2);
+        assert!(testgroup_name_1 < testgroup_name_2);
+
+        // ================
+        // Test pagination.
+        let base: ScimListResponse = server_txn
+            .scim_search_ext(
+                idm_admin_ident.clone(),
+                filter.clone(),
+                ScimEntryGetQuery {
+                    count: NonZeroU64::new(1),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(base.resources.len(), 1);
+        assert_eq!(base.total_results, 3);
+        // Pagination not requested,
+        assert_eq!(base.items_per_page, NonZeroU64::new(1));
+        assert_eq!(base.start_index, NonZeroU64::new(1));
+
+        let Some(ScimValueKanidm::String(testgroup_name_0)) =
+            base.resources[0].attrs.get(&Attribute::Name)
+        else {
+            panic!("Invalid data in attribute.");
+        };
+        // DB has reverse order
+        assert_eq!(testgroup_name_0, "testgroup3");
+
+        // ================
+        // Test pagination + sort
+        let base: ScimListResponse = server_txn
+            .scim_search_ext(
+                idm_admin_ident,
+                filter.clone(),
+                ScimEntryGetQuery {
+                    sort_by: Some(Attribute::Name),
+                    count: NonZeroU64::new(2),
+                    start_index: NonZeroU64::new(2),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(base.resources.len(), 2);
+        assert_eq!(base.total_results, 3);
+        assert_eq!(base.items_per_page, NonZeroU64::new(2));
+        assert_eq!(base.start_index, NonZeroU64::new(2));
+
+        let Some(ScimValueKanidm::String(testgroup_name_0)) =
+            base.resources[0].attrs.get(&Attribute::Name)
+        else {
+            panic!("Invalid data in attribute.");
+        };
+        let Some(ScimValueKanidm::String(testgroup_name_1)) =
+            base.resources[1].attrs.get(&Attribute::Name)
+        else {
+            panic!("Invalid data in attribute.");
+        };
+        // Sorted, note we skipped entry "testgroup 1" using pagination.
+        assert_eq!(testgroup_name_0, "testgroup2");
+        assert_eq!(testgroup_name_1, "testgroup3");
     }
 }

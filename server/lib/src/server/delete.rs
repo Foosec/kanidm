@@ -1,6 +1,7 @@
 use crate::prelude::*;
 use crate::server::DeleteEvent;
 use crate::server::{ChangeFlag, Plugins};
+use std::collections::BTreeMap;
 
 impl QueryServerWriteTransaction<'_> {
     #[allow(clippy::cognitive_complexity)]
@@ -17,7 +18,7 @@ impl QueryServerWriteTransaction<'_> {
         }
 
         // Now, delete only what you can see
-        let pre_candidates = self
+        let mut pre_candidates = self
             .impersonate_search_valid(de.filter.clone(), de.filter_orig.clone(), &de.ident)
             .map_err(|e| {
                 admin_error!("delete: error in pre-candidate selection {:?}", e);
@@ -49,6 +50,56 @@ impl QueryServerWriteTransaction<'_> {
             return Err(OperationError::AccessDenied);
         }
 
+        // ======= Access Control and Invariants Checked !!! ========
+
+        // We now extend pre-candidates with anything that will be cascade-deleted.
+        let references_filt = filter!(f_or(
+            pre_candidates
+                .iter()
+                .map(|entry| { f_eq(Attribute::Refers, PartialValue::Refer(entry.get_uuid())) })
+                .collect(),
+        ));
+
+        let mut pre_cascade_delete_candidates = self
+            .internal_search(references_filt)
+            .inspect_err(|err| error!(?err, "unable to find reference entries"))?;
+
+        #[cfg(any(test, debug_assertions))]
+        {
+            use std::collections::BTreeSet;
+
+            let candidate_uuids: BTreeSet<_> =
+                pre_candidates.iter().map(|e| e.get_uuid()).collect();
+            let ref_candidate_uuids: BTreeSet<_> = pre_cascade_delete_candidates
+                .iter()
+                .map(|e| e.get_uuid())
+                .collect();
+
+            assert!(candidate_uuids.is_disjoint(&ref_candidate_uuids));
+        }
+
+        let mut cascade_delete_candidates: Vec<Entry<EntryInvalid, EntryCommitted>> =
+            pre_cascade_delete_candidates
+                .iter()
+                // Invalidate and assign change id's
+                .map(|er| {
+                    er.as_ref()
+                        .clone()
+                        .invalidate(self.cid.clone(), &self.trim_cid)
+                })
+                // These entries are the ones that are being deleted by cascade, so we mark them
+                // as such.
+                .map(|mut entry| {
+                    if let Some(refer_uuid) = entry.get_ava_single_refer(Attribute::Refers) {
+                        // Stash the entry that triggered our deleted in this attribute. This
+                        // allows us to restore this linkage on revive, and also being a uuid instead
+                        // of a refers means that refint won't clean this linkage.
+                        entry.add_ava(Attribute::CascadeDeleted, Value::Uuid(refer_uuid));
+                    };
+                    entry
+                })
+                .collect();
+
         let mut candidates: Vec<Entry<EntryInvalid, EntryCommitted>> = pre_candidates
             .iter()
             // Invalidate and assign change id's
@@ -59,12 +110,69 @@ impl QueryServerWriteTransaction<'_> {
             })
             .collect();
 
+        pre_candidates.append(&mut pre_cascade_delete_candidates);
+        candidates.append(&mut cascade_delete_candidates);
+
         trace!(?candidates, "delete: candidates");
 
+        // If we need to build a memorial to the candidate, ask plugins now.
+        let mut memorials: BTreeMap<Uuid, EntryInitNew> = BTreeMap::new();
+
+        Plugins::run_build_memorials(self, &pre_candidates, &mut memorials, de).inspect_err(
+            |err| {
+                error!(?err, "Delete operation failed (plugin)");
+            },
+        )?;
+
+        if !memorials.is_empty() {
+            let candidates: Vec<Entry<EntryInvalid, EntryNew>> = memorials
+                .into_iter()
+                .map(|(source_uuid, mut entry)| {
+                    // First, ensure that the only class is Memorial.
+                    entry.remove_ava(&Attribute::Class);
+                    entry.set_ava_set(&Attribute::Uuid, ValueSetUuid::new(Uuid::new_v4()));
+                    entry.set_ava_set(&Attribute::InMemoriam, ValueSetUuid::new(source_uuid));
+                    entry.set_ava_set(
+                        &Attribute::Class,
+                        vs_iutf8![EntryClass::Object.into(), EntryClass::Memorial.into()],
+                    );
+                    // Now setup replication metadata so that we can put this entry
+                    // into the invalid state.
+                    entry.assign_cid(self.cid.clone(), &self.schema)
+                })
+                .collect();
+
+            if candidates.iter().any(|e| e.mask_recycled_ts().is_none()) {
+                warn!("Refusing to create invalid entries that are attempting to bypass replication state machine.");
+                return Err(OperationError::AccessDenied);
+            }
+
+            let norm_cand = candidates
+                .into_iter()
+                .map(|e| {
+                    e.validate(&self.schema)
+                        .map_err(|e| {
+                            error!("Schema Violation in create validate {:?}", e);
+                            OperationError::SchemaViolation(e)
+                        })
+                        .map(|e| {
+                            // Then seal the changes?
+                            e.seal(&self.schema)
+                        })
+                })
+                .collect::<Result<Vec<EntrySealedNew>, _>>()?;
+
+            let _commit_cand = self
+                .be_txn
+                .create(&self.cid, norm_cand)
+                .inspect_err(|err| {
+                    error!(?err, "betxn create failure");
+                })?;
+        }
+
         // Pre delete plugs
-        Plugins::run_pre_delete(self, &mut candidates, de).map_err(|e| {
-            admin_error!("Delete operation failed (plugin), {:?}", e);
-            e
+        Plugins::run_pre_delete(self, &mut candidates, de).inspect_err(|err| {
+            error!(?err, "Delete operation failed (plugin)");
         })?;
 
         trace!(?candidates, "delete: now marking candidates as recycled");
@@ -132,6 +240,23 @@ impl QueryServerWriteTransaction<'_> {
         {
             self.changed_flags.insert(ChangeFlag::OAUTH2)
         }
+
+        if !self.changed_flags.contains(ChangeFlag::OAUTH2_CLIENT)
+            && del_cand
+                .iter()
+                .any(|e| e.attribute_equality(Attribute::Class, &EntryClass::OAuth2Client.into()))
+        {
+            self.changed_flags.insert(ChangeFlag::OAUTH2_CLIENT)
+        }
+
+        if !self.changed_flags.contains(ChangeFlag::FEATURE)
+            && del_cand
+                .iter()
+                .any(|e| e.attribute_equality(Attribute::Class, &EntryClass::Feature.into()))
+        {
+            self.changed_flags.insert(ChangeFlag::FEATURE)
+        }
+
         if !self.changed_flags.contains(ChangeFlag::DOMAIN)
             && del_cand
                 .iter()
@@ -139,6 +264,7 @@ impl QueryServerWriteTransaction<'_> {
         {
             self.changed_flags.insert(ChangeFlag::DOMAIN)
         }
+
         if !self.changed_flags.contains(ChangeFlag::SYSTEM_CONFIG)
             && del_cand
                 .iter()
@@ -146,6 +272,7 @@ impl QueryServerWriteTransaction<'_> {
         {
             self.changed_flags.insert(ChangeFlag::SYSTEM_CONFIG)
         }
+
         if !self.changed_flags.contains(ChangeFlag::SYNC_AGREEMENT)
             && del_cand
                 .iter()
@@ -153,6 +280,7 @@ impl QueryServerWriteTransaction<'_> {
         {
             self.changed_flags.insert(ChangeFlag::SYNC_AGREEMENT)
         }
+
         if !self.changed_flags.contains(ChangeFlag::KEY_MATERIAL)
             && del_cand.iter().any(|e| {
                 e.attribute_equality(Attribute::Class, &EntryClass::KeyProvider.into())

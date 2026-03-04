@@ -10,7 +10,7 @@ async fn test_v1_group_id_patch(rsclient: &KanidmClient) {
         .await;
     assert!(res.is_ok());
 
-    create_user(&rsclient, "foo", "foogroup").await;
+    create_user(rsclient, "foo", "foogroup").await;
 
     let post_body = serde_json::json!({"attrs": { ATTR_DESCRIPTION : ["Fancy group change"]}});
 
@@ -19,9 +19,9 @@ async fn test_v1_group_id_patch(rsclient: &KanidmClient) {
         .await
     {
         Ok(val) => val,
-        Err(err) => panic!("Failed to patch group: {:?}", err),
+        Err(err) => panic!("Failed to patch group: {err:?}"),
     };
-    eprintln!("response: {:#?}", response);
+    eprintln!("response: {response:#?}");
 }
 
 #[kanidmd_testkit::test]
@@ -31,7 +31,7 @@ async fn test_v1_group_id_attr_post(rsclient: &KanidmClient) {
         .await;
     assert!(res.is_ok());
 
-    create_user(&rsclient, "foo", "foogroup").await;
+    create_user(rsclient, "foo", "foogroup").await;
 
     let post_body = serde_json::json!(["foo"]);
 
@@ -42,10 +42,10 @@ async fn test_v1_group_id_attr_post(rsclient: &KanidmClient) {
         )
         .await
     {
-        Ok(val) => panic!("Expected failure to post group attribute: {:?}", val),
+        Ok(val) => panic!("Expected failure to post group attribute: {val:?}"),
         Err(err) => err,
     };
-    eprintln!("response: {:#?}", response);
+    eprintln!("response: {response:#?}");
     assert!(matches!(
         response,
         ClientError::Http(StatusCode::BAD_REQUEST, _, _)

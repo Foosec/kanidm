@@ -59,11 +59,17 @@ pub enum UiHint {
 
 impl fmt::Display for UiHint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_ref())
+    }
+}
+
+impl AsRef<str> for UiHint {
+    fn as_ref(&self) -> &str {
         match self {
-            UiHint::PosixAccount => write!(f, "PosixAccount"),
-            UiHint::CredentialUpdate => write!(f, "CredentialUpdate"),
-            UiHint::ExperimentalFeatures => write!(f, "ExperimentalFeatures"),
-            UiHint::SynchronisedAccount => write!(f, "SynchronisedAccount"),
+            UiHint::PosixAccount => "PosixAccount",
+            UiHint::CredentialUpdate => "CredentialUpdate",
+            UiHint::ExperimentalFeatures => "ExperimentalFeatures",
+            UiHint::SynchronisedAccount => "SynchronisedAccount",
         }
     }
 }
@@ -98,7 +104,6 @@ pub enum IdentifyUserResponse {
     WaitForCode,
     Success,
     CodeFailure,
-    InvalidUserId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash, Ord, PartialOrd, ValueEnum)]
@@ -141,7 +146,7 @@ impl ImageType {
             CONTENT_TYPE_GIF => Ok(ImageType::Gif),
             CONTENT_TYPE_WEBP => Ok(ImageType::Webp),
             CONTENT_TYPE_SVG => Ok(ImageType::Svg),
-            _ => Err(format!("Invalid content type: {}", content_type)),
+            _ => Err(format!("Invalid content type: {content_type}")),
         }
     }
 
@@ -166,8 +171,7 @@ pub struct ImageValue {
 impl TryFrom<&str> for ImageValue {
     type Error = String;
     fn try_from(s: &str) -> Result<Self, String> {
-        serde_json::from_str(s)
-            .map_err(|e| format!("Failed to decode ImageValue from {} - {:?}", s, e))
+        serde_json::from_str(s).map_err(|e| format!("Failed to decode ImageValue from {s} - {e:?}"))
     }
 }
 
@@ -211,6 +215,14 @@ impl TryFrom<&str> for FsType {
             "generic" => Ok(FsType::Generic),
             _ => Err(()),
         }
+    }
+}
+
+impl FromStr for FsType {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        FsType::try_from(s).map_err(|_| "Invalid FsType, must be either 'zfs' or 'generic'")
     }
 }
 

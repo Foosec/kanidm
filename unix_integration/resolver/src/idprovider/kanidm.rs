@@ -1,30 +1,36 @@
+use super::interface::{
+    tpm::{
+        provider::{BoxedDynTpm, TpmHmacS256},
+        structures::{HmacS256Key, LoadableHmacS256Key, StorageKey},
+    },
+    AuthCredHandler, AuthRequest, AuthResult, GroupToken, GroupTokenState, Id, IdProvider,
+    IdpError, ProviderOrigin, UserToken, UserTokenState,
+};
 use crate::db::KeyStoreTxn;
-use crate::unix_config::{GroupMap, KanidmConfig};
 use async_trait::async_trait;
 use hashbrown::HashMap;
 use kanidm_client::{ClientError, KanidmClient, StatusCode};
+use kanidm_lib_crypto::CryptoPolicy;
+use kanidm_lib_crypto::DbPasswordV1;
+use kanidm_lib_crypto::Password;
 use kanidm_proto::internal::OperationError;
 use kanidm_proto::v1::{UnixGroupToken, UnixUserToken};
+use kanidm_unix_common::constants::{
+    DEFAULT_CACHE_TIMEOUT_JITTER_MS, DEFAULT_OFFLINE_PROVIDER_CHECK_TIME,
+};
+use kanidm_unix_common::unix_config::{GroupMap, KanidmConfig};
+use kanidm_unix_common::unix_proto::PamAuthRequest;
 use std::collections::BTreeSet;
 use std::time::{Duration, SystemTime};
 use tokio::sync::{broadcast, Mutex};
 
-use kanidm_lib_crypto::CryptoPolicy;
-use kanidm_lib_crypto::DbPasswordV1;
-use kanidm_lib_crypto::Password;
-
-use super::interface::{
-    tpm::{self, HmacKey, Tpm},
-    AuthCredHandler, AuthRequest, AuthResult, GroupToken, GroupTokenState, Id, IdProvider,
-    IdpError, ProviderOrigin, UserToken, UserTokenState,
-};
-use kanidm_unix_common::unix_proto::PamAuthRequest;
-
-const KANIDM_HMAC_KEY: &str = "kanidm-hmac-key";
+const KANIDM_HMAC_KEY: &str = "kanidm-hmac-key-v2";
 const KANIDM_PWV1_KEY: &str = "kanidm-pw-v1";
 
-// If the provider is offline, we need to backoff and wait a bit.
-const OFFLINE_NEXT_CHECK: Duration = Duration::from_secs(60);
+fn next_offline_check(now: SystemTime) -> SystemTime {
+    let jitter = rand::random_range(0..DEFAULT_CACHE_TIMEOUT_JITTER_MS);
+    now + (Duration::from_secs(DEFAULT_OFFLINE_PROVIDER_CHECK_TIME) - Duration::from_millis(jitter))
+}
 
 #[derive(Debug, Clone)]
 enum CacheState {
@@ -36,9 +42,10 @@ enum CacheState {
 struct KanidmProviderInternal {
     state: CacheState,
     client: KanidmClient,
-    hmac_key: HmacKey,
+    hmac_key: HmacS256Key,
     crypto_policy: CryptoPolicy,
     pam_allow_groups: BTreeSet<String>,
+    bearer_token_set: bool,
 }
 
 pub struct KanidmProvider {
@@ -49,18 +56,18 @@ pub struct KanidmProvider {
 }
 
 impl KanidmProvider {
-    pub fn new(
+    pub async fn new<'a, 'b>(
         client: KanidmClient,
         config: &KanidmConfig,
         now: SystemTime,
-        keystore: &mut KeyStoreTxn,
-        tpm: &mut tpm::BoxedDynTpm,
-        machine_key: &tpm::MachineKey,
+        keystore: &mut KeyStoreTxn<'a, 'b>,
+        tpm: &mut BoxedDynTpm,
+        machine_key: &StorageKey,
     ) -> Result<Self, IdpError> {
-        // FUTURE: Randomised jitter on next check at startup.
+        let tpm_ctx: &mut dyn TpmHmacS256 = &mut **tpm;
 
         // Initially retrieve our HMAC key.
-        let loadable_hmac_key: Option<tpm::LoadableHmacKey> = keystore
+        let loadable_hmac_key: Option<LoadableHmacS256Key> = keystore
             .get_tagged_hsm_key(KANIDM_HMAC_KEY)
             .map_err(|ks_err| {
                 error!(?ks_err);
@@ -70,7 +77,7 @@ impl KanidmProvider {
         let loadable_hmac_key = if let Some(loadable_hmac_key) = loadable_hmac_key {
             loadable_hmac_key
         } else {
-            let loadable_hmac_key = tpm.hmac_key_create(machine_key).map_err(|tpm_err| {
+            let loadable_hmac_key = tpm_ctx.hmac_s256_create(machine_key).map_err(|tpm_err| {
                 error!(?tpm_err);
                 IdpError::Tpm
             })?;
@@ -85,8 +92,8 @@ impl KanidmProvider {
             loadable_hmac_key
         };
 
-        let hmac_key = tpm
-            .hmac_key_load(machine_key, &loadable_hmac_key)
+        let hmac_key = tpm_ctx
+            .hmac_s256_load(machine_key, &loadable_hmac_key)
             .map_err(|tpm_err| {
                 error!(?tpm_err);
                 IdpError::Tpm
@@ -103,6 +110,12 @@ impl KanidmProvider {
             .map(|GroupMap { local, with }| (local, Id::Name(with)))
             .collect();
 
+        // Set the api token if one is set
+        if let Some(token) = config.service_account_token.clone() {
+            client.set_token(token).await;
+        };
+        let bearer_token_set = config.service_account_token.is_some();
+
         Ok(KanidmProvider {
             inner: Mutex::new(KanidmProviderInternal {
                 state: CacheState::OfflineNextCheck(now),
@@ -110,6 +123,7 @@ impl KanidmProvider {
                 hmac_key,
                 crypto_policy,
                 pam_allow_groups,
+                bearer_token_set,
             }),
             map_group,
         })
@@ -175,10 +189,12 @@ impl UserToken {
         &mut self,
         crypto_policy: &CryptoPolicy,
         cred: &str,
-        tpm: &mut tpm::BoxedDynTpm,
-        hmac_key: &HmacKey,
+        tpm: &mut BoxedDynTpm,
+        hmac_key: &HmacS256Key,
     ) {
-        let pw = match Password::new_argon2id_hsm(crypto_policy, cred, tpm, hmac_key) {
+        let tpm_ctx: &mut dyn TpmHmacS256 = &mut **tpm;
+
+        let pw = match Password::new_argon2id_hsm(crypto_policy, cred, tpm_ctx, hmac_key) {
             Ok(pw) => pw,
             Err(reason) => {
                 // Clear cached pw.
@@ -208,11 +224,15 @@ impl UserToken {
         debug!(spn = %self.spn, "Updated cached pw");
     }
 
+    pub fn kanidm_has_offline_credentials(&self) -> bool {
+        self.extra_keys.contains_key(KANIDM_PWV1_KEY)
+    }
+
     pub fn kanidm_check_cached_password(
         &self,
         cred: &str,
-        tpm: &mut tpm::BoxedDynTpm,
-        hmac_key: &HmacKey,
+        tpm: &mut BoxedDynTpm,
+        hmac_key: &HmacS256Key,
     ) -> bool {
         let pw_value = match self.extra_keys.get(KANIDM_PWV1_KEY) {
             Some(pw_value) => pw_value,
@@ -238,19 +258,20 @@ impl UserToken {
             }
         };
 
-        pw.verify_ctx(cred, Some((tpm, hmac_key)))
+        let tpm_ctx: &mut dyn TpmHmacS256 = &mut **tpm;
+
+        pw.verify_ctx(cred, Some((tpm_ctx, hmac_key)))
             .unwrap_or_default()
     }
 }
 
 impl KanidmProviderInternal {
     #[instrument(level = "debug", skip_all)]
-    async fn check_online(&mut self, tpm: &mut tpm::BoxedDynTpm, now: SystemTime) -> bool {
+    async fn check_online(&mut self, tpm: &mut BoxedDynTpm, now: SystemTime) -> bool {
         match self.state {
             // Proceed
             CacheState::Online => true,
             CacheState::OfflineNextCheck(at_time) if now >= at_time => {
-                // Attempt online. If fails, return token.
                 self.attempt_online(tpm, now).await
             }
             CacheState::OfflineNextCheck(_) | CacheState::Offline => false,
@@ -258,11 +279,34 @@ impl KanidmProviderInternal {
     }
 
     #[instrument(level = "debug", skip_all)]
-    async fn attempt_online(&mut self, _tpm: &mut tpm::BoxedDynTpm, now: SystemTime) -> bool {
+    async fn check_online_right_meow(&mut self, tpm: &mut BoxedDynTpm, now: SystemTime) -> bool {
+        match self.state {
+            CacheState::Online => true,
+            CacheState::OfflineNextCheck(_) => self.attempt_online(tpm, now).await,
+            CacheState::Offline => false,
+        }
+    }
+
+    #[instrument(level = "debug", skip_all)]
+    async fn is_online(&mut self) -> bool {
+        matches!(self.state, CacheState::Online)
+    }
+
+    #[instrument(level = "debug", skip_all)]
+    async fn attempt_online(&mut self, _tpm: &mut BoxedDynTpm, now: SystemTime) -> bool {
         let mut max_attempts = 3;
         while max_attempts > 0 {
             max_attempts -= 1;
-            match self.client.auth_anonymous().await {
+
+            // If a bearer token is set, we don't want to do an auth flow and
+            // remove that. Just do a whoami call, which will tell us the result.
+            let check_online_result = if self.bearer_token_set {
+                self.client.whoami().await.map(|_| ())
+            } else {
+                self.client.auth_anonymous().await
+            };
+
+            match check_online_result {
                 Ok(_uat) => {
                     debug!("provider is now online");
                     self.state = CacheState::Online;
@@ -279,7 +323,7 @@ impl KanidmProviderInternal {
                 }
                 Err(err) => {
                     error!(?err, "Provider online failed");
-                    self.state = CacheState::OfflineNextCheck(now + OFFLINE_NEXT_CHECK);
+                    self.state = CacheState::OfflineNextCheck(next_offline_check(now));
                     return false;
                 }
             }
@@ -295,9 +339,14 @@ impl IdProvider for KanidmProvider {
         ProviderOrigin::Kanidm
     }
 
-    async fn attempt_online(&self, tpm: &mut tpm::BoxedDynTpm, now: SystemTime) -> bool {
+    async fn attempt_online(&self, tpm: &mut BoxedDynTpm, now: SystemTime) -> bool {
         let mut inner = self.inner.lock().await;
-        inner.check_online(tpm, now).await
+        inner.check_online_right_meow(tpm, now).await
+    }
+
+    async fn is_online(&self) -> bool {
+        let mut inner = self.inner.lock().await;
+        inner.is_online().await
     }
 
     async fn mark_next_check(&self, now: SystemTime) {
@@ -314,11 +363,12 @@ impl IdProvider for KanidmProvider {
         inner.state = CacheState::Offline;
     }
 
+    #[instrument(level = "debug", skip_all, fields(id = ?id))]
     async fn unix_user_get(
         &self,
         id: &Id,
         token: Option<&UserToken>,
-        tpm: &mut tpm::BoxedDynTpm,
+        tpm: &mut BoxedDynTpm,
         now: SystemTime,
     ) -> Result<UserTokenState, IdpError> {
         let mut inner = self.inner.lock().await;
@@ -346,7 +396,7 @@ impl IdProvider for KanidmProvider {
             // Offline?
             Err(ClientError::Transport(err)) => {
                 error!(?err, "transport error");
-                inner.state = CacheState::OfflineNextCheck(now + OFFLINE_NEXT_CHECK);
+                inner.state = CacheState::OfflineNextCheck(next_offline_check(now));
                 Ok(UserTokenState::UseCached)
             }
             // Provider session error, need to re-auth
@@ -409,11 +459,12 @@ impl IdProvider for KanidmProvider {
         }
     }
 
+    #[instrument(level = "debug", skip_all)]
     async fn unix_user_online_auth_init(
         &self,
         _account_id: &str,
         _token: &UserToken,
-        _tpm: &mut tpm::BoxedDynTpm,
+        _tpm: &mut BoxedDynTpm,
         _shutdown_rx: &broadcast::Receiver<()>,
     ) -> Result<(AuthRequest, AuthCredHandler), IdpError> {
         // Not sure that I need to do much here?
@@ -423,19 +474,21 @@ impl IdProvider for KanidmProvider {
     async fn unix_unknown_user_online_auth_init(
         &self,
         _account_id: &str,
-        _tpm: &mut tpm::BoxedDynTpm,
+        _tpm: &mut BoxedDynTpm,
         _shutdown_rx: &broadcast::Receiver<()>,
     ) -> Result<Option<(AuthRequest, AuthCredHandler)>, IdpError> {
         // We do not support unknown user auth.
         Ok(None)
     }
 
+    #[instrument(level = "debug", skip_all)]
     async fn unix_user_online_auth_step(
         &self,
         account_id: &str,
+        current_token: Option<&UserToken>,
         cred_handler: &mut AuthCredHandler,
         pam_next_req: PamAuthRequest,
-        tpm: &mut tpm::BoxedDynTpm,
+        tpm: &mut BoxedDynTpm,
         _shutdown_rx: &broadcast::Receiver<()>,
     ) -> Result<AuthResult, IdpError> {
         match (cred_handler, pam_next_req) {
@@ -451,15 +504,23 @@ impl IdProvider for KanidmProvider {
 
                 match auth_result {
                     Ok(Some(n_tok)) => {
-                        let mut token = UserToken::from(n_tok);
-                        token.kanidm_update_cached_password(
+                        let mut new_token = UserToken::from(n_tok);
+
+                        // Update any keys that may have been in the db in the current
+                        // token.
+                        if let Some(previous_token) = current_token {
+                            new_token.extra_keys = previous_token.extra_keys.clone();
+                        }
+
+                        // Set any new keys that are relevant from this authentication
+                        new_token.kanidm_update_cached_password(
                             &inner.crypto_policy,
                             cred.as_str(),
                             tpm,
                             &inner.hmac_key,
                         );
 
-                        Ok(AuthResult::Success { token })
+                        Ok(AuthResult::SuccessUpdate { new_token })
                     }
                     Ok(None) => {
                         // TODO: i'm not a huge fan of this rn, but currently the way we handle
@@ -473,7 +534,7 @@ impl IdProvider for KanidmProvider {
                         Ok(AuthResult::Denied)
                     }
                     Err(ClientError::Transport(err)) => {
-                        error!(?err, "A client transport error occured.");
+                        error!(?err, "A client transport error occurred.");
                         Err(IdpError::Transport)
                     }
                     Err(ClientError::Http(StatusCode::UNAUTHORIZED, reason, opid)) => {
@@ -545,29 +606,40 @@ impl IdProvider for KanidmProvider {
         }
     }
 
+    async fn unix_user_can_offline_auth(&self, token: &UserToken) -> bool {
+        token.kanidm_has_offline_credentials()
+    }
+
     async fn unix_user_offline_auth_init(
         &self,
-        _token: &UserToken,
+        token: &UserToken,
     ) -> Result<(AuthRequest, AuthCredHandler), IdpError> {
-        Ok((AuthRequest::Password, AuthCredHandler::Password))
+        if token.kanidm_has_offline_credentials() {
+            Ok((AuthRequest::Password, AuthCredHandler::Password))
+        } else {
+            Err(IdpError::NoOfflineCredentials)
+        }
     }
 
     async fn unix_user_offline_auth_step(
         &self,
-        token: &UserToken,
+        current_token: Option<&UserToken>,
+        session_token: &UserToken,
         cred_handler: &mut AuthCredHandler,
         pam_next_req: PamAuthRequest,
-        tpm: &mut tpm::BoxedDynTpm,
+        tpm: &mut BoxedDynTpm,
     ) -> Result<AuthResult, IdpError> {
         match (cred_handler, pam_next_req) {
             (AuthCredHandler::Password, PamAuthRequest::Password { cred }) => {
                 let inner = self.inner.lock().await;
 
-                if token.kanidm_check_cached_password(cred.as_str(), tpm, &inner.hmac_key) {
+                if session_token.kanidm_check_cached_password(cred.as_str(), tpm, &inner.hmac_key) {
+                    // Ensure we have either the latest token, or if none, at least the session token.
+                    let new_token = current_token.unwrap_or(session_token).clone();
+
                     // TODO: We can update the token here and then do lockouts.
-                    Ok(AuthResult::Success {
-                        token: token.clone(),
-                    })
+
+                    Ok(AuthResult::SuccessUpdate { new_token })
                 } else {
                     Ok(AuthResult::Denied)
                 }
@@ -586,10 +658,11 @@ impl IdProvider for KanidmProvider {
         }
     }
 
+    #[instrument(level = "debug", skip_all)]
     async fn unix_group_get(
         &self,
         id: &Id,
-        tpm: &mut tpm::BoxedDynTpm,
+        tpm: &mut BoxedDynTpm,
         now: SystemTime,
     ) -> Result<GroupTokenState, IdpError> {
         let mut inner = self.inner.lock().await;
@@ -611,7 +684,7 @@ impl IdProvider for KanidmProvider {
             // Offline?
             Err(ClientError::Transport(err)) => {
                 error!(?err, "transport error");
-                inner.state = CacheState::OfflineNextCheck(now + OFFLINE_NEXT_CHECK);
+                inner.state = CacheState::OfflineNextCheck(next_offline_check(now));
                 Ok(GroupTokenState::UseCached)
             }
             // Provider session error, need to re-auth
@@ -630,7 +703,7 @@ impl IdProvider for KanidmProvider {
                         e, opid
                     ),
                 };
-                inner.state = CacheState::OfflineNextCheck(now + OFFLINE_NEXT_CHECK);
+                inner.state = CacheState::OfflineNextCheck(next_offline_check(now));
                 Ok(GroupTokenState::UseCached)
             }
             // 404 / Removed.
@@ -678,7 +751,7 @@ impl IdProvider for KanidmProvider {
 
         if inner.pam_allow_groups.is_empty() {
             // can't allow anything if the group list is zero...
-            warn!("Cannot authenticate users, no allowed groups in configuration!");
+            warn!("NO USERS CAN LOGIN TO THIS SYSTEM! There are no `pam_allowed_login_groups` in configuration!");
             Ok(Some(false))
         } else {
             let user_set: BTreeSet<_> = token
@@ -694,6 +767,10 @@ impl IdProvider for KanidmProvider {
             let intersection_count = user_set.intersection(&inner.pam_allow_groups).count();
             debug!("Number of intersecting groups: {}", intersection_count);
             debug!("User token is valid: {}", token.valid);
+
+            if intersection_count == 0 && token.valid {
+                warn!("The user {} authenticated successfully but is NOT a member of a group defined in `pam_allowed_login_groups`. They have been denied access to this system.", token.spn);
+            }
 
             Ok(Some(intersection_count > 0 && token.valid))
         }

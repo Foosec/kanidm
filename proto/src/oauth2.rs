@@ -7,8 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_with::base64::{Base64, UrlSafe};
 use serde_with::formats::SpaceSeparator;
 use serde_with::{
-    formats, rust::deserialize_ignore_any, serde_as, skip_serializing_none, NoneAsEmptyString,
-    StringWithSeparator,
+    formats, rust::deserialize_ignore_any, serde_as, skip_serializing_none, StringWithSeparator,
 };
 use url::Url;
 use uuid::Uuid;
@@ -17,6 +16,8 @@ use uuid::Uuid;
 pub const OAUTH2_DEVICE_CODE_EXPIRY_SECONDS: u64 = 300;
 /// How often a client device can query the status of the token
 pub const OAUTH2_DEVICE_CODE_INTERVAL_SECONDS: u64 = 5;
+/// Token type URI for OAuth2 access tokens as per RFC8693.
+pub const OAUTH2_TOKEN_TYPE_ACCESS_TOKEN: &str = "urn:ietf:params:oauth:token-type:access_token";
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone, Copy)]
 pub enum CodeChallengeMethod {
@@ -52,7 +53,6 @@ pub struct AuthorisationRequest {
     /// [OAuth 2.0 Multiple Response Type Encoding Practices: Response Modes](https://openid.net/specs/oauth-v2-multiple-response-types-1_0.html#ResponseModes)
     pub response_mode: Option<ResponseMode>,
     pub client_id: String,
-    #[serde_as(as = "NoneAsEmptyString")]
     pub state: Option<String>,
     #[serde(flatten)]
     pub pkce_request: Option<PkceRequest>,
@@ -158,6 +158,18 @@ pub enum GrantTypeReq {
         #[serde_as(as = "Option<StringWithSeparator::<SpaceSeparator, String>>")]
         scope: Option<BTreeSet<String>>,
     },
+    #[serde(rename = "urn:ietf:params:oauth:grant-type:token-exchange")]
+    TokenExchange {
+        subject_token: String,
+        subject_token_type: String,
+        requested_token_type: Option<String>,
+        audience: Option<String>,
+        resource: Option<String>,
+        actor_token: Option<String>,
+        actor_token_type: Option<String>,
+        #[serde_as(as = "Option<StringWithSeparator::<SpaceSeparator, String>>")]
+        scope: Option<BTreeSet<String>>,
+    },
     /// ref <https://www.rfc-editor.org/rfc/rfc8628#section-3.4>
     #[serde(rename = "urn:ietf:params:oauth:grant-type:device_code")]
     DeviceCode {
@@ -175,16 +187,15 @@ pub struct AccessTokenRequest {
     pub grant_type: GrantTypeReq,
     // REQUIRED, if the client is not authenticating with the
     //  authorization server as described in Section 3.2.1.
-    pub client_id: Option<String>,
-    pub client_secret: Option<String>,
+    #[serde(flatten)]
+    pub client_post_auth: ClientPostAuth,
 }
 
 impl From<GrantTypeReq> for AccessTokenRequest {
     fn from(req: GrantTypeReq) -> AccessTokenRequest {
         AccessTokenRequest {
             grant_type: req,
-            client_id: None,
-            client_secret: None,
+            client_post_auth: ClientPostAuth::default(),
         }
     }
 }
@@ -207,8 +218,8 @@ where
     pub nbf: i64,
     /// Issued at time.
     pub iat: i64,
-    /// -- NOT used, but part of the spec.
-    pub jti: Option<String>,
+    /// JWT ID <https://www.rfc-editor.org/rfc/rfc7519#section-4.1.7> - we set it to the session ID
+    pub jti: Uuid,
     pub client_id: String,
     #[serde(flatten)]
     pub extensions: V,
@@ -232,6 +243,15 @@ pub struct OAuth2RFC9068TokenExtensions {
     pub parent_session_id: Option<Uuid>,
 }
 
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+pub enum IssuedTokenType {
+    AccessToken,
+    RefreshToken,
+    IdToken,
+    Saml1,
+    Saml2,
+}
+
 /// The response for an access token
 #[serde_as]
 #[skip_serializing_none]
@@ -239,6 +259,8 @@ pub struct OAuth2RFC9068TokenExtensions {
 pub struct AccessTokenResponse {
     pub access_token: String,
     pub token_type: AccessTokenType,
+    /// Optional RFC8693 issued_token_type.
+    pub issued_token_type: Option<IssuedTokenType>,
     /// Expiration relative to `now` in seconds.
     pub expires_in: u32,
     pub refresh_token: Option<String>,
@@ -270,7 +292,7 @@ impl TryFrom<&str> for AccessTokenType {
             "pop" => Ok(AccessTokenType::PoP),
             "n_a" => Ok(AccessTokenType::NA),
             "dpop" => Ok(AccessTokenType::DPoP),
-            _ => Err(format!("Unknown AccessTokenType: {}", s)),
+            _ => Err(format!("Unknown AccessTokenType: {s}")),
         }
     }
 }
@@ -284,6 +306,52 @@ pub struct TokenRevokeRequest {
     /// Not required for Kanidm.
     /// <https://datatracker.ietf.org/doc/html/rfc7009#section-4.1.2>
     pub token_type_hint: Option<String>,
+
+    #[serde(flatten)]
+    pub client_post_auth: ClientPostAuth,
+}
+
+#[skip_serializing_none]
+#[derive(Serialize, Deserialize, Debug, Default)]
+/// <https://datatracker.ietf.org/doc/html/rfc6749#section-2.3.1>
+pub struct ClientPostAuth {
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
+}
+
+impl From<(String, Option<String>)> for ClientPostAuth {
+    fn from((client_id, client_secret): (String, Option<String>)) -> Self {
+        ClientPostAuth {
+            client_id: Some(client_id),
+            client_secret,
+        }
+    }
+}
+
+impl From<(&str, Option<&str>)> for ClientPostAuth {
+    fn from((client_id, client_secret): (&str, Option<&str>)) -> Self {
+        ClientPostAuth {
+            client_id: Some(client_id.to_string()),
+            client_secret: client_secret.map(|s| s.to_string()),
+        }
+    }
+}
+
+#[skip_serializing_none]
+#[derive(Serialize, Deserialize, Debug, Default)]
+/// <https://datatracker.ietf.org/doc/html/rfc6749#section-2.3.1>
+pub struct ClientAuth {
+    pub client_id: String,
+    pub client_secret: Option<String>,
+}
+
+impl From<(&str, Option<&str>)> for ClientAuth {
+    fn from((client_id, client_secret): (&str, Option<&str>)) -> Self {
+        ClientAuth {
+            client_id: client_id.to_string(),
+            client_secret: client_secret.map(|s| s.to_string()),
+        }
+    }
 }
 
 /// Request to introspect the identity of the account associated to a token.
@@ -294,6 +362,11 @@ pub struct AccessTokenIntrospectRequest {
     /// Not required for Kanidm.
     /// <https://datatracker.ietf.org/doc/html/rfc7009#section-4.1.2>
     pub token_type_hint: Option<String>,
+
+    // For when they want to use POST auth
+    // https://datatracker.ietf.org/doc/html/rfc6749#section-2.3.1
+    #[serde(flatten)]
+    pub client_post_auth: ClientPostAuth,
 }
 
 /// Response to an introspection request. If the token is inactive or revoked, only
@@ -314,11 +387,12 @@ pub struct AccessTokenIntrospectResponse {
     pub sub: Option<String>,
     pub aud: Option<String>,
     pub iss: Option<String>,
-    pub jti: Option<String>,
+    // JWT ID <https://www.rfc-editor.org/rfc/rfc7519#section-4.1.7> set to session ID
+    pub jti: Uuid,
 }
 
 impl AccessTokenIntrospectResponse {
-    pub fn inactive() -> Self {
+    pub fn inactive(session_id: Uuid) -> Self {
         AccessTokenIntrospectResponse {
             active: false,
             scope: BTreeSet::default(),
@@ -331,7 +405,7 @@ impl AccessTokenIntrospectResponse {
             sub: None,
             aud: None,
             iss: None,
-            jti: None,
+            jti: session_id,
         }
     }
 }
@@ -369,10 +443,16 @@ pub enum GrantType {
     #[serde(rename = "authorization_code")]
     AuthorisationCode,
     Implicit,
+    #[serde(rename = "urn:ietf:params:oauth:grant-type:token-exchange")]
+    TokenExchange,
 }
 
 fn grant_types_supported_default() -> Vec<GrantType> {
-    vec![GrantType::AuthorisationCode, GrantType::Implicit]
+    vec![
+        GrantType::AuthorisationCode,
+        GrantType::Implicit,
+        GrantType::TokenExchange,
+    ]
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
@@ -632,7 +712,8 @@ impl DeviceAuthorizationResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{AccessTokenRequest, GrantTypeReq};
+    use super::{AccessTokenRequest, GrantTypeReq, OAUTH2_TOKEN_TYPE_ACCESS_TOKEN};
+    use std::collections::BTreeSet;
     use url::Url;
 
     #[test]
@@ -651,20 +732,67 @@ mod tests {
     fn test_oauth2_access_token_type_serde() {
         for testcase in ["bearer", "Bearer", "BeArEr"] {
             let at: super::AccessTokenType =
-                serde_json::from_str(&format!("\"{}\"", testcase)).expect("Failed to parse");
+                serde_json::from_str(&format!("\"{testcase}\"")).expect("Failed to parse");
             assert_eq!(at, super::AccessTokenType::Bearer);
         }
 
         for testcase in ["dpop", "dPoP", "DPOP", "DPoP"] {
             let at: super::AccessTokenType =
-                serde_json::from_str(&format!("\"{}\"", testcase)).expect("Failed to parse");
+                serde_json::from_str(&format!("\"{testcase}\"")).expect("Failed to parse");
             assert_eq!(at, super::AccessTokenType::DPoP);
         }
 
         {
             let testcase = "cheese";
-            let at = serde_json::from_str::<super::AccessTokenType>(&format!("\"{}\"", testcase));
+            let at = serde_json::from_str::<super::AccessTokenType>(&format!("\"{testcase}\""));
             assert!(at.is_err())
+        }
+    }
+
+    #[test]
+    fn test_token_exchange_grant_serialization() {
+        let scopes: BTreeSet<String> = ["groups", "openid"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+
+        let atr = AccessTokenRequest {
+            grant_type: GrantTypeReq::TokenExchange {
+                subject_token: "subject".to_string(),
+                subject_token_type: OAUTH2_TOKEN_TYPE_ACCESS_TOKEN.to_string(),
+                requested_token_type: None,
+                audience: Some("test_resource_server".to_string()),
+                resource: None,
+                actor_token: None,
+                actor_token_type: None,
+                scope: Some(scopes.clone()),
+            },
+            client_post_auth: Default::default(),
+        };
+
+        let json = serde_json::to_string(&atr).expect("JSON failure");
+        let de: AccessTokenRequest = serde_json::from_str(&json).expect("Roundtrip failure");
+
+        match de.grant_type {
+            GrantTypeReq::TokenExchange {
+                subject_token,
+                subject_token_type,
+                requested_token_type,
+                audience,
+                actor_token,
+                actor_token_type,
+                scope: descope,
+                ..
+            } => {
+                assert_eq!(subject_token, "subject");
+                assert_eq!(subject_token_type, OAUTH2_TOKEN_TYPE_ACCESS_TOKEN);
+                assert_eq!(requested_token_type, None);
+                assert_eq!(audience.as_deref(), Some("test_resource_server"));
+                assert_eq!(actor_token, None);
+                assert_eq!(actor_token_type, None);
+                assert_eq!(descope, Some(scopes));
+            }
+            _ => panic!("Wrong grant type"),
         }
     }
 }

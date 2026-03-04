@@ -3,35 +3,6 @@
 //! typed values, allows their comparison, filtering and more. It also has the code for serialising
 //! these into a form for the backend that can be persistent into the [`Backend`](crate::be::Backend).
 
-#![allow(non_upper_case_globals)]
-
-use std::cmp::Ordering;
-use std::collections::BTreeSet;
-use std::convert::TryFrom;
-use std::fmt;
-use std::fmt::Formatter;
-use std::str::FromStr;
-use std::time::Duration;
-
-#[cfg(test)]
-use base64::{engine::general_purpose, Engine as _};
-use compact_jwt::{crypto::JwsRs256Signer, JwsEs256Signer};
-use hashbrown::HashSet;
-use kanidm_lib_crypto::x509_cert::{der::DecodePem, Certificate};
-use kanidm_proto::internal::ImageValue;
-use num_enum::TryFromPrimitive;
-use openssl::ec::EcKey;
-use openssl::pkey::Private;
-use regex::Regex;
-use serde::{Deserialize, Serialize};
-use sshkey_attest::proto::PublicKey as SshPublicKey;
-use time::OffsetDateTime;
-use url::Url;
-use uuid::Uuid;
-use webauthn_rs::prelude::{
-    AttestationCaList, AttestedPasskey as AttestedPasskeyV4, Passkey as PasskeyV4,
-};
-
 use crate::be::dbentry::DbIdentSpn;
 use crate::be::dbvalue::DbValueOauthClaimMapJoinV1;
 use crate::credential::{apppwd::ApplicationPassword, totp::Totp, Credential};
@@ -41,92 +12,114 @@ use crate::server::identity::IdentityId;
 use crate::server::keys::KeyId;
 use crate::valueset::image::ImageValueThings;
 use crate::valueset::uuid_to_proto_string;
-
+use compact_jwt::{crypto::JwsRs256Signer, JwsEs256Signer};
+use crypto_glue::{s256::Sha256Output, traits::Zeroizing};
+use hashbrown::HashSet;
+use kanidm_lib_crypto::x509_cert::{der::DecodePem, Certificate};
+use kanidm_proto::internal::ImageValue;
 use kanidm_proto::internal::{ApiTokenPurpose, Filter as ProtoFilter, UiHint};
 use kanidm_proto::scim_v1::ScimOauth2ClaimMapJoinChar;
 use kanidm_proto::v1::UatPurposeStatus;
+use num_enum::TryFromPrimitive;
+use openssl::ec::EcKey;
+use openssl::pkey::Private;
+use regex::Regex;
+use serde::{Deserialize, Serialize};
+use sshkey_attest::proto::PublicKey as SshPublicKey;
+use std::cmp::Ordering;
+use std::collections::BTreeSet;
+use std::convert::TryFrom;
+use std::fmt;
+use std::fmt::Formatter;
 use std::hash::Hash;
+use std::str::FromStr;
+use std::time::Duration;
+use time::OffsetDateTime;
+use url::Url;
+use uuid::Uuid;
+use webauthn_rs::prelude::{
+    AttestationCaList, AttestedPasskey as AttestedPasskeyV4, Passkey as PasskeyV4,
+};
 
-lazy_static! {
-    pub static ref SPN_RE: Regex = {
-        #[allow(clippy::expect_used)]
-        Regex::new("(?P<name>[^@]+)@(?P<realm>[^@]+)").expect("Invalid SPN regex found")
-    };
+#[cfg(test)]
+use base64::{engine::general_purpose, Engine as _};
 
-    pub static ref DISALLOWED_NAMES: HashSet<&'static str> = {
-        // Most of these were removed in favour of the unixd daemon filtering out
-        // local users instead.
-        let mut m = HashSet::with_capacity(2);
-        m.insert("root");
-        m.insert("dn=token");
-        m
-    };
+pub static SPN_RE: LazyLock<Regex> = LazyLock::new(|| {
+    #[allow(clippy::expect_used)]
+    Regex::new("(?P<name>[^@]+)@(?P<realm>[^@]+)").expect("Invalid SPN regex found")
+});
 
-    /// Only lowercase+numbers, with limited chars.
-    pub static ref INAME_RE: Regex = {
-        #[allow(clippy::expect_used)]
-        Regex::new("^[a-z][a-z0-9-_\\.]{0,63}$").expect("Invalid Iname regex found")
-    };
+pub static DISALLOWED_NAMES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
+    // Most of these were removed in favour of the unixd daemon filtering out
+    // local users instead.
+    let mut m = HashSet::with_capacity(2);
+    m.insert("root");
+    m.insert("dn=token");
+    m
+});
 
-    /// Only alpha-numeric with limited special chars and space
-    pub static ref LABEL_RE: Regex = {
-        #[allow(clippy::expect_used)]
-        Regex::new("^[a-zA-Z0-9][ a-zA-Z0-9-_\\.@]{0,63}$").expect("Invalid Iname regex found")
-    };
+/// Only lowercase+numbers, with limited chars.
+pub static INAME_RE: LazyLock<Regex> = LazyLock::new(|| {
+    #[allow(clippy::expect_used)]
+    Regex::new("^[a-z][a-z0-9-_\\.]{0,63}$").expect("Invalid Iname regex found")
+});
 
-    /// Only lowercase+numbers, with limited chars.
-    pub static ref HEXSTR_RE: Regex = {
-        #[allow(clippy::expect_used)]
-        Regex::new("^[a-f0-9]+$").expect("Invalid hexstring regex found")
-    };
+/// Only alpha-numeric with limited special chars and space
+pub static LABEL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    #[allow(clippy::expect_used)]
+    Regex::new("^[a-zA-Z0-9][ a-zA-Z0-9-_\\.@]{0,63}$").expect("Invalid Iname regex found")
+});
 
-    pub static ref EXTRACT_VAL_DN: Regex = {
-        #[allow(clippy::expect_used)]
-        Regex::new("^(([^=,]+)=)?(?P<val>[^=,]+)").expect("extract val from dn regex")
-        // Regex::new("^(([^=,]+)=)?(?P<val>[^=,]+)(,.*)?$").expect("Invalid Iname regex found")
-    };
+/// Only lowercase+numbers, with limited chars.
+pub static HEXSTR_RE: LazyLock<Regex> = LazyLock::new(|| {
+    #[allow(clippy::expect_used)]
+    Regex::new("^[a-f0-9]+$").expect("Invalid hexstring regex found")
+});
 
-    pub static ref NSUNIQUEID_RE: Regex = {
-        #[allow(clippy::expect_used)]
-        Regex::new("^[0-9a-fA-F]{8}-[0-9a-fA-F]{8}-[0-9a-fA-F]{8}-[0-9a-fA-F]{8}$").expect("Invalid Nsunique regex found")
-    };
+pub static EXTRACT_VAL_DN: LazyLock<Regex> = LazyLock::new(|| {
+    #[allow(clippy::expect_used)]
+    Regex::new("^(([^=,]+)=)?(?P<val>[^=,]+)").expect("extract val from dn regex")
+});
 
-    /// Must not contain whitespace.
-    pub static ref OAUTHSCOPE_RE: Regex = {
-        #[allow(clippy::expect_used)]
-        Regex::new("^[0-9a-zA-Z_]+$").expect("Invalid oauthscope regex found")
-    };
+pub static NSUNIQUEID_RE: LazyLock<Regex> = LazyLock::new(|| {
+    #[allow(clippy::expect_used)]
+    Regex::new("^[0-9a-fA-F]{8}-[0-9a-fA-F]{8}-[0-9a-fA-F]{8}-[0-9a-fA-F]{8}$")
+        .expect("Invalid Nsunique regex found")
+});
 
-    pub static ref SINGLELINE_RE: Regex = {
-        #[allow(clippy::expect_used)]
-        Regex::new("[\n\r\t]").expect("Invalid singleline regex found")
-    };
+/// Must not contain whitespace.
+pub static OAUTHSCOPE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    #[allow(clippy::expect_used)]
+    Regex::new("^[0-9a-zA-Z_]+$").expect("Invalid oauthscope regex found")
+});
 
-    /// Per https://html.spec.whatwg.org/multipage/input.html#valid-e-mail-address
-    /// this regex validates for valid emails.
-    pub static ref VALIDATE_EMAIL_RE: Regex = {
-        #[allow(clippy::expect_used)]
-        Regex::new(r"^[a-zA-Z0-9.!#$%&'*+=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$").expect("Invalid singleline regex found")
-    };
+/// Must not contain whitespace. Allows "abcd", "abcd:efgh", but ":" and "-" need to be separating
+/// groups of characters, and are not able to be leading or trailing.
+pub static OAUTH_CLAIMNAME_RE: LazyLock<Regex> = LazyLock::new(|| {
+    #[allow(clippy::expect_used)]
+    Regex::new("^[0-9a-zA-Z_]+([:\\-][0-9a-zA-Z_]+)*$").expect("Invalid oauth claim regex found")
+});
 
-    // Formerly checked with
-    /*
-    pub static ref ESCAPES_RE: Regex = {
-        #[allow(clippy::expect_used)]
-        Regex::new(r"\x1b\[([\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e])")
-            .expect("Invalid escapes regex found")
-    };
-    */
+pub static SINGLELINE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    #[allow(clippy::expect_used)]
+    Regex::new("[\n\r\t]").expect("Invalid singleline regex found")
+});
 
-    pub static ref UNICODE_CONTROL_RE: Regex = {
-        #[allow(clippy::expect_used)]
-        Regex::new(r"[[:cntrl:]]")
-            .expect("Invalid unicode control regex found")
-    };
-}
+/// Per <https://html.spec.whatwg.org/multipage/input.html#valid-e-mail-address>
+/// this regex validates for valid emails.
+pub static VALIDATE_EMAIL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    #[allow(clippy::expect_used)]
+        Regex::new(r"^[a-zA-Z0-9.!#$%&'*+\/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$")
+            .expect("Invalid singleline regex found")
+});
+
+pub static UNICODE_CONTROL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    #[allow(clippy::expect_used)]
+    Regex::new(r"[[:cntrl:]]").expect("Invalid unicode control regex found")
+});
 
 #[derive(Debug, Clone, PartialOrd, Ord, Eq, PartialEq, Hash)]
-// https://openid.net/specs/openid-connect-core-1_0.html#AddressClaim
+/// Per <https://openid.net/specs/openid-connect-core-1_0.html#AddressClaim>
 pub struct Address {
     pub formatted: String,
     pub street_address: String,
@@ -182,6 +175,7 @@ pub enum IndexType {
     Equality,
     Presence,
     SubString,
+    Ordering,
 }
 
 impl TryFrom<&str> for IndexType {
@@ -193,6 +187,7 @@ impl TryFrom<&str> for IndexType {
             "EQUALITY" => Ok(IndexType::Equality),
             "PRESENCE" => Ok(IndexType::Presence),
             "SUBSTRING" => Ok(IndexType::SubString),
+            "ORDERING" => Ok(IndexType::Ordering),
             // UUID map?
             // UUID rev map?
             _ => Err(()),
@@ -206,6 +201,7 @@ impl IndexType {
             IndexType::Equality => "eq",
             IndexType::Presence => "pres",
             IndexType::SubString => "sub",
+            IndexType::Ordering => "ord",
         }
     }
 }
@@ -219,6 +215,7 @@ impl fmt::Display for IndexType {
                 IndexType::Equality => "EQUALITY",
                 IndexType::Presence => "PRESENCE",
                 IndexType::SubString => "SUBSTRING",
+                IndexType::Ordering => "ORDERING",
             }
         )
     }
@@ -284,6 +281,11 @@ pub enum SyntaxType {
     HexString = 39,
     Certificate = 40,
     ApplicationPassword = 41,
+    Json = 42,
+    Message = 43,
+    Sha256 = 44,
+    Int64 = 45,
+    Uint64 = 46,
 }
 
 impl TryFrom<&str> for SyntaxType {
@@ -334,6 +336,11 @@ impl TryFrom<&str> for SyntaxType {
             "HEX_STRING" => Ok(SyntaxType::HexString),
             "CERTIFICATE" => Ok(SyntaxType::Certificate),
             "APPLICATION_PASSWORD" => Ok(SyntaxType::ApplicationPassword),
+            "JSON" => Ok(SyntaxType::Json),
+            "MESSAGE" => Ok(SyntaxType::Message),
+            "SHA256" => Ok(SyntaxType::Sha256),
+            "INT64" => Ok(SyntaxType::Int64),
+            "UINT64" => Ok(SyntaxType::Uint64),
             _ => Err(()),
         }
     }
@@ -384,7 +391,86 @@ impl fmt::Display for SyntaxType {
             SyntaxType::HexString => "HEX_STRING",
             SyntaxType::Certificate => "CERTIFICATE",
             SyntaxType::ApplicationPassword => "APPLICATION_PASSWORD",
+            SyntaxType::Json => "JSON",
+            SyntaxType::Message => "MESSAGE",
+            SyntaxType::Sha256 => "SHA256",
+            SyntaxType::Int64 => "INT64",
+            SyntaxType::Uint64 => "UINT64",
         })
+    }
+}
+
+impl SyntaxType {
+    pub fn index_types(&self) -> &[IndexType] {
+        match self {
+            SyntaxType::Utf8String => &[IndexType::Equality, IndexType::Presence],
+            // Used by classes, needs to change ...
+            // Probably need an attrname syntax too
+            SyntaxType::Utf8StringInsensitive => &[IndexType::Equality, IndexType::Presence],
+            SyntaxType::Utf8StringIname => &[
+                IndexType::Equality,
+                IndexType::Presence,
+                IndexType::SubString,
+            ],
+            SyntaxType::Uuid => &[IndexType::Equality, IndexType::Presence],
+            SyntaxType::Boolean => &[IndexType::Equality],
+            SyntaxType::ReferenceUuid => &[IndexType::Equality, IndexType::Presence],
+            SyntaxType::Credential => &[IndexType::Equality],
+            SyntaxType::SshKey => &[IndexType::Equality, IndexType::Presence],
+            SyntaxType::SecurityPrincipalName => &[
+                IndexType::Equality,
+                IndexType::Presence,
+                IndexType::SubString,
+            ],
+            SyntaxType::Uint32 | SyntaxType::Int64 | SyntaxType::Uint64 => &[
+                IndexType::Equality,
+                IndexType::Presence,
+                IndexType::Ordering,
+            ],
+            SyntaxType::Cid => &[
+                IndexType::Equality,
+                IndexType::Presence,
+                IndexType::Ordering,
+            ],
+            SyntaxType::NsUniqueId => &[IndexType::Equality, IndexType::Presence],
+            SyntaxType::DateTime => &[
+                IndexType::Equality,
+                IndexType::Presence,
+                IndexType::Ordering,
+            ],
+            SyntaxType::EmailAddress => &[IndexType::Equality, IndexType::SubString],
+            SyntaxType::OauthScopeMap => &[IndexType::Equality],
+            SyntaxType::IntentToken => &[IndexType::Equality],
+            SyntaxType::Passkey => &[IndexType::Equality],
+            SyntaxType::AttestedPasskey => &[IndexType::Equality],
+            SyntaxType::Session => &[IndexType::Equality],
+            SyntaxType::Oauth2Session => &[IndexType::Equality],
+            SyntaxType::ApiToken => &[IndexType::Equality],
+            SyntaxType::OauthClaimMap => &[IndexType::Equality],
+            SyntaxType::ApplicationPassword => &[IndexType::Equality],
+            SyntaxType::SecretUtf8String => &[],
+            SyntaxType::Url => &[],
+            SyntaxType::OauthScope => &[],
+            SyntaxType::PrivateBinary => &[],
+            SyntaxType::JwsKeyEs256 => &[],
+            SyntaxType::JwsKeyRs256 => &[],
+            SyntaxType::UiHint => &[],
+            SyntaxType::TotpSecret => &[],
+            SyntaxType::AuditLogString => &[],
+            SyntaxType::EcKeyPrivate => &[],
+            SyntaxType::Image => &[],
+            SyntaxType::CredentialType => &[],
+            SyntaxType::WebauthnAttestationCaList => &[],
+            SyntaxType::KeyInternal => &[],
+            SyntaxType::HexString => &[],
+            SyntaxType::Certificate => &[],
+            SyntaxType::SyntaxId => &[],
+            SyntaxType::IndexId => &[],
+            SyntaxType::JsonFilter => &[],
+            SyntaxType::Json => &[],
+            SyntaxType::Message => &[],
+            SyntaxType::Sha256 => &[IndexType::Equality],
+        }
     }
 }
 
@@ -405,6 +491,9 @@ impl fmt::Display for SyntaxType {
 #[repr(u16)]
 pub enum CredentialType {
     Any = 0,
+    /// Since we have no control over external authentication providers, we need
+    /// to rank these below our own authentication methods.
+    External = 5,
     #[default]
     Mfa = 10,
     Passkey = 20,
@@ -419,6 +508,7 @@ impl TryFrom<&str> for CredentialType {
     fn try_from(value: &str) -> Result<CredentialType, Self::Error> {
         match value {
             "any" => Ok(CredentialType::Any),
+            "external" => Ok(CredentialType::External),
             "mfa" => Ok(CredentialType::Mfa),
             "passkey" => Ok(CredentialType::Passkey),
             "attested_passkey" => Ok(CredentialType::AttestedPasskey),
@@ -433,6 +523,7 @@ impl fmt::Display for CredentialType {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.write_str(match self {
             CredentialType::Any => "any",
+            CredentialType::External => "external",
             CredentialType::Mfa => "mfa",
             CredentialType::Passkey => "passkey",
             CredentialType::AttestedPasskey => "attested_passkey",
@@ -520,6 +611,10 @@ pub enum PartialValue {
     OauthClaimValue(String, Uuid, String),
 
     HexString(String),
+    Json,
+    Sha256(Sha256Output),
+    Int64(i64),
+    Uint64(u64),
 }
 
 impl From<SyntaxType> for PartialValue {
@@ -570,6 +665,12 @@ impl From<Url> for PartialValue {
     }
 }
 
+impl From<Sha256Output> for PartialValue {
+    fn from(i: Sha256Output) -> Self {
+        PartialValue::Sha256(i)
+    }
+}
+
 impl PartialValue {
     pub fn new_utf8(s: String) -> Self {
         PartialValue::Utf8(s)
@@ -591,12 +692,6 @@ impl PartialValue {
         PartialValue::Iname(s.to_lowercase())
     }
 
-    // TODO: take this away
-    #[inline]
-    pub fn new_class(s: &str) -> Self {
-        PartialValue::new_iutf8(s)
-    }
-
     pub fn is_iutf8(&self) -> bool {
         matches!(self, PartialValue::Iutf8(_))
     }
@@ -605,7 +700,7 @@ impl PartialValue {
         matches!(self, PartialValue::Iname(_))
     }
 
-    pub fn new_bool(b: bool) -> Self {
+    pub const fn new_bool(b: bool) -> Self {
         PartialValue::Bool(b)
     }
 
@@ -721,6 +816,14 @@ impl PartialValue {
 
     pub fn new_uint32_str(u: &str) -> Option<Self> {
         u.parse::<u32>().ok().map(PartialValue::Uint32)
+    }
+
+    pub fn new_int64_str(u: &str) -> Option<Self> {
+        u.parse::<i64>().ok().map(PartialValue::Int64)
+    }
+
+    pub fn new_uint64_str(u: &str) -> Option<Self> {
+        u.parse::<u64>().ok().map(PartialValue::Uint64)
     }
 
     pub fn is_uint32(&self) -> bool {
@@ -891,6 +994,8 @@ impl PartialValue {
             PartialValue::SecretValue | PartialValue::PrivateBinary => "_".to_string(),
             PartialValue::Spn(name, realm) => format!("{name}@{realm}"),
             PartialValue::Uint32(u) => u.to_string(),
+            PartialValue::Int64(u) => u.to_string(),
+            PartialValue::Uint64(u) => u.to_string(),
             PartialValue::DateTime(odt) => {
                 debug_assert_eq!(odt.offset(), time::UtcOffset::UTC);
                 #[allow(clippy::expect_used)]
@@ -911,6 +1016,8 @@ impl PartialValue {
             PartialValue::OauthClaim(_, _) => "_".to_string(),
             PartialValue::OauthClaimValue(_, _, _) => "_".to_string(),
             PartialValue::HexString(hexstr) => hexstr.to_string(),
+            PartialValue::Json => "_".to_string(),
+            PartialValue::Sha256(bytes) => hex::encode(bytes),
         }
     }
 
@@ -1057,6 +1164,7 @@ pub enum AuthType {
     PasswordSecurityKey,
     Passkey,
     AttestedPasskey,
+    OAuth2Trust,
 }
 
 impl fmt::Display for AuthType {
@@ -1070,6 +1178,32 @@ impl fmt::Display for AuthType {
             AuthType::PasswordSecurityKey => write!(f, "passwordsecuritykey"),
             AuthType::Passkey => write!(f, "passkey"),
             AuthType::AttestedPasskey => write!(f, "attested_passkey"),
+            AuthType::OAuth2Trust => write!(f, "oauth2_trust"),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Default)]
+pub enum SessionExtMetadata {
+    #[default]
+    None,
+    OAuth2 {
+        access_expires_at: Duration,
+        access_token: String,
+        refresh_token: Option<String>,
+    },
+}
+
+impl fmt::Debug for SessionExtMetadata {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        match self {
+            Self::None => f.debug_struct("SessionExtMetadata::None").finish(),
+            Self::OAuth2 {
+                access_expires_at, ..
+            } => f
+                .debug_struct("SessionExtMetadata::OAuth2")
+                .field("access_expires_at", access_expires_at)
+                .finish(),
         }
     }
 }
@@ -1084,6 +1218,7 @@ pub struct Session {
     pub cred_id: Uuid,
     pub scope: SessionScope,
     pub type_: AuthType,
+    pub ext_metadata: SessionExtMetadata,
 }
 
 impl fmt::Debug for Session {
@@ -1091,7 +1226,7 @@ impl fmt::Debug for Session {
         let issuer = match self.issued_by {
             IdentityId::User(u) => format!("User - {}", uuid_to_proto_string(u)),
             IdentityId::Synch(u) => format!("Synch - {}", uuid_to_proto_string(u)),
-            IdentityId::Internal => "Internal".to_string(),
+            IdentityId::Internal(u) => format!("Internal - {}", uuid_to_proto_string(u)),
         };
         let expiry = match self.state {
             SessionState::ExpiresAt(e) => e.to_string(),
@@ -1192,7 +1327,10 @@ pub struct Oauth2Session {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyUsage {
     JwsEs256,
+    JwsHs256,
+    JwsRs256,
     JweA128GCM,
+    HkdfS256,
 }
 
 impl fmt::Display for KeyUsage {
@@ -1202,7 +1340,10 @@ impl fmt::Display for KeyUsage {
             "{}",
             match self {
                 KeyUsage::JwsEs256 => "jws_es256",
+                KeyUsage::JwsHs256 => "jws_hs256",
+                KeyUsage::JwsRs256 => "jws_rs256",
                 KeyUsage::JweA128GCM => "jwe_a128gcm",
+                KeyUsage::HkdfS256 => "hkdf_s256",
             }
         )
     }
@@ -1253,6 +1394,8 @@ pub enum Value {
     SecretValue(String),
     Spn(String, String),
     Uint32(u32),
+    Int64(i64),
+    Uint64(u64),
     Cid(Cid),
     Nsuniqueid(String),
     DateTime(OffsetDateTime),
@@ -1294,13 +1437,15 @@ pub enum Value {
         valid_from: u64,
         status: KeyStatus,
         status_cid: Cid,
-        der: Vec<u8>,
+        der: Zeroizing<Vec<u8>>,
     },
 
     HexString(String),
 
     Certificate(Box<Certificate>),
     ApplicationPassword(ApplicationPassword),
+    Json(JsonValue),
+    Sha256(Sha256Output),
 }
 
 impl PartialEq for Value {
@@ -1331,6 +1476,10 @@ impl PartialEq for Value {
             (Value::JsonFilt(a), Value::JsonFilt(b)) => a.eq(b),
             // Uint32
             (Value::Uint32(a), Value::Uint32(b)) => a.eq(b),
+            // Int64
+            (Value::Int64(a), Value::Int64(b)) => a.eq(b),
+            // Uint64
+            (Value::Uint64(a), Value::Uint64(b)) => a.eq(b),
             // Cid
             (Value::Cid(a), Value::Cid(b)) => a.eq(b),
             // DateTime
@@ -1468,11 +1617,6 @@ impl Value {
 
     pub fn is_iutf8(&self) -> bool {
         matches!(self, Value::Iutf8(_))
-    }
-
-    #[inline(always)]
-    pub fn new_class(s: &str) -> Self {
-        Value::Iutf8(s.to_lowercase())
     }
 
     pub fn new_attr(s: &str) -> Self {
@@ -1675,6 +1819,14 @@ impl Value {
         matches!(&self, Value::Uint32(_))
     }
 
+    pub fn new_int64_str(u: &str) -> Option<Self> {
+        u.parse::<i64>().ok().map(Value::Int64)
+    }
+
+    pub fn new_uint64_str(u: &str) -> Option<Self> {
+        u.parse::<u64>().ok().map(Value::Uint64)
+    }
+
     pub fn new_cid(c: Cid) -> Self {
         Value::Cid(c)
     }
@@ -1785,7 +1937,7 @@ impl Value {
     }
 
     pub fn new_oauthclaimmap(n: String, u: Uuid, c: BTreeSet<String>) -> Option<Self> {
-        if OAUTHSCOPE_RE.is_match(&n) && c.iter().all(|s| OAUTHSCOPE_RE.is_match(s)) {
+        if OAUTH_CLAIMNAME_RE.is_match(&n) && c.iter().all(|s| OAUTH_CLAIMNAME_RE.is_match(s)) {
             Some(Value::OauthClaimValue(n, u, c))
         } else {
             None
@@ -2065,7 +2217,7 @@ impl Value {
             Value::Iname(s) => s.clone(),
             Value::Uuid(u) => u.as_hyphenated().to_string(),
             // We display the tag and fingerprint.
-            Value::SshKey(tag, key) => format!("{}: {}", tag, key),
+            Value::SshKey(tag, key) => format!("{tag}: {key}"),
             Value::Spn(n, r) => format!("{n}@{r}"),
             _ => unreachable!(
                 "You've specified the wrong type for the attribute, got: {:?}",
@@ -2127,12 +2279,19 @@ impl Value {
             Value::OauthScope(s) => OAUTHSCOPE_RE.is_match(s),
             Value::OauthScopeMap(_, m) => m.iter().all(|s| OAUTHSCOPE_RE.is_match(s)),
 
-            Value::OauthClaimMap(name, _) => OAUTHSCOPE_RE.is_match(name),
+            Value::OauthClaimMap(name, _) => OAUTH_CLAIMNAME_RE.is_match(name),
             Value::OauthClaimValue(name, _, value) => {
-                OAUTHSCOPE_RE.is_match(name) && value.iter().all(|s| OAUTHSCOPE_RE.is_match(s))
+                OAUTH_CLAIMNAME_RE.is_match(name)
+                    && value.iter().all(|s| OAUTH_CLAIMNAME_RE.is_match(s))
             }
 
-            Value::HexString(id) | Value::KeyInternal { id, .. } => {
+            Value::KeyInternal { id, .. } => {
+                let s = id.as_str();
+                Value::validate_str_escapes(s)
+                    && Value::validate_singleline(s)
+                    && Value::validate_hexstr(s)
+            }
+            Value::HexString(id) => {
                 Value::validate_str_escapes(id.as_str())
                     && Value::validate_singleline(id.as_str())
                     && Value::validate_hexstr(id.as_str())
@@ -2150,6 +2309,8 @@ impl Value {
             | Value::JsonFilt(_)
             | Value::SecretValue(_)
             | Value::Uint32(_)
+            | Value::Int64(_)
+            | Value::Uint64(_)
             | Value::Url(_)
             | Value::Cid(_)
             | Value::PrivateBinary(_)
@@ -2161,6 +2322,8 @@ impl Value {
             | Value::EcKeyPrivate(_)
             | Value::UiHint(_)
             | Value::CredentialType(_)
+            | Value::Json(_)
+            | Value::Sha256(_)
             | Value::WebauthnAttestationCaList(_) => true,
         }
     }
@@ -2283,17 +2446,17 @@ mod tests {
         assert!(sk1.validate());
         // to proto them
         let psk1 = sk1.to_proto_string_clone();
-        assert_eq!(psk1, format!("tag: {}", ecdsa));
+        assert_eq!(psk1, format!("tag: {ecdsa}"));
 
         let sk2 = Value::new_sshkey_str("tag", ed25519).expect("Invalid ssh key");
         assert!(sk2.validate());
         let psk2 = sk2.to_proto_string_clone();
-        assert_eq!(psk2, format!("tag: {}", ed25519));
+        assert_eq!(psk2, format!("tag: {ed25519}"));
 
         let sk3 = Value::new_sshkey_str("tag", rsa).expect("Invalid ssh key");
         assert!(sk3.validate());
         let psk3 = sk3.to_proto_string_clone();
-        assert_eq!(psk3, format!("tag: {}", rsa));
+        assert_eq!(psk3, format!("tag: {rsa}"));
 
         let sk4 = Value::new_sshkey_str("tag", "ntaouhtnhtnuehtnuhotnuhtneouhtneouh");
         assert!(sk4.is_err());
@@ -2498,5 +2661,21 @@ mod tests {
                 > SessionState::ExpiresAt(OffsetDateTime::UNIX_EPOCH)
         );
         assert!(SessionState::ExpiresAt(OffsetDateTime::UNIX_EPOCH) > SessionState::NeverExpires);
+    }
+
+    #[test]
+    fn test_extract_val_dn_regexn() {
+        fn do_extract(name: &str) -> &str {
+            EXTRACT_VAL_DN
+                .captures(name)
+                .and_then(|caps| caps.name("val"))
+                .map(|v| v.as_str())
+                .unwrap()
+        }
+
+        assert_eq!(do_extract("william"), "william");
+        assert_eq!(do_extract("cn=william"), "william");
+        assert_eq!(do_extract("cn=william,o=blackhats"), "william");
+        assert_eq!(do_extract("cn=william@example.com"), "william@example.com");
     }
 }

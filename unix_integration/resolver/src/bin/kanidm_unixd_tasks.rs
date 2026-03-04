@@ -10,14 +10,16 @@
 #![deny(clippy::needless_pass_by_value)]
 #![deny(clippy::trivially_copy_pass_by_ref)]
 
-use bytes::{BufMut, BytesMut};
 use futures::{SinkExt, StreamExt};
-use kanidm_unix_common::constants::DEFAULT_CONFIG_PATH;
+use kanidm_unix_common::constants::{
+    DEFAULT_CONFIG_PATH, SYSTEM_GROUP_PATH, SYSTEM_PASSWD_PATH, SYSTEM_SHADOW_PATH,
+};
+use kanidm_unix_common::json_codec::JsonCodec;
+use kanidm_unix_common::unix_config::{HomeStrategy, UnixdConfig};
 use kanidm_unix_common::unix_passwd::{parse_etc_group, parse_etc_passwd, parse_etc_shadow, EtcDb};
 use kanidm_unix_common::unix_proto::{
     HomeDirectoryInfo, TaskRequest, TaskRequestFrame, TaskResponse,
 };
-use kanidm_unix_resolver::unix_config::UnixdConfig;
 use kanidm_utils_users::{get_effective_gid, get_effective_uid};
 use libc::{lchown, umask};
 use notify_debouncer_full::notify::RecommendedWatcher;
@@ -38,50 +40,21 @@ use tokio::fs::File;
 use tokio::io::AsyncReadExt;
 use tokio::net::UnixStream;
 use tokio::sync::broadcast;
+use tokio::sync::watch;
 use tokio::time;
-use tokio_util::codec::{Decoder, Encoder, Framed};
+use tokio_util::codec::Framed;
+use tracing::instrument;
 use walkdir::WalkDir;
 
+#[cfg(target_os = "linux")]
+use nix::mount::MsFlags;
+#[cfg(target_os = "linux")]
+use procfs::process::Process;
+#[cfg(target_os = "linux")]
+use std::fs::{create_dir, remove_file};
+
 #[cfg(all(target_family = "unix", feature = "selinux"))]
-use kanidm_unix_resolver::selinux_util;
-
-struct TaskCodec;
-
-impl Decoder for TaskCodec {
-    type Error = io::Error;
-    type Item = TaskRequestFrame;
-
-    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        match serde_json::from_slice::<TaskRequestFrame>(src) {
-            Ok(msg) => {
-                // Clear the buffer for the next message.
-                src.clear();
-                Ok(Some(msg))
-            }
-            _ => Ok(None),
-        }
-    }
-}
-
-impl Encoder<TaskResponse> for TaskCodec {
-    type Error = io::Error;
-
-    fn encode(&mut self, msg: TaskResponse, dst: &mut BytesMut) -> Result<(), Self::Error> {
-        debug!("Attempting to send request -> {:?} ...", msg);
-        let data = serde_json::to_vec(&msg).map_err(|e| {
-            error!("socket encoding error -> {:?}", e);
-            io::Error::new(io::ErrorKind::Other, "JSON encode error")
-        })?;
-        dst.put(data.as_slice());
-        Ok(())
-    }
-}
-
-impl TaskCodec {
-    fn new() -> Self {
-        TaskCodec
-    }
-}
+use kanidm_unix_common::selinux_util;
 
 fn chown(path: &Path, gid: u32) -> Result<(), String> {
     let path_os = CString::new(path.as_os_str().as_bytes())
@@ -98,6 +71,7 @@ fn create_home_directory(
     info: &HomeDirectoryInfo,
     home_prefix_path: &Path,
     home_mount_prefix_path: Option<&PathBuf>,
+    home_strategy: &HomeStrategy,
     use_etc_skel: bool,
     use_selinux: bool,
 ) -> Result<(), String> {
@@ -111,13 +85,13 @@ fn create_home_directory(
     // mounts
     let home_prefix_path = home_prefix_path
         .canonicalize()
-        .map_err(|e| format!("{:?}", e))?;
+        .map_err(|e| format!("{e:?}"))?;
 
     // This is where the storage is *mounted*. If not set, falls back to the home_prefix.
     let home_mount_prefix_path = home_mount_prefix_path
         .unwrap_or(&home_prefix_path)
         .canonicalize()
-        .map_err(|e| format!("{:?}", e))?;
+        .map_err(|e| format!("{e:?}"))?;
 
     // Does our home_prefix actually exist?
     if !home_prefix_path.exists() || !home_prefix_path.is_dir() || !home_prefix_path.is_absolute() {
@@ -155,24 +129,28 @@ fn create_home_directory(
         selinux_util::SelinuxLabeler::new_noop()
     };
 
+    // In the ZFS strategy, we will need to check if the filesystem
+    // exists, rather than the location it's mounted to.
+    let hd_mount_path_exists = match home_strategy {
+        HomeStrategy::Symlink => hd_mount_path.exists(),
+        #[cfg(target_os = "linux")]
+        HomeStrategy::BindMount => hd_mount_path.exists(),
+    };
+
     // Does the home directory exist? This is checking the *true* home mount storage.
-    if !hd_mount_path.exists() {
+    if !hd_mount_path_exists {
         // Set the SELinux security context for file creation
         #[cfg(all(target_family = "unix", feature = "selinux"))]
         labeler.do_setfscreatecon_for_path()?;
 
-        // Set a umask
-        let before = unsafe { umask(0o0027) };
-
-        // Create the dir
-        if let Err(e) = fs::create_dir_all(&hd_mount_path) {
-            let _ = unsafe { umask(before) };
-            error!(err = ?e, ?hd_mount_path, "Unable to create directory");
-            return Err(format!("{:?}", e));
+        // This is affected by the mount strategy
+        // because in a future ZFS home dir setup, we'll need to be able to make
+        // the zfs volume for the user in this step.
+        match home_strategy {
+            HomeStrategy::Symlink => create_dir_path(&hd_mount_path, info)?,
+            #[cfg(target_os = "linux")]
+            HomeStrategy::BindMount => create_dir_path(&hd_mount_path, info)?,
         }
-        let _ = unsafe { umask(before) };
-
-        chown(&hd_mount_path, info.gid)?;
 
         // Copy in structure from /etc/skel/ if present
         let skel_dir = Path::new("/etc/skel/");
@@ -219,133 +197,332 @@ fn create_home_directory(
     #[cfg(all(target_family = "unix", feature = "selinux"))]
     labeler.set_default_context_for_fs_objects()?;
 
-    // Do the aliases exist?
-    for alias in info.aliases.iter() {
-        // Sanity check the alias.
-        // let alias = alias.replace(".", "").replace("/", "").replace("\\", "");
-        let alias = alias.trim_start_matches('.').replace(['/', '\\'], "");
+    let Some(alias) = info.alias.as_ref() else {
+        // No alias for the home dir, lets go.
+        debug!("No home directory alias present, success.");
+        return Ok(());
+    };
 
-        let alias_path = Path::join(&home_prefix_path, &alias);
+    // Sanity check the alias.
+    // let alias = alias.replace(".", "").replace("/", "").replace("\\", "");
+    let alias = alias.trim_start_matches('.').replace(['/', '\\'], "");
 
-        // Assert the resulting alias path is consistent and correct within the home_prefix.
-        if let Some(pp) = alias_path.parent() {
-            if pp != home_prefix_path {
-                return Err("Invalid home directory alias - not within home_prefix".to_string());
-            }
-        } else {
-            return Err("Invalid/Corrupt alias directory path - no prefix found".to_string());
+    let alias_path = Path::join(&home_prefix_path, &alias);
+
+    // Assert the resulting alias path is consistent and correct within the home_prefix.
+    if let Some(pp) = alias_path.parent() {
+        if pp != home_prefix_path {
+            return Err("Invalid home directory alias - not within home_prefix".to_string());
         }
+    } else {
+        return Err("Invalid/Corrupt alias directory path - no prefix found".to_string());
+    }
 
-        if alias_path.exists() {
-            debug!("checking symlink {:?} -> {:?}", alias_path, hd_mount_path);
-            let attr = match fs::symlink_metadata(&alias_path) {
-                Ok(a) => a,
-                Err(e) => {
-                    error!(err = ?e, ?alias_path, "Unable to read alias path metadata");
-                    return Err(format!("{:?}", e));
-                }
-            };
+    match home_strategy {
+        HomeStrategy::Symlink => home_alias_update_symlink(&alias_path, &hd_mount_path),
+        #[cfg(target_os = "linux")]
+        HomeStrategy::BindMount => home_alias_update_bind_mount(&alias_path, &hd_mount_path),
+    }
+}
 
-            if attr.file_type().is_symlink() {
-                // Probably need to update it.
-                if let Err(e) = fs::remove_file(&alias_path) {
-                    error!(err = ?e, ?alias_path, "Unable to remove existing alias path");
-                    return Err(format!("{:?}", e));
-                }
+fn create_dir_path(hd_mount_path: &Path, info: &HomeDirectoryInfo) -> Result<(), String> {
+    // Set a umask
+    let before = unsafe { umask(0o0027) };
 
-                debug!("updating symlink {:?} -> {:?}", alias_path, hd_mount_path);
-                if let Err(e) = symlink(&hd_mount_path, &alias_path) {
-                    error!(err = ?e, ?alias_path, "Unable to update alias path");
-                    return Err(format!("{:?}", e));
-                }
-            } else {
-                warn!(
-                    ?alias_path,
-                    ?hd_mount_path,
-                    "home directory alias path is not a symlink, unable to update"
-                );
+    // Create the home directory.
+    if let Err(e) = fs::create_dir_all(hd_mount_path) {
+        let _ = unsafe { umask(before) };
+        error!(err = ?e, ?hd_mount_path, "Unable to create directory");
+        return Err(format!("{e:?}"));
+    }
+    let _ = unsafe { umask(before) };
+
+    chown(hd_mount_path, info.gid)
+}
+
+#[cfg(target_os = "linux")]
+fn home_alias_update_bind_mount(alias_path: &Path, hd_mount_path: &Path) -> Result<(), String> {
+    if alias_path.exists() {
+        if alias_path.is_symlink() {
+            // If the alias_path is a symlink, remove it
+            if let Err(e) = remove_file(alias_path) {
+                error!("Unable to remove existing symlink at {alias_path:?}");
+                return Err(format!("{e:?}"));
             }
-        } else {
-            // Does not exist. Create.
-            debug!("creating symlink {:?} -> {:?}", alias_path, hd_mount_path);
-            if let Err(e) = symlink(&hd_mount_path, &alias_path) {
-                error!(err = ?e, ?alias_path, "Unable to create alias path");
-                return Err(format!("{:?}", e));
+        } else if !alias_path.is_dir() {
+            // If it's anything other than a directory, we don't proceed.
+            error!("A non-directory item already exists at {alias_path:?}");
+            return Err(format!(
+                "A non-directory item already exists at {alias_path:?}"
+            ));
+        }
+    }
+
+    // Create mount point if it doesn't exist
+    if !alias_path.exists() {
+        if let Err(e) = create_dir(alias_path) {
+            error!("Unable to create bind mount target at {alias_path:?}");
+            return Err(format!("{e:?}"));
+        }
+    }
+
+    let current_mounts = Process::myself()
+        .map_err(|e| format!("While updating home directory bind mount, could not get reference to current process: {e}"))?
+        .mountinfo()
+        .map_err(|e| format!("While updating home directory bind mount, could not get mount info: {e}"))?;
+
+    // Remove conflicting mount if it exists:
+    let mismatching_mount = current_mounts.iter().find(|m| {
+        m.mount_point == alias_path && m.mount_source.as_ref().map(Path::new) != Some(hd_mount_path)
+    });
+
+    if let Some(m) = mismatching_mount {
+        nix::mount::umount(&m.mount_point).map_err(|e| {
+            format!(
+                "Unable to remove conflicting mount at {:?}: {e}",
+                &m.mount_point
+            )
+        })?;
+    }
+
+    // If mount point exists and is already correctly mounted, we are done
+    if current_mounts.iter().any(|m| {
+        m.mount_point == alias_path && m.mount_source.as_ref().map(Path::new) != Some(hd_mount_path)
+    }) {
+        return Ok(());
+    }
+
+    // Finally, try to create the bind mount
+    nix::mount::mount::<Path, Path, str, str>(
+        Some(hd_mount_path),
+        alias_path,
+        None,
+        MsFlags::MS_BIND,
+        None,
+    )
+    .map_err(|e| {
+        format!("Unable to bind mount home directory {hd_mount_path:?} to {alias_path:?}: {e}")
+    })?;
+
+    Ok(())
+}
+
+fn home_alias_update_symlink(alias_path: &Path, hd_mount_path: &Path) -> Result<(), String> {
+    if !alias_path.exists() {
+        // Does not exist. Create.
+        debug!("creating symlink {:?} -> {:?}", alias_path, hd_mount_path);
+        if let Err(e) = symlink(hd_mount_path, alias_path) {
+            error!(err = ?e, ?alias_path, "Unable to create alias path");
+            return Err(format!("{e:?}"));
+        }
+        return Ok(());
+    }
+
+    debug!("checking symlink {:?} -> {:?}", alias_path, hd_mount_path);
+    let attr = match fs::symlink_metadata(alias_path) {
+        Ok(a) => a,
+        Err(e) => {
+            error!(err = ?e, ?alias_path, "Unable to read alias path metadata");
+            return Err(format!("{e:?}"));
+        }
+    };
+
+    if !attr.file_type().is_symlink() {
+        warn!(
+            ?alias_path,
+            ?hd_mount_path,
+            "home directory alias path is not a symlink, unable to update"
+        );
+        return Ok(());
+    }
+
+    // If already correct, skip churn.
+    match fs::read_link(alias_path) {
+        Ok(current_target) if current_target == hd_mount_path => {
+            debug!(
+                ?alias_path,
+                ?current_target,
+                "alias symlink already correct, skipping update"
+            );
+            return Ok(());
+        }
+        Ok(current_target) => {
+            debug!(
+                ?alias_path,
+                ?current_target,
+                ?hd_mount_path,
+                "alias symlink target differs, updating atomically"
+            );
+        }
+        Err(e) => {
+            warn!(
+                err=?e, ?alias_path,
+                "unable to read existing symlink target, will replace atomically"
+            );
+        }
+    }
+
+    // Atomic replace: create temp symlink in same dir, then rename over existing.
+    let alias_path_tmp = alias_path.with_extension("tmp");
+
+    if alias_path_tmp.exists() {
+        debug!("checking symlink temp {:?}", alias_path_tmp);
+        let attr = match fs::symlink_metadata(&alias_path_tmp) {
+            Ok(a) => a,
+            Err(e) => {
+                error!(err = ?e, ?alias_path_tmp, "Unable to read alias path temp metadata");
+                return Err(format!("{e:?}"));
+            }
+        };
+
+        if !attr.file_type().is_symlink() {
+            warn!(
+                ?alias_path,
+                ?alias_path_tmp,
+                ?hd_mount_path,
+                "home directory alias path temporary update location already exists, and is not a symlink, unable to update"
+            );
+            return Ok(());
+        }
+    }
+
+    // Best-effort cleanup of any stale tmp.
+    let _ = fs::remove_file(&alias_path_tmp);
+
+    if let Err(e) = symlink(hd_mount_path, &alias_path_tmp) {
+        error!(err=?e, ?alias_path_tmp, "Unable to create temporary alias symlink");
+        return Err(format!("{e:?}"));
+    }
+
+    // Rename is atomic within the same directory; no disappearance window.
+    if let Err(e) = fs::rename(&alias_path_tmp, alias_path) {
+        error!(err=?e, from=?alias_path_tmp, to=?alias_path, "Unable to atomically replace alias symlink");
+        // Cleanup temp on failure.
+        let _ = fs::remove_file(&alias_path_tmp);
+        return Err(format!("{e:?}"));
+    }
+
+    debug!(
+        "alias symlink updated atomically {:?} -> {:?}",
+        alias_path, hd_mount_path
+    );
+
+    Ok(())
+}
+
+async fn shadow_reload_task(
+    shadow_data_watch_tx: watch::Sender<EtcDb>,
+    mut shadow_broadcast_rx: broadcast::Receiver<bool>,
+) {
+    debug!("shadow reload task has started ...");
+
+    while shadow_broadcast_rx.recv().await.is_ok() {
+        match process_etc_passwd_group().await {
+            Ok(etc_db) => {
+                shadow_data_watch_tx.send_replace(etc_db);
+                debug!("shadow reload task sent");
+            }
+            Err(()) => {
+                error!("Unable to process etc db");
+                continue;
             }
         }
     }
-    Ok(())
+
+    debug!("shadow reload task has stopped");
+}
+
+async fn handle_shadow_reload(shadow_data_watch_rx: &mut watch::Receiver<EtcDb>) -> TaskResponse {
+    debug!("Received shadow reload event.");
+    let etc_db: EtcDb = {
+        let etc_db_ref = shadow_data_watch_rx.borrow_and_update();
+        (*etc_db_ref).clone()
+    };
+    // process etc shadow and send it here.
+    TaskResponse::NotifyShadowChange(etc_db)
+}
+
+async fn handle_unixd_request(
+    request: Option<Result<TaskRequestFrame, io::Error>>,
+    cfg: &UnixdConfig,
+) -> Result<TaskResponse, ()> {
+    debug!("Received unixd event.");
+    match request {
+        Some(Ok(TaskRequestFrame {
+            id,
+            req: TaskRequest::HomeDirectory(info),
+        })) => {
+            debug!("Received task -> HomeDirectory({:?})", info);
+
+            match create_home_directory(
+                &info,
+                cfg.home_prefix.as_ref(),
+                cfg.home_mount_prefix.as_ref(),
+                &cfg.home_strategy,
+                cfg.use_etc_skel,
+                cfg.selinux,
+            ) {
+                Ok(()) => Ok(TaskResponse::Success(id)),
+                Err(msg) => Ok(TaskResponse::Error(msg)),
+            }
+        }
+        other => {
+            error!("Error -> got un-handled Request Frame {other:?}");
+            Err(())
+        }
+    }
 }
 
 async fn handle_tasks(
     stream: UnixStream,
     ctl_broadcast_rx: &mut broadcast::Receiver<bool>,
-    shadow_broadcast_rx: &mut broadcast::Receiver<bool>,
+    shadow_data_watch_rx: &mut watch::Receiver<EtcDb>,
     cfg: &UnixdConfig,
 ) {
-    let mut reqs = Framed::new(stream, TaskCodec::new());
+    let codec: JsonCodec<TaskRequestFrame, TaskResponse> = JsonCodec::default();
+
+    let mut reqs = Framed::new(stream, codec);
+
+    // Immediately trigger that we should reload the shadow files for the new connected handler
+    shadow_data_watch_rx.mark_changed();
+
+    debug!("Task handler loop has started ...");
 
     loop {
-        tokio::select! {
+        let msg = tokio::select! {
+            biased; // tell tokio to poll these in order
             _ = ctl_broadcast_rx.recv() => {
-                break;
+                // We received a shutdown signal.
+                debug!("Received shutdown signal, breaking task handler loop ...");
+                return
+            }
+            // We bias to *sending* messages in tasks.
+            Ok(_) = shadow_data_watch_rx.changed() => {
+                handle_shadow_reload(shadow_data_watch_rx).await
             }
             request = reqs.next() => {
-                match request {
-                    Some(Ok(TaskRequestFrame {
-                        id,
-                        req: TaskRequest::HomeDirectory(info),
-                    })) => {
-                        debug!("Received task -> HomeDirectory({:?})", info);
-
-                        let resp = match create_home_directory(
-                            &info,
-                            cfg.home_prefix.as_ref(),
-                            cfg.home_mount_prefix.as_ref(),
-                            cfg.use_etc_skel,
-                            cfg.selinux,
-                        ) {
-                            Ok(()) => TaskResponse::Success(id),
-                            Err(msg) => TaskResponse::Error(msg),
-                        };
-
-                        // Now send a result.
-                        if let Err(err) = reqs.send(resp).await {
-                            error!(?err, "Unable to communicate to kanidm unixd");
-                            break;
-                        }
-                        // All good, loop.
+                match handle_unixd_request(request,  cfg).await {
+                    Ok(response) => {
+                       response
                     }
-                    other => {
-                        error!("Error -> {:?}", other);
-                        break;
+                    Err(_) => {
+                        error!("Error handling request, exiting task handler loop ...");
+                        return;
                     }
                 }
             }
-            _ = shadow_broadcast_rx.recv() => {
-                // process etc shadow and send it here.
-                match process_etc_passwd_group().await {
-                    Ok(etc_db) => {
-                        let resp = TaskResponse::NotifyShadowChange(etc_db);
-                        if let Err(err) = reqs.send(resp).await {
-                            error!(?err, "Unable to communicate to kanidm unixd");
-                            break;
-                        }
-                    }
-                    Err(()) => {
-                        error!("Unable to process etc db");
-                        continue
-                    }
-                }
-            }
+        };
+
+        if let Err(e) = reqs.send(msg).await {
+            error!(?e, "Error sending response to kanidm_unixd");
+            return;
         }
     }
-
-    info!("Disconnected from kanidm_unixd ...");
 }
 
+#[instrument(level = "debug", skip_all)]
 async fn process_etc_passwd_group() -> Result<EtcDb, ()> {
-    let mut file = File::open("/etc/passwd").await.map_err(|err| {
+    let mut file = File::open(SYSTEM_PASSWD_PATH).await.map_err(|err| {
         error!(?err);
     })?;
     let mut contents = vec![];
@@ -359,7 +536,7 @@ async fn process_etc_passwd_group() -> Result<EtcDb, ()> {
             error!(?err);
         })?;
 
-    let mut file = File::open("/etc/shadow").await.map_err(|err| {
+    let mut file = File::open(SYSTEM_SHADOW_PATH).await.map_err(|err| {
         error!(?err);
     })?;
     let mut contents = vec![];
@@ -373,7 +550,7 @@ async fn process_etc_passwd_group() -> Result<EtcDb, ()> {
             error!(?err);
         })?;
 
-    let mut file = File::open("/etc/group").await.map_err(|err| {
+    let mut file = File::open(SYSTEM_GROUP_PATH).await.map_err(|err| {
         error!(?err);
     })?;
     let mut contents = vec![];
@@ -398,7 +575,7 @@ fn setup_shadow_inotify_watcher(
     shadow_broadcast_tx: broadcast::Sender<bool>,
 ) -> Result<Debouncer<RecommendedWatcher, RecommendedCache>, ExitCode> {
     let watcher = new_debouncer(
-        Duration::from_secs(1),
+        Duration::from_secs(5),
         None,
         move |event: Result<Vec<DebouncedEvent>, _>| {
             let array_of_events = match event {
@@ -416,9 +593,9 @@ fn setup_shadow_inotify_watcher(
             for inode_event in array_of_events.iter() {
                 if !inode_event.kind.is_access()
                     && inode_event.paths.iter().any(|path| {
-                        path == Path::new("/etc/group")
-                            || path == Path::new("/etc/passwd")
-                            || path == Path::new("/etc/shadow")
+                        path == Path::new(SYSTEM_GROUP_PATH)
+                            || path == Path::new(SYSTEM_PASSWD_PATH)
+                            || path == Path::new(SYSTEM_SHADOW_PATH)
                     })
                 {
                     debug!(?inode_event, "Handling inotify modification event");
@@ -430,7 +607,7 @@ fn setup_shadow_inotify_watcher(
             if path_of_interest_was_changed {
                 let _ = shadow_broadcast_tx.send(true);
             } else {
-                debug!(?array_of_events, "IGNORED");
+                trace!(?array_of_events, "IGNORED");
             }
         },
     )
@@ -518,12 +695,30 @@ async fn main() -> ExitCode {
 
             // This is to broadcast when we need to reload the shadow
             // files.
-            let (shadow_broadcast_tx, mut shadow_broadcast_rx) = broadcast::channel(4);
+            let (shadow_broadcast_tx, shadow_broadcast_rx) = broadcast::channel(4);
 
             let watcher = match setup_shadow_inotify_watcher(shadow_broadcast_tx.clone()) {
                 Ok(w) => w,
                 Err(exit) => return exit,
             };
+
+            // Setup the etcdb watch
+            let etc_db = match process_etc_passwd_group().await {
+                Ok(etc_db) => etc_db,
+                Err(err) => {
+                    warn!(?err, "unable to process {SYSTEM_PASSWD_PATH} and related files.");
+                    // Return an empty set instead.
+                    EtcDb::default()
+                }
+            };
+
+            let (shadow_data_watch_tx, mut shadow_data_watch_rx) = watch::channel(etc_db);
+
+            let _shadow_task = tokio::spawn(async move {
+                shadow_reload_task(
+                    shadow_data_watch_tx, shadow_broadcast_rx
+                ).await
+            });
 
             let server = tokio::spawn(async move {
                 loop {
@@ -538,12 +733,9 @@ async fn main() -> ExitCode {
                                 Ok(stream) => {
                                     info!("Found kanidm_unixd, waiting for tasks ...");
 
-                                    // Immediately trigger that we should reload the shadow files
-                                    let _ = shadow_broadcast_tx.send(true);
-
-                                    // Yep! Now let the main handler do it's job.
+                                    // Yep! Now let the main handler do its job.
                                     // If it returns (dc, etc, then we loop and try again).
-                                    handle_tasks(stream, &mut d_broadcast_rx, &mut shadow_broadcast_rx, &cfg).await;
+                                    handle_tasks(stream, &mut d_broadcast_rx, &mut shadow_data_watch_rx, &cfg).await;
                                     continue;
                                 }
                                 Err(e) => {

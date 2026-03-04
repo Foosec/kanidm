@@ -125,7 +125,10 @@ pub enum ClientRequest {
         account_id: String,
         info: PamServiceInfo,
     },
-    PamAuthenticateStep(PamAuthRequest),
+    PamAuthenticateStep {
+        request: PamAuthRequest,
+        session_id: u64,
+    },
     PamAccountAllowed(String),
     PamAccountBeginSession(String),
     InvalidateCache,
@@ -137,13 +140,13 @@ impl ClientRequest {
     /// Get a safe display version of the request, without credentials.
     pub fn as_safe_string(&self) -> String {
         match self {
-            ClientRequest::SshKey(id) => format!("SshKey({})", id),
+            ClientRequest::SshKey(id) => format!("SshKey({id})"),
             ClientRequest::NssAccounts => "NssAccounts".to_string(),
-            ClientRequest::NssAccountByUid(id) => format!("NssAccountByUid({})", id),
-            ClientRequest::NssAccountByName(id) => format!("NssAccountByName({})", id),
+            ClientRequest::NssAccountByUid(id) => format!("NssAccountByUid({id})"),
+            ClientRequest::NssAccountByName(id) => format!("NssAccountByName({id})"),
             ClientRequest::NssGroups => "NssGroups".to_string(),
-            ClientRequest::NssGroupByGid(id) => format!("NssGroupByGid({})", id),
-            ClientRequest::NssGroupByName(id) => format!("NssGroupByName({})", id),
+            ClientRequest::NssGroupByGid(id) => format!("NssGroupByGid({id})"),
+            ClientRequest::NssGroupByName(id) => format!("NssGroupByName({id})"),
             ClientRequest::PamAuthenticateInit { account_id, info } => format!(
                 "PamAuthenticateInit{{ account_id={} tty={} pam_secvice{} rhost={} }}",
                 account_id,
@@ -151,9 +154,9 @@ impl ClientRequest {
                 info.tty.as_deref().unwrap_or(""),
                 info.rhost.as_deref().unwrap_or("")
             ),
-            ClientRequest::PamAuthenticateStep(_) => "PamAuthenticateStep".to_string(),
+            ClientRequest::PamAuthenticateStep { .. } => "PamAuthenticateStep".to_string(),
             ClientRequest::PamAccountAllowed(id) => {
-                format!("PamAccountAllowed({})", id)
+                format!("PamAccountAllowed({id})")
             }
             ClientRequest::PamAccountBeginSession(_) => "PamAccountBeginSession".to_string(),
             ClientRequest::InvalidateCache => "InvalidateCache".to_string(),
@@ -178,7 +181,10 @@ pub enum ClientResponse {
     NssGroup(Option<NssGroup>),
 
     PamStatus(Option<bool>),
-    PamAuthenticateStepResponse(PamAuthResponse),
+    PamAuthenticateStepResponse {
+        response: PamAuthResponse,
+        session_id: u64,
+    },
 
     ProviderStatus(Vec<ProviderStatus>),
 
@@ -186,18 +192,12 @@ pub enum ClientResponse {
     Error(OperationError),
 }
 
-impl From<PamAuthResponse> for ClientResponse {
-    fn from(par: PamAuthResponse) -> Self {
-        ClientResponse::PamAuthenticateStepResponse(par)
-    }
-}
-
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct HomeDirectoryInfo {
     pub uid: u32,
     pub gid: u32,
     pub name: String,
-    pub aliases: Vec<String>,
+    pub alias: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

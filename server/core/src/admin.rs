@@ -8,7 +8,6 @@ use kanidm_utils_users::get_current_uid;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::io;
-use std::path::Path;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
@@ -25,6 +24,7 @@ pub use kanidm_proto::internal::{
 #[derive(Serialize, Deserialize, Debug)]
 pub enum AdminTaskRequest {
     RecoverAccount { name: String },
+    DisableAccount { name: String },
     ShowReplicationCertificate,
     RenewReplicationCertificate,
     RefreshReplicationConsumer,
@@ -32,9 +32,10 @@ pub enum AdminTaskRequest {
     DomainUpgradeCheck,
     DomainRaise,
     DomainRemigrate { level: Option<u32> },
+    Reload,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize)]
 pub enum AdminTaskResponse {
     RecoverAccount {
         password: String,
@@ -53,6 +54,30 @@ pub enum AdminTaskResponse {
     },
     Success,
     Error,
+}
+
+impl std::fmt::Debug for AdminTaskResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // the intent here is that we aren't sharing secret material in logs
+            AdminTaskResponse::RecoverAccount { .. } => write!(f, "RecoverAccount {{ .. }}"),
+            // the intent here is that we aren't sharing secret material in logs
+            AdminTaskResponse::ShowReplicationCertificate { .. } => {
+                write!(f, "ShowReplicationCertificate {{ .. }}",)
+            }
+            AdminTaskResponse::DomainUpgradeCheck { report } => {
+                write!(f, "DomainUpgradeCheck {{ report: {:?} }}", report)
+            }
+            AdminTaskResponse::DomainRaise { level } => {
+                write!(f, "DomainRaise {{ level: {} }}", level)
+            }
+            AdminTaskResponse::DomainShow { domain_info } => {
+                write!(f, "DomainShow {{ domain_info: {:?} }}", domain_info)
+            }
+            AdminTaskResponse::Success => write!(f, "Success"),
+            AdminTaskResponse::Error => write!(f, "Error"),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -82,7 +107,7 @@ impl Encoder<AdminTaskRequest> for ClientCodec {
         trace!("Attempting to send response -> {:?} ...", msg);
         let data = serde_json::to_vec(&msg).map_err(|e| {
             error!("socket encoding error -> {:?}", e);
-            io::Error::new(io::ErrorKind::Other, "JSON encode error")
+            io::Error::other("JSON encode error")
         })?;
         dst.put(data.as_slice());
         Ok(())
@@ -116,7 +141,7 @@ impl Encoder<AdminTaskResponse> for ServerCodec {
         trace!("Attempting to send response -> {:?} ...", msg);
         let data = serde_json::to_vec(&msg).map_err(|e| {
             error!("socket encoding error -> {:?}", e);
-            io::Error::new(io::ErrorKind::Other, "JSON encode error")
+            io::Error::other("JSON encode error")
         })?;
         dst.put(data.as_slice());
         Ok(())
@@ -130,7 +155,7 @@ impl AdminActor {
         sock_path: &str,
         server_rw: &'static QueryServerWriteV1,
         server_ro: &'static QueryServerReadV1,
-        mut broadcast_rx: broadcast::Receiver<CoreAction>,
+        broadcast_tx: broadcast::Sender<CoreAction>,
         repl_ctrl_tx: Option<mpsc::Sender<ReplCtrl>>,
     ) -> Result<tokio::task::JoinHandle<()>, ()> {
         debug!("🧹 Cleaning up sockets from previous invocations");
@@ -145,6 +170,8 @@ impl AdminActor {
             }
         };
 
+        let mut broadcast_rx = broadcast_tx.subscribe();
+
         // what is the uid we are running as?
         let cuid = get_current_uid();
 
@@ -154,6 +181,7 @@ impl AdminActor {
                     Ok(action) = broadcast_rx.recv() => {
                         match action {
                             CoreAction::Shutdown => break,
+                            CoreAction::Reload => {},
                         }
                     }
                     accept_res = listener.accept() => {
@@ -178,8 +206,9 @@ impl AdminActor {
 
                                 // spawn the worker.
                                 let task_repl_ctrl_tx = repl_ctrl_tx.clone();
+                                let broadcast_tx_ = broadcast_tx.clone();
                                 tokio::spawn(async move {
-                                    if let Err(e) = handle_client(socket, server_rw, server_ro, task_repl_ctrl_tx).await {
+                                    if let Err(e) = handle_client(socket, server_rw, server_ro, task_repl_ctrl_tx, broadcast_tx_).await {
                                         error!(err = ?e, "admin client error");
                                     }
                                 });
@@ -198,17 +227,19 @@ impl AdminActor {
 }
 
 fn rm_if_exist(p: &str) {
-    if Path::new(p).exists() {
-        debug!("Removing requested file {:?}", p);
-        let _ = std::fs::remove_file(p).map_err(|e| {
+    debug!("Attempting to remove requested file {}", p);
+    let _ = std::fs::remove_file(p).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => {
+            debug!("{} not present, no need to remove.", p);
+        }
+        _ => {
             error!(
-                "Failure while attempting to attempting to remove {:?} -> {:?}",
-                p, e
+                "Failure while attempting to attempting to remove {} -> {}",
+                p,
+                e.to_string()
             );
-        });
-    } else {
-        debug!("Path {:?} doesn't exist, not attempting to remove.", p);
-    }
+        }
+    });
 }
 
 async fn show_replication_certificate(ctrl_tx: &mut mpsc::Sender<ReplCtrl>) -> AdminTaskResponse {
@@ -296,6 +327,7 @@ async fn handle_client(
     server_rw: &'static QueryServerWriteV1,
     server_ro: &'static QueryServerReadV1,
     mut repl_ctrl_tx: Option<mpsc::Sender<ReplCtrl>>,
+    broadcast_tx: broadcast::Sender<CoreAction>,
 ) -> Result<(), Box<dyn Error>> {
     debug!("Accepted admin socket connection");
 
@@ -314,6 +346,15 @@ async fn handle_client(
                         Ok(password) => AdminTaskResponse::RecoverAccount { password },
                         Err(e) => {
                             error!(err = ?e, "error during recover-account");
+                            AdminTaskResponse::Error
+                        }
+                    }
+                }
+                AdminTaskRequest::DisableAccount { name } => {
+                    match server_rw.handle_admin_disable_account(name, eventid).await {
+                        Ok(()) => AdminTaskResponse::Success,
+                        Err(e) => {
+                            error!(err = ?e, "error during disable-account");
                             AdminTaskResponse::Error
                         }
                     }
@@ -373,6 +414,13 @@ async fn handle_client(
                         }
                     }
                 }
+                AdminTaskRequest::Reload => match broadcast_tx.send(CoreAction::Reload) {
+                    Ok(_) => AdminTaskResponse::Success,
+                    Err(e) => {
+                        error!(err = ?e, "error during server reload");
+                        AdminTaskResponse::Error
+                    }
+                },
             }
         }
         .instrument(nspan)

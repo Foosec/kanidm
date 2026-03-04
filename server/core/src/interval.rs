@@ -16,7 +16,9 @@ use crate::CoreAction;
 
 use crate::actors::{QueryServerReadV1, QueryServerWriteV1};
 use kanidmd_lib::constants::PURGE_FREQUENCY;
-use kanidmd_lib::event::{OnlineBackupEvent, PurgeRecycledEvent, PurgeTombstoneEvent};
+use kanidmd_lib::event::{
+    OnlineBackupEvent, PurgeDeleteAfterEvent, PurgeRecycledEvent, PurgeTombstoneEvent,
+};
 
 pub(crate) struct IntervalActor;
 
@@ -36,11 +38,15 @@ impl IntervalActor {
                 server
                     .handle_purgerecycledevent(PurgeRecycledEvent::new())
                     .await;
+                server
+                    .handle_purge_delete_after_event(PurgeDeleteAfterEvent::new())
+                    .await;
 
                 tokio::select! {
                     Ok(action) = rx.recv() => {
                         match action {
                             CoreAction::Shutdown => break,
+                            CoreAction::Reload => continue,
                         }
                     }
                     _ = inter.tick() => {
@@ -112,21 +118,23 @@ impl IntervalActor {
         if !op.exists() {
             info!(
                 "Online backup output folder '{}' does not exist, trying to create it.",
-                outpath
+                outpath.display()
             );
             fs::create_dir_all(&outpath).map_err(|e| {
                 error!(
                     "Online backup failed to create output directory '{}': {}",
-                    outpath.clone(),
+                    outpath.display(),
                     e
                 )
             })?;
         }
 
         if !op.is_dir() {
-            error!("Online backup output '{}' is not a directory or we are missing permissions to access it.", outpath);
+            error!("Online backup output '{}' is not a directory or we are missing permissions to access it.", outpath.display());
             return Err(());
         }
+
+        let backup_compression = online_backup_config.compression;
 
         let handle = tokio::spawn(async move {
             for next_time in cron_expr.upcoming(Utc) {
@@ -142,14 +150,16 @@ impl IntervalActor {
                     Ok(action) = rx.recv() => {
                         match action {
                             CoreAction::Shutdown => break,
+                            CoreAction::Reload => {}
                         }
                     }
                     _ = sleep(Duration::from_secs(wait_seconds)) => {
                         if let Err(e) = server
                             .handle_online_backup(
                                 OnlineBackupEvent::new(),
-                                outpath.clone().as_str(),
+                                &outpath,
                                 versions,
+                                backup_compression,
                             )
                             .await
                         {

@@ -14,7 +14,7 @@ ARG KANIDM_BUILD_OPTIONS=""
 
 # Set the build profile
 ENV KANIDM_BUILD_PROFILE=${KANIDM_BUILD_PROFILE:-container_generic}
-ENV RUSTFLAGS="-Clinker=clang -Clink-arg=-fuse-ld=/usr/bin/ld.mold"
+ENV RUSTFLAGS="-Clinker=clang"
 
 RUN \
     --mount=type=cache,id=zypp,target=/var/cache/zypp \
@@ -22,6 +22,8 @@ RUN \
         sccache \
         cargo \
         clang \
+        gcc \
+        cmake \
         gawk \
         make \
         automake \
@@ -32,8 +34,7 @@ RUN \
         systemd-devel \
         rsync \
         findutils \
-        which \
-        mold
+        which
 
 COPY . /usr/src/kanidm
 
@@ -104,6 +105,6 @@ HEALTHCHECK \
     --start-period=60s \
     --start-interval=5s \
     --retries=3 \
-    CMD [ "/sbin/kanidmd", "healthcheck", "-c", "/data/server.toml"]
+    CMD [ "/sbin/kanidmd", "scripting", "healthcheck"]
 
-CMD [ "/sbin/kanidmd", "server", "-c", "/data/server.toml"]
+CMD [ "/sbin/kanidmd", "server"]

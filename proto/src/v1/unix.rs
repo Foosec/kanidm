@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use sshkey_attest::proto::PublicKey as SshPublicKey;
 use sshkeys::{KeyType, KeyTypeKind, PublicKeyKind};
-use std::fmt;
+use std::fmt::{self, Display};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -11,7 +11,7 @@ use crate::constants::{ATTR_GROUP, ATTR_LDAP_SSHPUBLICKEY};
 
 #[allow(dead_code)]
 #[derive(ToSchema)]
-#[schema(as = KeyTypeKind)]
+#[schema(as = KeyTypeKind, value_type = String)]
 pub struct KeyTypeKindSchema(KeyTypeKind);
 
 #[derive(ToSchema)]
@@ -21,19 +21,22 @@ pub struct KeyTypeSchema {
     pub short_name: &'static str,
     pub is_cert: bool,
     pub is_sk: bool,
+    #[schema(value_type = String)]
     pub kind: KeyTypeKind,
     pub plain: &'static str,
 }
 
 #[allow(dead_code)]
 #[derive(ToSchema)]
-#[schema(as = PublicKeyKind)]
+#[schema(as = PublicKeyKind, value_type = String)]
 pub struct PublicKeyKindSchema(PublicKeyKind);
 
 #[derive(ToSchema)]
 #[schema(as = SshPublicKey)]
 pub struct SshPublicKeySchema {
+    #[schema(value_type = String)]
     pub key_type: KeyType,
+    #[schema(value_type = String)]
     pub kind: PublicKeyKind,
     pub comment: Option<String>,
 }
@@ -47,12 +50,13 @@ pub struct UnixGroupToken {
     pub gidnumber: u32,
 }
 
-impl fmt::Display for UnixGroupToken {
+impl Display for UnixGroupToken {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "[ spn: {}, ", self.spn)?;
-        write!(f, "gidnumber: {} ", self.gidnumber)?;
-        write!(f, "name: {}, ", self.name)?;
-        write!(f, "uuid: {} ]", self.uuid)
+        write!(
+            f,
+            "[ spn: {}, gidnumber: {}, name: {}, uuid: {} ]",
+            self.spn, self.gidnumber, self.name, self.uuid
+        )
     }
 }
 
@@ -73,29 +77,31 @@ pub struct UnixUserToken {
     pub uuid: Uuid,
     pub shell: Option<String>,
     pub groups: Vec<UnixGroupToken>,
+    #[schema(value_type = Vec<String>)]
     pub sshkeys: Vec<SshPublicKey>,
     // The default value of bool is false.
     #[serde(default)]
     pub valid: bool,
 }
 
-impl fmt::Display for UnixUserToken {
+impl Display for UnixUserToken {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "---")?;
         writeln!(f, "spn: {}", self.spn)?;
         writeln!(f, "name: {}", self.name)?;
         writeln!(f, "displayname: {}", self.displayname)?;
         writeln!(f, "uuid: {}", self.uuid)?;
+        writeln!(f, "gidnumber: {}", self.gidnumber)?;
         match &self.shell {
-            Some(s) => writeln!(f, "shell: {}", s)?,
+            Some(s) => writeln!(f, "shell: {s}")?,
             None => writeln!(f, "shell: <none>")?,
         }
         self.sshkeys
             .iter()
-            .try_for_each(|s| writeln!(f, "{}: {}", ATTR_LDAP_SSHPUBLICKEY, s))?;
+            .try_for_each(|s| writeln!(f, "{ATTR_LDAP_SSHPUBLICKEY}: {s}"))?;
         self.groups
             .iter()
-            .try_for_each(|g| writeln!(f, "{}: {}", ATTR_GROUP, g))
+            .try_for_each(|g| writeln!(f, "{ATTR_GROUP}: {g}"))
     }
 }
 

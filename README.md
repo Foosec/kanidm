@@ -4,16 +4,15 @@
 
 ## About
 
-Kanidm is a simple and secure identity management platform, allowing other applications and services
-to offload the challenge of authenticating and storing identities to Kanidm.
+Kanidm is a simple and secure identity management platform, allowing other applications and services to offload the
+challenge of authenticating and storing identities to Kanidm.
 
-The goal of this project is to be a complete identity provider, covering the broadest possible set
-of requirements and integrations. You should not need any other components (like Keycloak) when you
-use Kanidm - we already have everything you need!
+The goal of this project is to be a complete identity provider, covering the broadest possible set of requirements and
+integrations. You should not need any other components (like Keycloak) when you use Kanidm - we already have everything
+you need!
 
-To achieve this we rely heavily on strict defaults, simple configuration, and self-healing
-components. This allows Kanidm to support small home labs, families, small businesses, and all the
-way to the largest enterprise needs.
+To achieve this we rely heavily on strict defaults, simple configuration, and self-healing components. This allows
+Kanidm to support small home labs, families, small businesses, and all the way to the largest enterprise needs.
 
 If you want to host your own authentication service, then Kanidm is for you!
 
@@ -23,16 +22,18 @@ If you want to host your own authentication service, then Kanidm is for you!
 Kanidm supports:
 
 - Passkeys (WebAuthn) for secure cryptographic authentication
-- Attested passkeys for high security environments
-- OAuth2/OIDC authentication provider for web SSO
+  - Attested passkeys for high security environments
 - Application Portal allowing easy access to linked applications
-- Linux/Unix integration with TPM secured offline authentication
+- OAuth2/OIDC authentication provider for SSO
+- OAuth2/OIDC service access with token exchange services
+- Linux/Unix integration with TPM protected offline authentication
 - SSH key distribution to Linux/Unix systems
 - RADIUS for network and VPN authentication
 - Read-only LDAPs gateway for Legacy Systems
 - Complete CLI tooling for Administration
 - Two node high availability using database replication
 - A WebUI for user self-service
+- And more!
 
 </details>
 
@@ -42,9 +43,8 @@ If you want to read more about what Kanidm can do, you should read our documenta
 
 - [Kanidm book (latest stable)](https://kanidm.github.io/kanidm/stable/)
 
-We also have a set of
-[support guidelines](https://github.com/kanidm/kanidm/blob/master/book/src/support.md) for what the
-project team will support.
+We also have a set of [support guidelines](https://github.com/kanidm/kanidm/blob/master/book/src/support.md) for what
+the project team will support.
 
 ## Code of Conduct / Ethics
 
@@ -57,124 +57,118 @@ When we develop features, we follow our project's guidelines on [rights and ethi
 
 ## Getting in Contact / Questions
 
-We have a Matrix-powered [gitter community channel] where project members are always happy to chat
-and answer questions. Alternately you can open a new [GitHub discussion].
+We have a Matrix-powered [gitter community channel] where project members are always happy to chat and answer questions.
+Alternately you can open a new [GitHub discussion].
 
 [gitter community channel]: https://app.gitter.im/#/room/#kanidm_community:gitter.im
 [github discussion]: https://github.com/kanidm/kanidm/discussions
 
 ## What does Kanidm mean?
 
-Kanidm is a portmanteau of 'kani' and 'idm'. Kani is Japanese for crab, related to Rust's mascot
-Ferris the crab. Identity management is often abbreviated to 'idm', and is a common industry term
-for authentication providers.
+Kanidm is a portmanteau of 'kani' and 'idm'. Kani is Japanese for crab, related to Rust's mascot Ferris the crab.
+Identity management is often abbreviated to 'idm', and is a common industry term for authentication providers.
 
 Kanidm is pronounced as "kar - nee - dee - em".
 
+## Kanidm Anthem
+
+> An anthem is a popular song, especially a rock song felt to sum up the attitudes or feelings associated with a period
+> or social group.
+
+The Kanidm anthem is [Crab Rave - Noisestorm](https://www.youtube.com/watch?v=LDU_Txk06tM)
+
 ## Comparison with other services
 
-<details>
-  <summary>LLDAP</summary>
+<details> <summary>LLDAP</summary>
 
-[LLDAP](https://github.com/nitnelave/lldap) is a similar project aiming for a small and easy to
-administer LDAP server with a web administration portal. Both projects use the
-[Kanidm LDAP bindings](https://github.com/kanidm/ldap3), and have many similar ideas.
+[LLDAP](https://github.com/nitnelave/lldap) is a similar project focused on providing a small, easy-to-administer LDAP
+server with a web administration portal. Both LLDAP and Kanidm use the
+[Kanidm LDAP bindings](https://github.com/kanidm/ldap3) and share many common design ideas.
 
-The primary benefit of Kanidm over LLDAP is that Kanidm offers a broader set of "built-in" features
-like OAuth2 and OIDC. To use these from LLDAP you need an external portal like Keycloak. However,
-that is also a strength of LLDAP is that is offers "less" which may make it easier to administer and
-deploy for you.
+The primary advantage of Kanidm over LLDAP is its broader built-in feature set, including native support for OAuth2 and
+OIDC. In contrast, LLDAP requires integration with an external portal like Keycloak to provide these features. However,
+LLDAP’s simplicity — offering fewer features — can make it easier to deploy and manage for certain use cases.
 
-While LLDAP offers a simple WebUI as the primary user management frontend, Kanidm currently only
-offers administration functionality via its CLI. The Kanidm WebUI is tailored to user interactions.
+While LLDAP provides a simple Web UI as the main user management interface, Kanidm currently offers administrative
+functionality primarily via its CLI, with its Web UI designed more for user interactions than for administration.
 
-If Kanidm is too complex for your needs, you should check out LLDAP as a smaller alternative. If you
-want a project which has a broader feature set out of the box, then Kanidm will be a better fit.
+If Kanidm feels too complex for your needs, LLDAP is a smaller and simpler alternative. But if you want a more
+feature-rich solution out of the box, Kanidm will likely be a better fit.
 
 </details>
 
-<details><summary>389-ds / OpenLDAP</summary>
-Both 389-ds and OpenLDAP are generic LDAP servers. This means they only provide LDAP and you need to
-bring your own IDM components - you need your own OIDC portal, a WebUI for self-service, commandline
-tools to administer and more.
+<details> <summary>389-ds / OpenLDAP</summary>
 
-If you need the highest levels of customisation possible from your LDAP deployment, then these are
-probably better alternatives. If you want a service that is easy to set up and focused on IDM, then
-Kanidm is a better choice.
+Both 389 Directory Server (389-ds) and OpenLDAP are general-purpose LDAP servers. They provide LDAP functionality only,
+so you must supply your own Identity Management (IDM) components—such as an OIDC portal, self-service web UI,
+command-line tools for administration, and more.
 
-Kanidm was originally inspired by many elements of both 389-ds and OpenLDAP. Already Kanidm is as
-fast as (or faster than) 389-ds for performance and scaling as a directory service while having a
-richer feature set.
+If you require maximum customization of your LDAP deployment, 389-ds or OpenLDAP may be better choices. However, if you
+prefer an easy-to-set-up service focused specifically on IDM, Kanidm is a superior option.
 
-</details>
-
-<details>
-  <summary>FreeIPA</summary>
-
-FreeIPA is another identity management service for Linux/Unix, and ships a huge number of features
-from LDAP, Kerberos, DNS, Certificate Authority, and more.
-
-FreeIPA however is a complex system, with a huge amount of parts and configuration. This adds a lot
-of resource overhead and difficulty for administration and upgrades.
-
-Kanidm aims to have the features richness of FreeIPA, but without the resource and administration
-overheads. If you want a complete IDM package, but in a lighter footprint and easier to manage, then
-Kanidm is probably for you. In testing with 3000 users and 1500 groups, Kanidm is 3 times faster for
-search operations and 5 times faster for modification and addition of entries (your results may
-differ however, but generally Kanidm is much faster than FreeIPA).
+Kanidm draws inspiration from both 389-ds and OpenLDAP and already matches or exceeds 389-ds in directory service
+performance and scalability, while offering a richer feature set.
 
 </details>
 
-<details>
-  <summary>Keycloak</summary>
+<details> <summary>FreeIPA</summary>
 
-Keycloak is an OIDC/OAuth2/SAML provider. It allows you to layer on WebAuthn to existing IDM
-systems. Keycloak can operate as a stand-alone IDM but generally is a component attached to an
-existing LDAP server or similar.
+FreeIPA is a comprehensive identity management system for Linux/Unix, bundling many services including LDAP, Kerberos,
+DNS, and a Certificate Authority.
 
-Keycloak requires a significant amount of configuration and experience to deploy. It allows high
-levels of customisation to every detail of its authentication work flows, which makes it harder to
-start with in many cases.
+However, FreeIPA is complex, consisting of numerous components and configurations, which leads to higher resource usage
+and administrative overhead during setup and upgrades.
 
-Kanidm does NOT require Keycloak to provide services such as OAuth2 and integrates many of the
-elements in a simpler and correct way out of the box in comparison.
+Kanidm aims to offer the feature richness of FreeIPA but with a lighter resource footprint and simpler management. In
+benchmarks with 3,000 users and 1,500 groups, Kanidm demonstrated approximately three times faster search operations and
+five times faster modifications and additions (results may vary, but Kanidm generally outperforms FreeIPA in speed).
 
-</details>
-
-<details>
-  <summary>Rauthy</summary>
-
-Rauthy is a minimal OIDC provider. It supports WebAuthn just like Kanidm - they actually use our
-libraries for it!
-
-Rauthy only provides support for OIDC and so is unable to support other use cases like RADIUS and
-unix authentication.
-
-If you need a minimal OIDC only provider, Rauthy is an excellent choice. If you need more features
-then Kanidm will support those.
+If you want a full IDM solution that’s easier to manage and more efficient, Kanidm is worth considering.
 
 </details>
 
-<details>
-  <summary>Authentik / Authelia / Zitadel</summary>
+<details> <summary>Keycloak</summary>
 
-Authentik is an IDM provider written in Python and, Authelia and Zitadel are written in Go. all
-similar to Kanidm in the features it offers but notably all have weaker support for UNIX
-authentication and do not support the same level of authentication policy as Kanidm. Notably, all
-are missing WebAuthn Attestation.
+[Keycloak](https://github.com/keycloak/keycloak) is an OIDC/OAuth2/SAML provider that can layer WebAuthn authentication
+on top of existing IDM systems. Although it can operate as a stand-alone IDM solution, it is commonly used alongside an
+LDAP server or similar backend.
 
-All three use an external SQL server such as PostgreSQL. This can create a potential single source
-of failure and performance limitation compared to Kanidm which opted to write our own high
-performance database and replication system instead based on our experience with enterprise LDAP
-servers.
+Deploying Keycloak requires significant configuration and expertise. Its extensive customization options for
+authentication workflows can make initial setup challenging.
+
+Kanidm does not require Keycloak to provide OAuth2 and other services. It integrates many of these capabilities in a
+simpler, more streamlined way right out of the box.
+
+</details> <details> <summary>Rauthy</summary>
+
+[Rauthy](https://github.com/sebadob/rauthy) is a minimal OIDC provider supporting WebAuthn—using some of the same
+libraries as Kanidm.
+
+However, Rauthy focuses exclusively on OIDC and does not support additional use cases such as RADIUS or Unix
+authentication.
+
+If you need a minimal OIDC-only provider, Rauthy is an excellent choice. But if you require a broader feature set,
+Kanidm is the better option.
+
+</details>
+
+<details> <summary>Authentik / Authelia / Zitadel</summary>
+
+[Authentik](https://github.com/goauthentik/authentik) (written in Python),
+[Authelia](https://github.com/authelia/authelia), and [Zitadel](https://github.com/zitadel/zitadel) (both written in Go)
+are IDM providers similar to Kanidm in many respects. However, all three have weaker support for Unix authentication and
+do not provide the advanced authentication policies or WebAuthn Attestation capabilities that Kanidm offers.
+
+Additionally, these projects rely on external SQL databases such as PostgreSQL, which can introduce potential single
+points of failure and performance bottlenecks. In contrast, Kanidm uses its own high-performance database and
+replication system, developed based on enterprise LDAP server experience.
 
 </details>
 
 ## Developer Getting Started
 
-If you want to contribute to Kanidm there is a getting started [guide for developers]. IDM is a
-diverse topic and we encourage contributions of many kinds in the project, from people of all
-backgrounds.
+If you want to contribute to Kanidm there is a getting started [guide for developers]. IDM is a diverse topic and we
+encourage contributions of many kinds in the project, from people of all backgrounds.
 
 When developing the server you should refer to the latest commit documentation instead.
 

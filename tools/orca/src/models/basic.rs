@@ -6,7 +6,7 @@ use crate::state::*;
 use kanidm_client::KanidmClient;
 
 use async_trait::async_trait;
-use rand::Rng;
+use rand::RngExt;
 use rand_chacha::ChaCha8Rng;
 
 use std::collections::BTreeSet;
@@ -27,7 +27,7 @@ impl ActorBasic {
     pub fn new(mut cha_rng: ChaCha8Rng, warmup_time_ms: u64) -> Self {
         let max_backoff_time_in_ms = 2 * warmup_time_ms / 3;
         let randomised_backoff_time =
-            Duration::from_millis(cha_rng.gen_range(0..max_backoff_time_in_ms));
+            Duration::from_millis(cha_rng.random_range(0..max_backoff_time_in_ms));
         ActorBasic {
             state: State::Unauthenticated,
             randomised_backoff_time,

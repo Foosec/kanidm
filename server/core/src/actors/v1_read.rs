@@ -1,39 +1,28 @@
-use std::convert::TryFrom;
-use std::fs;
-use std::net::IpAddr;
-use std::path::{Path, PathBuf};
-use std::str::FromStr;
-
+use compact_jwt::{JweCompact, Jwk, JwsCompact};
+use kanidm_proto::backup::BackupCompression;
 use kanidm_proto::internal::{
-    ApiToken, AppLink, BackupCodesView, CURequest, CUSessionToken, CUStatus, CredentialStatus,
-    IdentifyUserRequest, IdentifyUserResponse, ImageValue, OperationError, RadiusAuthToken,
-    SearchRequest, SearchResponse, UserAuthToken,
+    ApiToken, AppLink, CURequest, CUSessionToken, CUStatus, CredentialStatus, IdentifyUserRequest,
+    IdentifyUserResponse, ImageValue, OperationError, RadiusAuthToken, SearchRequest,
+    SearchResponse, UserAuthToken,
 };
 use kanidm_proto::oauth2::OidcWebfingerResponse;
 use kanidm_proto::v1::{
-    AuthIssueSession, AuthRequest, Entry as ProtoEntry, UatStatus, UnixGroupToken, UnixUserToken,
-    WhoamiResponse,
+    AuthIssueSession, Entry as ProtoEntry, UatStatus, UnixGroupToken, UnixUserToken, WhoamiResponse,
 };
+use kanidmd_lib::be::BackendTransaction;
 use kanidmd_lib::idm::identityverification::{
     IdentifyUserDisplayCodeEvent, IdentifyUserStartEvent, IdentifyUserSubmitCodeEvent,
 };
-use ldap3_proto::simple::*;
-use regex::Regex;
-use tracing::{error, info, instrument, trace};
-use uuid::Uuid;
-
-use compact_jwt::{JweCompact, Jwk, JwsCompact};
-
-use kanidmd_lib::be::BackendTransaction;
 use kanidmd_lib::prelude::*;
 use kanidmd_lib::{
     event::{OnlineBackupEvent, SearchEvent, SearchResult, WhoamiResult},
     filter::{Filter, FilterInvalid},
     idm::account::ListUserAuthTokenEvent,
+    idm::authentication::AuthStep,
     idm::credupdatesession::CredentialUpdateSessionToken,
     idm::event::{
-        AuthEvent, AuthResult, CredentialStatusEvent, RadiusAuthTokenEvent, ReadBackupCodeEvent,
-        UnixGroupTokenEvent, UnixUserAuthEvent, UnixUserTokenEvent,
+        AuthEvent, AuthResult, CredentialStatusEvent, RadiusAuthTokenEvent, UnixGroupTokenEvent,
+        UnixUserAuthEvent, UnixUserTokenEvent,
     },
     idm::ldap::{LdapBoundToken, LdapResponseState},
     idm::oauth2::{
@@ -43,8 +32,16 @@ use kanidmd_lib::{
     },
     idm::server::{DomainInfoRead, IdmServerTransaction},
     idm::serviceaccount::ListApiTokenEvent,
-    idm::ClientAuthInfo,
 };
+use ldap3_proto::simple::*;
+use regex::Regex;
+use std::convert::TryFrom;
+use std::fs;
+use std::net::IpAddr;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
+use tracing::{error, info, instrument, trace};
+use uuid::Uuid;
 
 use super::QueryServerReadV1;
 
@@ -105,7 +102,7 @@ impl QueryServerReadV1 {
     pub async fn handle_auth(
         &self,
         sessionid: Option<Uuid>,
-        req: AuthRequest,
+        req: AuthStep,
         eventid: Uuid,
         client_auth_info: ClientAuthInfo,
     ) -> Result<AuthResult, OperationError> {
@@ -191,24 +188,32 @@ impl QueryServerReadV1 {
     pub async fn handle_online_backup(
         &self,
         msg: OnlineBackupEvent,
-        outpath: &str,
+        outpath: &Path,
         versions: usize,
+        compression: BackupCompression,
     ) -> Result<(), OperationError> {
         trace!(eventid = ?msg.eventid, "Begin online backup event");
 
+        #[allow(clippy::disallowed_methods)]
+        // Allowed as this timestamp is only used for the filename creation.
         let now = time::OffsetDateTime::now_utc();
 
         #[allow(clippy::unwrap_used)]
         let timestamp = now.format(&Rfc3339).unwrap();
-        let dest_file = format!("{}/backup-{}.json", outpath, timestamp);
+        let dest_file = outpath.join(format!("backup-{timestamp}.json{}", compression.suffix()));
 
-        if Path::new(&dest_file).exists() {
+        if dest_file.exists() {
             error!(
                 "Online backup file {} already exists, will not overwrite it.",
-                dest_file
+                dest_file.display()
             );
             return Err(OperationError::InvalidState);
         }
+
+        let output = std::fs::File::create(&dest_file).map_err(|err| {
+            error!(?err, "File::create error creating {}", dest_file.display());
+            OperationError::FsError
+        })?;
 
         // Scope to limit the read txn.
         {
@@ -216,18 +221,24 @@ impl QueryServerReadV1 {
             idms_prox_read
                 .qs_read
                 .get_be_txn()
-                .backup(&dest_file)
+                .backup(output, compression)
                 .map(|()| {
-                    info!("Online backup created {} successfully", dest_file);
+                    info!("Online backup created {} successfully", dest_file.display());
                 })
                 .map_err(|e| {
-                    error!("Online backup failed to create {}: {:?}", dest_file, e);
+                    error!(
+                        "Online backup failed to create {}: {:?}",
+                        dest_file.display(),
+                        e
+                    );
                     OperationError::InvalidState
                 })?;
         }
 
+        // TODO: make the file rotation a separate function
+
         // pattern to find automatically generated backup files
-        let re = Regex::new(r"^backup-\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?Z\.json$")
+        let re = Regex::new(r"^backup-\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?Z\.json")
             .map_err(|error| {
                 error!(
                     "Failed to parse regexp for online backup files: {:?}",
@@ -267,7 +278,11 @@ impl QueryServerReadV1 {
                 }
             }
             Err(e) => {
-                error!("Online backup cleanup error read dir {}: {}", outpath, e);
+                error!(
+                    "Online backup cleanup error read dir {}: {}",
+                    outpath.display(),
+                    e
+                );
                 return Err(OperationError::InvalidState);
             }
         }
@@ -356,6 +371,20 @@ impl QueryServerReadV1 {
         }
     }
 
+    pub async fn pre_validate_client_auth_info(
+        &self,
+        client_auth_info: &mut ClientAuthInfo,
+    ) -> Result<(), OperationError> {
+        let ct = duration_from_epoch_now();
+        let mut idms_prox_read = self.idms.proxy_read().await?;
+        idms_prox_read
+            .pre_validate_client_auth_info(client_auth_info, ct)
+            .map_err(|e| {
+                error!(?e, "Invalid identity");
+                e
+            })
+    }
+
     #[instrument(
         level = "info",
         name = "whoami_uat",
@@ -364,7 +393,7 @@ impl QueryServerReadV1 {
     )]
     pub async fn handle_whoami_uat(
         &self,
-        client_auth_info: ClientAuthInfo,
+        client_auth_info: &ClientAuthInfo,
         eventid: Uuid,
     ) -> Result<UserAuthToken, OperationError> {
         let ct = duration_from_epoch_now();
@@ -981,14 +1010,16 @@ impl QueryServerReadV1 {
             })?;
         match user_request {
             IdentifyUserRequest::Start => idms_prox_read
-                .handle_identify_user_start(&IdentifyUserStartEvent::new(target, ident)),
+                .handle_identify_user_start(&IdentifyUserStartEvent::new(target, ident), ct),
             IdentifyUserRequest::DisplayCode => idms_prox_read.handle_identify_user_display_code(
                 &IdentifyUserDisplayCodeEvent::new(target, ident),
+                ct,
             ),
             IdentifyUserRequest::SubmitCode { other_totp } => idms_prox_read
-                .handle_identify_user_submit_code(&IdentifyUserSubmitCodeEvent::new(
-                    target, ident, other_totp,
-                )),
+                .handle_identify_user_submit_code(
+                    &IdentifyUserSubmitCodeEvent::new(target, ident, other_totp),
+                    ct,
+                ),
         }
     }
 
@@ -1093,51 +1124,6 @@ impl QueryServerReadV1 {
         skip_all,
         fields(uuid = ?eventid)
     )]
-    pub async fn handle_idmbackupcodeview(
-        &self,
-        client_auth_info: ClientAuthInfo,
-        uuid_or_name: String,
-        eventid: Uuid,
-    ) -> Result<BackupCodesView, OperationError> {
-        let ct = duration_from_epoch_now();
-        let mut idms_prox_read = self.idms.proxy_read().await?;
-
-        let ident = idms_prox_read
-            .validate_client_auth_info_to_ident(client_auth_info, ct)
-            .map_err(|e| {
-                error!("Invalid identity: {:?}", e);
-                e
-            })?;
-        let target_uuid = idms_prox_read
-            .qs_read
-            .name_to_uuid(uuid_or_name.as_str())
-            .inspect_err(|err| {
-                error!(?err, "Error resolving id to target");
-            })?;
-
-        // Make an event from the request
-        let rbce = match ReadBackupCodeEvent::from_parts(
-            // &idms_prox_read.qs_read,
-            ident,
-            target_uuid,
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                error!("Failed to begin backup code read: {:?}", e);
-                return Err(e);
-            }
-        };
-
-        trace!(?rbce, "Begin event");
-
-        idms_prox_read.get_backup_codes(&rbce)
-    }
-
-    #[instrument(
-        level = "info",
-        skip_all,
-        fields(uuid = ?eventid)
-    )]
     pub async fn handle_idmcredentialupdatestatus(
         &self,
         session_token: CUSessionToken,
@@ -1192,138 +1178,86 @@ impl QueryServerReadV1 {
         match scr {
             CURequest::PrimaryRemove => idms_cred_update
                 .credential_primary_delete(&session_token, ct)
-                .map_err(|e| {
-                    error!(
-                        err = ?e,
-                        "Failed to begin credential_primary_delete",
-                    );
-                    e
+                .inspect_err(|err| {
+                    error!(?err, "Failed to begin credential_primary_delete",);
+                }),
+            CURequest::PasswordQualityCheck(pw) => idms_cred_update
+                .credential_check_password_quality(&session_token, ct, &pw)
+                .inspect_err(|err| {
+                    error!(?err, "Failed to begin credential_check_password_quality",);
                 }),
             CURequest::Password(pw) => idms_cred_update
                 .credential_primary_set_password(&session_token, ct, &pw)
-                .map_err(|e| {
-                    error!(
-                        err = ?e,
-                        "Failed to begin credential_primary_set_password",
-                    );
-                    e
+                .inspect_err(|err| {
+                    error!(?err, "Failed to begin credential_primary_set_password",);
                 }),
             CURequest::CancelMFAReg => idms_cred_update
                 .credential_update_cancel_mfareg(&session_token, ct)
-                .map_err(|e| {
-                    error!(
-                        err = ?e,
-                        "Failed to begin credential_update_cancel_mfareg",
-                    );
-                    e
+                .inspect_err(|err| {
+                    error!(?err, "Failed to begin credential_update_cancel_mfareg",);
                 }),
             CURequest::TotpGenerate => idms_cred_update
                 .credential_primary_init_totp(&session_token, ct)
-                .map_err(|e| {
-                    error!(
-                        err = ?e,
-                        "Failed to begin credential_primary_init_totp",
-                    );
-                    e
+                .inspect_err(|err| {
+                    error!(?err, "Failed to begin credential_primary_init_totp",);
                 }),
             CURequest::TotpVerify(totp_chal, label) => idms_cred_update
                 .credential_primary_check_totp(&session_token, ct, totp_chal, &label)
-                .map_err(|e| {
-                    error!(
-                        err = ?e,
-                        "Failed to begin credential_primary_check_totp",
-                    );
-                    e
+                .inspect_err(|err| {
+                    error!(?err, "Failed to begin credential_primary_check_totp",);
                 }),
             CURequest::TotpAcceptSha1 => idms_cred_update
                 .credential_primary_accept_sha1_totp(&session_token, ct)
-                .map_err(|e| {
-                    error!(
-                        err = ?e,
-                        "Failed to begin credential_primary_accept_sha1_totp",
-                    );
-                    e
+                .inspect_err(|err| {
+                    error!(?err, "Failed to begin credential_primary_accept_sha1_totp",);
                 }),
             CURequest::TotpRemove(label) => idms_cred_update
                 .credential_primary_remove_totp(&session_token, ct, &label)
-                .map_err(|e| {
-                    error!(
-                        err = ?e,
-                        "Failed to begin credential_primary_remove_totp",
-                    );
-                    e
+                .inspect_err(|err| {
+                    error!(?err, "Failed to begin credential_primary_remove_totp",);
                 }),
             CURequest::BackupCodeGenerate => idms_cred_update
                 .credential_primary_init_backup_codes(&session_token, ct)
-                .map_err(|e| {
-                    error!(
-                        err = ?e,
-                        "Failed to begin credential_primary_init_backup_codes",
-                    );
-                    e
+                .inspect_err(|err| {
+                    error!(?err, "Failed to begin credential_primary_init_backup_codes",);
                 }),
             CURequest::BackupCodeRemove => idms_cred_update
                 .credential_primary_remove_backup_codes(&session_token, ct)
-                .map_err(|e| {
+                .inspect_err(|err| {
                     error!(
-                        err = ?e,
+                        ?err,
                         "Failed to begin credential_primary_remove_backup_codes",
                     );
-                    e
                 }),
             CURequest::PasskeyInit => idms_cred_update
                 .credential_passkey_init(&session_token, ct)
-                .map_err(|e| {
-                    error!(
-                        err = ?e,
-                        "Failed to begin credential_passkey_init",
-                    );
-                    e
+                .inspect_err(|err| {
+                    error!(?err, "Failed to begin credential_passkey_init",);
                 }),
             CURequest::PasskeyFinish(label, rpkc) => idms_cred_update
                 .credential_passkey_finish(&session_token, ct, label, &rpkc)
-                .map_err(|e| {
-                    error!(
-                        err = ?e,
-                        "Failed to begin credential_passkey_finish",
-                    );
-                    e
+                .inspect_err(|err| {
+                    error!(?err, "Failed to begin credential_passkey_finish",);
                 }),
             CURequest::PasskeyRemove(uuid) => idms_cred_update
                 .credential_passkey_remove(&session_token, ct, uuid)
-                .map_err(|e| {
-                    error!(
-                        err = ?e,
-                        "Failed to begin credential_passkey_remove"
-                    );
-                    e
+                .inspect_err(|err| {
+                    error!(?err, "Failed to begin credential_passkey_remove",);
                 }),
             CURequest::AttestedPasskeyInit => idms_cred_update
                 .credential_attested_passkey_init(&session_token, ct)
-                .map_err(|e| {
-                    error!(
-                        err = ?e,
-                        "Failed to begin credential_attested_passkey_init"
-                    );
-                    e
+                .inspect_err(|err| {
+                    error!(?err, "Failed to begin credential_attested_passkey_init",);
                 }),
             CURequest::AttestedPasskeyFinish(label, rpkc) => idms_cred_update
                 .credential_attested_passkey_finish(&session_token, ct, label, &rpkc)
-                .map_err(|e| {
-                    error!(
-                        err = ?e,
-                        "Failed to begin credential_attested_passkey_finish"
-                    );
-                    e
+                .inspect_err(|err| {
+                    error!(?err, "Failed to begin credential_attested_passkey_finish",);
                 }),
             CURequest::AttestedPasskeyRemove(uuid) => idms_cred_update
                 .credential_attested_passkey_remove(&session_token, ct, uuid)
-                .map_err(|e| {
-                    error!(
-                        err = ?e,
-                        "Failed to begin credential_attested_passkey_remove"
-                    );
-                    e
+                .inspect_err(|err| {
+                    error!(?err, "Failed to begin credential_attested_passkey_remove",);
                 }),
             CURequest::UnixPasswordRemove => idms_cred_update
                 .credential_unix_delete(&session_token, ct)
@@ -1335,13 +1269,11 @@ impl QueryServerReadV1 {
                 .inspect_err(|err| {
                     error!(?err, "Failed to begin credential_unix_set_password");
                 }),
-
             CURequest::SshPublicKey(label, pubkey) => idms_cred_update
                 .credential_sshkey_add(&session_token, ct, label, pubkey)
                 .inspect_err(|err| {
                     error!(?err, "Failed to begin credential_sshkey_remove");
                 }),
-
             CURequest::SshPublicKeyRemove(label) => idms_cred_update
                 .credential_sshkey_remove(&session_token, ct, &label)
                 .inspect_err(|err| {
@@ -1484,7 +1416,7 @@ impl QueryServerReadV1 {
     pub async fn handle_oauth2_openid_userinfo(
         &self,
         client_id: String,
-        token: JwsCompact,
+        token: &JwsCompact,
         eventid: Uuid,
     ) -> Result<OidcToken, Oauth2Error> {
         let ct = duration_from_epoch_now();
